@@ -76,6 +76,7 @@ foreach ($siteUrl in $siteUrls) {
 
                                 # Check each user for permissions
                                 foreach ($UserUPN in $usersToCheck) {
+                                    $hasAccess = $false
                                     $readSources = @()
                                     $editSources = @()
                                     $fullControl = $false
@@ -85,6 +86,7 @@ foreach ($siteUrl in $siteUrls) {
                                         foreach ($principal in $permsInfo.permissionsInformation.principals) {
                                             $principalUpn = $principal.principal.userPrincipalName ?? $principal.principal.email
                                             if ($principalUpn -like "*$UserUPN*") { # Wildcard match for case insensitivity
+                                                $hasAccess = $true
                                                 switch ($principal.role) {
                                                     1 { $readSources += "Direct Permission" }
                                                     2 { $editSources += "Direct Permission" }
@@ -98,17 +100,14 @@ foreach ($siteUrl in $siteUrls) {
                                     if ($permsInfo.permissionsInformation.links) {
                                         foreach ($link in $permsInfo.permissionsInformation.links) {
                                             $linkUrl = $link.linkDetails.Url
-                                            Write-Host "Processing link: $linkUrl" -ForegroundColor DarkGray
                                             
                                             if ($link.linkMembers) {
                                                 foreach ($member in $link.linkMembers) {
                                                     $memberUpn = $member.userPrincipalName ?? $member.email
-                                                    Write-Host "Checking member: $memberUpn" -ForegroundColor DarkGray
                                                     
                                                     # Case-insensitive comparison
                                                     if ($memberUpn -like "*$UserUPN*") {
-                                                        Write-Host "Match found for $UserUPN in link: $linkUrl" -ForegroundColor Green
-                                                        
+                                                        $hasAccess = $true
                                                         # Determine permission type
                                                         if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) {
                                                             $editSources += $linkUrl
@@ -123,7 +122,7 @@ foreach ($siteUrl in $siteUrls) {
                                     }
 
                                     # Only add to report if user has any permissions
-                                    if ($readSources.Count -gt 0 -or $editSources.Count -gt 0 -or $fullControl) {
+                                    if ($hasAccess) {
                                         # Build report entry
                                         $reportEntry = [PSCustomObject]@{
                                             Site        = $siteUrl
@@ -137,8 +136,8 @@ foreach ($siteUrl in $siteUrls) {
                                                         elseif ($itemType -eq "Folder") { $folder.ServerRelativeUrl } 
                                                         else { "" }
                                             Size        = if ($itemType -eq "File") { $file.Length } else { "" }
-                                            Read        = $readSources -join "`n"
-                                            Edit        = $editSources -join "`n"
+                                            Read        = if ($readSources.Count -gt 0) { $readSources -join "`n" } else { "" }
+                                            Edit        = if ($editSources.Count -gt 0) { $editSources -join "`n" } else { "" }
                                             FullControl = if ($fullControl) { "Yes" } else { "" }
                                         }
                                         $reportData += $reportEntry
@@ -162,9 +161,12 @@ foreach ($siteUrl in $siteUrls) {
     }
 }
 
-# Generate report
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$fileName = "Combined_PermissionsReport_$timestamp.csv"
-$reportData | Export-Csv -Path $fileName -NoTypeInformation -Encoding UTF8
-
-Write-Host "Report generated: $fileName" -ForegroundColor Green
+# Generate report only if we have data
+if ($reportData.Count -gt 0) {
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $fileName = "UserAccessReport_$timestamp.csv"
+    $reportData | Export-Csv -Path $fileName -NoTypeInformation -Encoding UTF8
+    Write-Host "Report generated: $fileName" -ForegroundColor Green
+} else {
+    Write-Host "No items with user access found." -ForegroundColor Yellow
+}
