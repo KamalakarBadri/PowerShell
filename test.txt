@@ -1,108 +1,76 @@
-<#
-.SYNOPSIS
-    Generates permission reports for multiple users across multiple SharePoint sites
-.DESCRIPTION
-    This script checks permissions for specified users across multiple SharePoint Online sites,
-    identifying all documents, folders, and items where they have access.
-.NOTES
-    Requires PnP.PowerShell module (Install-Module PnP.PowerShell)
-    Requires Application Permissions with Sites.FullControl.All
-#>
+# Tenant Details
+$TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
+$ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
+$ThumbPrint = "B799789F78628CAE56B4D0F380FD551EB754E0DB"
 
-# Import required module
-Import-Module PnP.PowerShell -ErrorAction Stop
+# List of SharePoint Sites
+$SiteUrls = @(
+    "https://",
+    "https://"
+)
 
-# Configuration
-$config = @{
-    TenantId    = "yourtenant.onmicrosoft.com"
-    ClientId    = "your-app-client-id"
-    Thumbprint  = "your-cert-thumbprint"
-    Sites       = @(
-        "https://yourtenant.sharepoint.com/sites/site1",
-        "https://yourtenant.sharepoint.com/sites/site2",
-        "https://yourtenant.sharepoint.com/sites/team-site3"
-    )
-    Users       = @(
-        "user1@domain.com",
-        "user2@domain.com",
-        "user3@domain.com"
-    )
-    ExcludedLists = @("Access Requests", "App Packages", "appdata", "Apps in Testing", "Form Templates", "Maintenance Log Library", "Pages", "Preservation Hold Library", "Site Assets", "Site Pages", "Style Library", "TaxonomyHiddenList")
-    ThrottleLimit = 5 # Number of parallel site connections
-    OutputPath  = "C:\Reports\SharePointPermissions"
-}
+# List of Users to Check Permissions
+$UserUPNs = @(
+    "",
+    ""
+)
 
-# Create output directory if it doesn't exist
-if (-not (Test-Path $config.OutputPath)) {
-    New-Item -ItemType Directory -Path $config.OutputPath | Out-Null
-}
+# Excluded Lists
+$ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", 
+    "Composed Looks", "Content and Structure Reports", "Content type publishing error log", "Converted Forms",
+    "Device Channels", "Form Templates", "fpdatasources", "Get started with Apps for Office and SharePoint", 
+    "List Template Gallery", "Long Running Operation Status", "Maintenance Log Library", "Images", "site collection images",
+    "Master Docs", "Master Page Gallery", "MicroFeed", "NintexFormXml", "Quick Deploy Items", "Relationships List", 
+    "Reusable Content", "Reporting Metadata", "Reporting Templates", "Search Config List", "Site Assets", 
+    "Preservation Hold Library", "Solution Gallery", "Style Library", "Suggested Content Browser Locations", 
+    "Theme Gallery", "TaxonomyHiddenList", "User Information List", "Web Part Gallery", "wfpub", "wfsvc", 
+    "Workflow History", "Workflow Tasks", "Pages")
 
-# Initialize logging
-$logFile = Join-Path $config.OutputPath "PermissionReport_Log_$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-Start-Transcript -Path $logFile -Append
+# Loop through each SharePoint site
+foreach ($siteUrl in $SiteUrls) {
+    Write-Host "Connecting to: $siteUrl" -ForegroundColor Cyan
+    Connect-PnPOnline -Url $siteUrl -ClientId $ClientId -Thumbprint $ThumbPrint -Tenant $TenantId
 
-# Main processing function
-function Process-SiteUserPermissions {
-    param (
-        [string]$SiteUrl,
-        [string]$UserUPN,
-        [string]$OutputFolder
-    )
-    
-    try {
-        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Processing site: $SiteUrl for user: $UserUPN" -ForegroundColor Cyan
+    # Get all document libraries
+    $lists = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists" -Method Get
+    $reportData = @()
 
-        # Connect to SharePoint
-        Connect-PnPOnline -Url $SiteUrl -ClientId $config.ClientId -Thumbprint $config.Thumbprint -Tenant $config.TenantId -ErrorAction Stop
-        
-        # Get all lists
-        $lists = Invoke-PnPSPRestMethod -Url "$SiteUrl/_api/web/lists" -Method Get -ErrorAction Stop
-        $reportData = @()
+    foreach ($list in $lists.value) {
+        if ($list.Title -in $ExcludedLists) { continue }
 
-        foreach ($list in $lists.value) {
-            if ($list.Title -in $config.ExcludedLists -or $list.Hidden) { continue }
-            
-            if ($list.BaseTemplate -eq 101) { # Document Library
-                Write-Host "  Processing Document Library: $($list.Title)" -ForegroundColor DarkCyan
-                
-                $nextPageUrl = "$SiteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000&`$expand=File,Folder"
-                do {
-                    try {
-                        $response = Invoke-PnPSPRestMethod -Url $nextPageUrl -Method Get -ErrorAction Stop
-                        $listItems = $response.value
-                        $nextPageUrl = $response."odata.nextLink"
+        if ($list.BaseTemplate -eq 101) {
+            Write-Host "Processing Document Library: $($list.Title)" -ForegroundColor Yellow
 
-                        foreach ($item in $listItems) {
-                            try {
-                                # Check unique permissions
-                                $uniquePerms = Invoke-PnPSPRestMethod -Url "$SiteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments" -Method Get -ErrorAction Stop
-                                if (-not $uniquePerms.value) { continue }
+            $nextPageUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000"
+            do {
+                try {
+                    $response = Invoke-PnPSPRestMethod -Url $nextPageUrl -Method Get
+                    $listItems = $response.value
+                    $nextPageUrl = $response."odata.nextLink"
 
-                                # Get item type and details
-                                $itemType = $null
-                                $itemName = $null
-                                $itemPath = $null
-                                $itemSize = $null
+                    foreach ($item in $listItems) {
+                        try {
+                            # Check unique permissions
+                            $uniquePerms = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments" -Method Get
+                            if (-not $uniquePerms.value) { continue }
 
-                                if ($item.FileSystemObjectType -eq 0) {
-                                    $itemType = "File"
-                                    $itemName = $item.File.Name
-                                    $itemPath = $item.File.ServerRelativeUrl
-                                    $itemSize = $item.File.Length
+                            # Determine if the item is a file or folder
+                            $itemType = switch ($item.FileSystemObjectType) {
+                                0 { 
+                                    $file = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/file" -Method Get
+                                    "File"
                                 }
-                                elseif ($item.FileSystemObjectType -eq 1) {
-                                    $itemType = "Folder"
-                                    $itemName = $item.Folder.Name
-                                    $itemPath = $item.Folder.ServerRelativeUrl
+                                1 { 
+                                    $folder = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/folder" -Method Get
+                                    "Folder"
                                 }
-                                else {
-                                    $itemType = "ListItem"
-                                    $itemName = $item.Title
-                                }
+                                default { "ListItem" }
+                            }
 
-                                # Get permissions info
-                                $permsInfo = Invoke-PnPSPRestMethod -Url "$SiteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get -ErrorAction Stop
+                            # Get permissions info
+                            $permsInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get
 
+                            foreach ($UserUPN in $UserUPNs) {
                                 $readSources = @()
                                 $editSources = @()
                                 $fullControl = $false
@@ -111,7 +79,7 @@ function Process-SiteUserPermissions {
                                 if ($permsInfo.permissionsInformation.principals) {
                                     foreach ($principal in $permsInfo.permissionsInformation.principals) {
                                         $principalUpn = $principal.principal.userPrincipalName ?? $principal.principal.email
-                                        if ($principalUpn -and $principalUpn -like "*$UserUPN*") {
+                                        if ($principalUpn -like "*$UserUPN*") { 
                                             switch ($principal.role) {
                                                 1 { $readSources += "Direct Permission" }
                                                 2 { $editSources += "Direct Permission" }
@@ -124,15 +92,17 @@ function Process-SiteUserPermissions {
                                 # Process sharing links
                                 if ($permsInfo.permissionsInformation.links) {
                                     foreach ($link in $permsInfo.permissionsInformation.links) {
+                                        $linkUrl = $link.linkDetails.Url
+                                        
                                         if ($link.linkMembers) {
                                             foreach ($member in $link.linkMembers) {
                                                 $memberUpn = $member.userPrincipalName ?? $member.email
-                                                if ($memberUpn -and $memberUpn -like "*$UserUPN*") {
+                                                if ($memberUpn -like "*$UserUPN*") {
                                                     if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) {
-                                                        $editSources += "Shared Link: $($link.linkDetails.Url)"
+                                                        $editSources += $linkUrl
                                                     }
                                                     else {
-                                                        $readSources += "Shared Link: $($link.linkDetails.Url)"
+                                                        $readSources += $linkUrl
                                                     }
                                                 }
                                             }
@@ -140,139 +110,44 @@ function Process-SiteUserPermissions {
                                     }
                                 }
 
-                                # Process group memberships
-                                $itemPerms = Get-PnPProperty -ClientObject $item -Property "RoleAssignments"
-                                foreach ($roleAssignment in $item.RoleAssignments) {
-                                    $member = Get-PnPProperty -ClientObject $roleAssignment -Property "Member"
-                                    if ($member.PrincipalType -eq "SharePointGroup") {
-                                        $groupUsers = Get-PnPGroupMember -Identity $member.Title
-                                        foreach ($user in $groupUsers) {
-                                            if ($user.Email -like "*$UserUPN*" -or $user.UserPrincipalName -like "*$UserUPN*") {
-                                                $roleBindings = Get-PnPProperty -ClientObject $roleAssignment -Property "RoleDefinitionBindings"
-                                                foreach ($role in $roleBindings) {
-                                                    switch ($role.Name) {
-                                                        "Read" { $readSources += "Group: $($member.Title)" }
-                                                        "Edit" { $editSources += "Group: $($member.Title)" }
-                                                        "Full Control" { $fullControl = $true }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                # Build report entry
+                                $reportEntry = [PSCustomObject]@{
+                                    SiteName    = $siteUrl.Split("/")[-1]
+                                    ItemID      = $item.Id
+                                    UserUPN     = $UserUPN
+                                    ItemType    = $itemType
+                                    Name        = if ($itemType -eq "File") { $file.Name } 
+                                                elseif ($itemType -eq "Folder") { $folder.Name } 
+                                                else { $item.Title }
+                                    Location    = if ($itemType -eq "File") { $file.ServerRelativeUrl } 
+                                                elseif ($itemType -eq "Folder") { $folder.ServerRelativeUrl } 
+                                                else { "" }
+                                    Size        = if ($itemType -eq "File") { $file.Length } else { "" }
+                                    Read        = $readSources -join "`n"
+                                    Edit        = $editSources -join "`n"
+                                    FullControl = if ($fullControl) { "Yes" } else { "" }
                                 }
-
-                                # Only add to report if user has any permissions
-                                if ($readSources.Count -gt 0 -or $editSources.Count -gt 0 -or $fullControl) {
-                                    $reportEntry = [PSCustomObject]@{
-                                        Site        = $SiteUrl
-                                        List        = $list.Title
-                                        ItemID      = $item.Id
-                                        ItemType    = $itemType
-                                        Name        = $itemName
-                                        Location    = $itemPath
-                                        Size        = if ($itemSize) { "{0:N2} MB" -f ($itemSize / 1MB) } else { "" }
-                                        Read        = ($readSources | Select-Object -Unique) -join "`n"
-                                        Edit        = ($editSources | Select-Object -Unique) -join "`n"
-                                        FullControl = if ($fullControl) { "Yes" } else { "" }
-                                        LastModified= $item.Modified
-                                        Created     = $item.Created
-                                    }
-                                    $reportData += $reportEntry
-                                }
-
-                            } catch {
-                                Write-Host "    Error processing item $($item.Id): $_" -ForegroundColor Red
+                                $reportData += $reportEntry
                             }
+
+                        } catch {
+                            Write-Host "Error processing item $($item.Id): $_" -ForegroundColor Red
                         }
-                    } catch {
-                        Write-Host "  Error retrieving items: $_" -ForegroundColor Red
-                        $nextPageUrl = $null
                     }
-                } while ($nextPageUrl)
-            }
+                } catch {
+                    Write-Host "Error retrieving items: $_" -ForegroundColor Red
+                    $nextPageUrl = $null
+                }
+            } while ($nextPageUrl)
         }
-
-        # Generate report for this site-user combination
-        if ($reportData.Count -gt 0) {
-            $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-            $fileName = "$($SiteUrl.Split('/')[-1])_$($UserUPN.Split('@')[0])_Permissions_$timestamp.csv"
-            $fullPath = Join-Path $OutputFolder $fileName
-            $reportData | Export-Csv -Path $fullPath -NoTypeInformation -Encoding UTF8
-            Write-Host "  Report generated: $fileName ($($reportData.Count) items)" -ForegroundColor Green
-            return $fullPath
-        } else {
-            Write-Host "  No permissions found for $UserUPN in $SiteUrl" -ForegroundColor Yellow
-            return $null
-        }
-
-    } catch {
-        Write-Host "  Error processing site $SiteUrl : $_" -ForegroundColor Red
-        return $null
-    } finally {
-        Disconnect-PnPOnline -ErrorAction SilentlyContinue
     }
+
+    # Generate CSV report
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $siteName = $siteUrl.Split("/")[-1]
+    $fileName = "$siteName-PermissionsReport_$timestamp.csv"
+    $reportData | Export-Csv -Path $fileName -NoTypeInformation -Encoding UTF8
+
+    Write-Host "Report generated: $fileName" -ForegroundColor Green
+    Disconnect-PnPOnline
 }
-
-# Process all sites and users
-$allReports = @()
-$siteCounter = 0
-
-foreach ($siteUrl in $config.Sites) {
-    $siteCounter++
-    Write-Host "`nProcessing site $siteCounter of $($config.Sites.Count): $siteUrl" -ForegroundColor Magenta
-    
-    $userJobs = @()
-    $userCounter = 0
-    
-    foreach ($user in $config.Users) {
-        $userCounter++
-        Write-Host "  Starting processing for user $userCounter of $($config.Users.Count): $user"
-        
-        # Throttle parallel processing
-        while (($userJobs | Where-Object { $_.State -eq "Running" }).Count -ge $config.ThrottleLimit) {
-            Start-Sleep -Seconds 2
-        }
-        
-        $job = Start-ThreadJob -Name "$($siteUrl.Split('/')[-1])_$user" -ScriptBlock {
-            param($SiteUrl, $UserUPN, $OutputFolder, $Config)
-            $ErrorActionPreference = 'Stop'
-            Import-Module PnP.PowerShell -ErrorAction Stop
-            Process-SiteUserPermissions -SiteUrl $SiteUrl -UserUPN $UserUPN -OutputFolder $OutputFolder
-        } -ArgumentList $siteUrl, $user, $config.OutputPath, $config
-        
-        $userJobs += $job
-    }
-    
-    # Wait for all user jobs to complete for this site
-    $userJobs | Wait-Job | Out-Null
-    
-    # Collect results
-    foreach ($job in $userJobs) {
-        $result = Receive-Job -Job $job
-        if ($result) {
-            $allReports += $result
-        }
-        Remove-Job -Job $job
-    }
-}
-
-# Generate consolidated report if multiple reports were created
-if ($allReports.Count -gt 1) {
-    $consolidatedData = @()
-    foreach ($report in $allReports) {
-        if (Test-Path $report) {
-            $data = Import-Csv -Path $report
-            $consolidatedData += $data
-        }
-    }
-    
-    if ($consolidatedData.Count -gt 0) {
-        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $consolidatedFile = Join-Path $config.OutputPath "Consolidated_Permissions_Report_$timestamp.csv"
-        $consolidatedData | Export-Csv -Path $consolidatedFile -NoTypeInformation -Encoding UTF8
-        Write-Host "`nConsolidated report generated: $consolidatedFile" -ForegroundColor Green
-    }
-}
-
-Write-Host "`nProcessing complete. All reports saved to: $($config.OutputPath)" -ForegroundColor Green
-Stop-Transcript
