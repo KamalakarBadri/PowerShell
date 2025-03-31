@@ -1,0 +1,149 @@
+# Load required module
+Import-Module PnP.PowerShell
+
+# Configuration
+$CsvPath = "C:\path\to\sites_users.csv"
+$ExcludedLists = @("Access Requests", "App Packages", "appdata")
+
+# Read CSV
+$siteUserMappings = Import-Csv -Path $CsvPath
+
+# Loop through each site-user combination
+foreach ($entry in $siteUserMappings) {
+    $siteUrl = $entry.SiteUrl
+    $UserUPN = $entry.UserUPN
+
+    Write-Host "Processing Site: $siteUrl for User: $UserUPN" -ForegroundColor Yellow
+
+    try {
+        # Connect to SharePoint Online
+        Connect-PnPOnline -Url $siteUrl -ClientId $clientId -Thumbprint $Thumbprint -Tenant $Tenantid
+
+        # Get all lists
+        $lists = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists" -Method Get
+        $reportData = @()
+
+        foreach ($list in $lists.value) {
+            if ($list.Title -in $ExcludedLists) { continue }
+            if ($list.BaseTemplate -eq 101) {
+                Write-Host "Processing Document Library: $($list.Title)" -ForegroundColor Cyan
+                
+                $nextPageUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000"
+                do {
+                    try {
+                        $response = Invoke-PnPSPRestMethod -Url $nextPageUrl -Method Get
+                        $listItems = $response.value
+                        $nextPageUrl = $response."odata.nextLink"
+
+                        foreach ($item in $listItems) {
+                            try {
+                                # Check unique permissions
+                                $uniquePerms = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments" -Method Get
+                                if (-not $uniquePerms.value) { continue }
+
+                                # Get item details
+                                $itemType = switch ($item.FileSystemObjectType) {
+                                    0 { "File" }
+                                    1 { "Folder" }
+                                    default { "ListItem" }
+                                }
+
+                                # Get permissions info
+                                $permsInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get
+
+                                $readSources = @()
+                                $editSources = @()
+                                $fullControl = $false
+
+                                # Process direct permissions
+                                if ($permsInfo.permissionsInformation.principals) {
+                                    foreach ($principal in $permsInfo.permissionsInformation.principals) {
+                                        $principalUpn = $principal.principal.userPrincipalName ?? $principal.principal.email
+                                        if ($principalUpn -eq $UserUPN -or $principalUpn -like "*$UserUPN*") {
+                                            switch ($principal.role) {
+                                                1 { $readSources += "Direct Permission" }
+                                                2 { $editSources += "Direct Permission" }
+                                                3 { $fullControl = $true }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Process sharing links
+                                if ($permsInfo.permissionsInformation.links) {
+                                    foreach ($link in $permsInfo.permissionsInformation.links) {
+                                        $linkUrl = $link.linkDetails.Url
+                                        $linkType = "Read"
+                                        
+                                        if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) {
+                                            $linkType = "Edit"
+                                        }
+                                        elseif ($link.linkDetails.BlocksDownload) {
+                                            $linkType = "Restricted View"
+                                        }
+
+                                        if ($link.linkMembers) {
+                                            foreach ($member in $link.linkMembers) {
+                                                $memberUpn = $member.userPrincipalName ?? $member.email
+                                                if ($memberUpn -eq $UserUPN -or $memberUpn -like "*$UserUPN*") {
+                                                    switch ($linkType) {
+                                                        "Edit" { $editSources += $linkUrl }
+                                                        default { $readSources += $linkUrl }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Build report entry
+                                $reportEntry = [PSCustomObject]@{
+                                    Site        = $siteUrl
+                                    User        = $UserUPN
+                                    ItemID      = $item.Id
+                                    ItemType    = $itemType
+                                    Name        = $item.Title
+                                    Location    = ""
+                                    Read        = $readSources -join "`n"
+                                    Edit        = $editSources -join "`n"
+                                    FullControl = if ($fullControl) { "Yes" } else { "" }
+                                }
+                                $reportData += $reportEntry
+
+                            } catch {
+                                Write-Host "Error processing item $($item.Id): $_" -ForegroundColor Red
+                            }
+                        }
+                    } catch {
+                        Write-Host "Error retrieving items: $_" -ForegroundColor Red
+                        $nextPageUrl = $null
+                    }
+                } while ($nextPageUrl)
+            }
+        }
+
+        # Generate report
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $fileName = "PermissionsReport_$timestamp.csv"
+        $reportData | Export-Csv -Path $fileName -NoTypeInformation -Encoding UTF8
+
+        Write-Host "Report generated: $fileName" -ForegroundColor Green
+
+        # Disconnect
+        Disconnect-PnPOnline
+
+    } catch {
+        Write-Host "Error processing $siteUrl for $UserUPN: $_" -ForegroundColor Red
+    }
+}
+
+Write-Host "Script execution completed!" -ForegroundColor Green
+
+
+
+
+SiteUrl,UserUPN
+https://tenant.sharepoint.com/sites/site1,user1@domain.com
+https://tenant.sharepoint.com/sites/site1,user2@domain.com
+https://tenant.sharepoint.com/sites/site2,user1@domain.com
+https://tenant.sharepoint.com/sites/site3,user3@domain.com
