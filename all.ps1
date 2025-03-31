@@ -1,12 +1,10 @@
 
-# List of SharePoint Sites
-$SiteUrls = @(
-   
-)
-
-# List of Users to Check Permissions
-$UserUPNs = @(
-    
+# Excluded Lists (e.g., system libraries like Site Assets, Form Templates, etc.)
+$ExcludedLists = @(
+    "Form Templates",
+    "Site Assets",
+    "Style Library",
+    "Preservation Hold Library"
 )
 
 # Loop through each SharePoint site
@@ -20,6 +18,13 @@ foreach ($siteUrl in $SiteUrls) {
 
     foreach ($list in $lists.value) {
         if ($list.BaseTemplate -ne 101) { continue } # Process only document libraries
+
+        # Check if the list is in the exclusion list
+        if ($ExcludedLists -contains $list.Title) {
+            Write-Host "Skipping excluded list: $($list.Title)" -ForegroundColor Gray
+            continue
+        }
+
         Write-Host "Processing Document Library: $($list.Title)" -ForegroundColor Yellow
 
         $nextPageUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000"
