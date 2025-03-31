@@ -27,7 +27,7 @@ foreach ($siteUrl in $SiteUrls) {
 
         Write-Host "Processing Document Library: $($list.Title)" -ForegroundColor Yellow
 
-        $nextPageUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000"
+        $nextPageUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items?`$top=1000&`$select=Id,Title,FileLeafRef,FileSystemObjectType,ServerRelativeUrl"
         do {
             try {
                 $response = Invoke-PnPSPRestMethod -Url $nextPageUrl -Method Get
@@ -46,6 +46,14 @@ foreach ($siteUrl in $SiteUrls) {
                             1 { "Folder" }
                             default { "ListItem" }
                         }
+
+                        # Fix item name issue
+                        $itemName = if ($itemType -eq "File") { $item.FileLeafRef } else { $item.Title }
+                        if (-not $itemName) { $itemName = "[Unnamed]" }
+
+                        # Get item location (Full Path)
+                        $itemLocation = $item.ServerRelativeUrl
+                        if (-not $itemLocation) { $itemLocation = "[Unknown Location]" }
 
                         # Get permissions info
                         $permsInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get
@@ -97,8 +105,8 @@ foreach ($siteUrl in $SiteUrls) {
                                     ItemID      = $item.Id
                                     UserUPN     = $UserUPN
                                     ItemType    = $itemType
-                                    Name        = $item.Title
-                                    Location    = $item.ServerRelativeUrl
+                                    Name        = $itemName
+                                    Location    = $itemLocation
                                     Read        = $readSources -join "`n"
                                     Edit        = $editSources -join "`n"
                                     FullControl = if ($fullControl) { "Yes" } else { "" }
