@@ -1,6 +1,6 @@
 $TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
 $ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
-$ThumbPrint = 
+$ThumbPrint = "B799789F78628CAE56B4D0F380FD551EB754E0DB"
 Connect-PnPOnline -Url $siteUrl -ClientId $clientId -Thumbprint $Thumbprint -Tenant $Tenantid
 Write-Host "Connected to SharePoint site: $siteUrl" -ForegroundColor Green
 
@@ -43,23 +43,53 @@ foreach ($list in $lists.value) {
     if ($list.BaseTemplate -eq 101) {
         Write-Host "`nProcessing document library: $($list.Title)" -ForegroundColor Cyan
         
-        # Get all items
-        $itemsUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items"
-        Write-Host "API CALL: GET $itemsUrl" -ForegroundColor Gray
-        try {
-            $items = Invoke-PnPSPRestMethod -Url $itemsUrl -Method Get
-            Write-Host "SUCCESS: Retrieved $($items.value.Count) items" -ForegroundColor Green
-        } catch {
-            Write-Host "ERROR: Failed to get items - $_" -ForegroundColor Red
-            $errorCount++
-            continue
-        }
+        # Initialize pagination variables
+        $itemsApiUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items"
+        $nextPageUrl = $itemsApiUrl
+        $listItems = @()
 
-        foreach ($item in $items.value) {
+        # Pagination loop
+        do {
+            try {
+                Write-Host "API CALL: GET $nextPageUrl" -ForegroundColor Gray
+                $response = Invoke-PnPSPRestMethod -Url $nextPageUrl -Method Get
+                $listItems += $response.value
+                Write-Host "SUCCESS: Retrieved $($response.value.Count) items from current page" -ForegroundColor Green
+
+                # Check for next page
+                if ($response."odata.nextLink") {
+                    $nextPageUrl = $response."odata.nextLink"
+                    Write-Host "Found next page: $nextPageUrl" -ForegroundColor Cyan
+                } else {
+                    $nextPageUrl = $null
+                }
+            } catch {
+                $errorCount++
+                Write-Host "ERROR: Failed to retrieve items from $nextPageUrl - $_" -ForegroundColor Red
+                $nextPageUrl = $null
+            }
+        } while ($nextPageUrl)
+
+        Write-Host "Total items to process in $($list.Title): $($listItems.Count)" -ForegroundColor Yellow
+
+        foreach ($item in $listItems) {
             $processedItems++
-            Write-Host "`nProcessing item $($item.Id) ($processedItems of $($items.value.Count))" -ForegroundColor Yellow
+            Write-Host "`nProcessing item $($item.Id) ($processedItems of $($listItems.Count))" -ForegroundColor Yellow
             
             try {
+                # Check if item has unique permissions
+                $uniqueRoleAssignmentsApiUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments"
+                Write-Host "API CALL: GET $uniqueRoleAssignmentsApiUrl" -ForegroundColor Gray
+                $uniqueRoleAssignmentsResponse = Invoke-PnPSPRestMethod -Url $uniqueRoleAssignmentsApiUrl -Method Get
+                $hasUniqueRoleAssignments = $uniqueRoleAssignmentsResponse.value
+                Write-Host "Item has unique permissions: $hasUniqueRoleAssignments" -ForegroundColor DarkYellow
+
+                # Skip items without unique permissions
+                if (-not $hasUniqueRoleAssignments) {
+                    Write-Host "Skipping item (inherits permissions)" -ForegroundColor DarkGray
+                    continue
+                }
+
                 # Get item type and details
                 $itemType = if ($item.FileSystemObjectType -eq 0) { "File" } else { "Folder" }
                 $itemName = ""
@@ -232,6 +262,7 @@ foreach ($list in $lists.value) {
                     ItemType = $itemType
                     ItemName = $itemName
                     ItemLocation = $itemLocation
+                    HasUniquePermissions = $hasUniqueRoleAssignments
                     ReadAccess = $directPermissions.Read -join ", "
                     EditAccess = $directPermissions.Edit -join ", "
                     FullControlAccess = $directPermissions.FullControl -join ", "
@@ -268,6 +299,7 @@ Write-Host "`n=== Execution Summary ===" -ForegroundColor Cyan
 Write-Host "Start Time: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Host "End Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
 Write-Host "Total Items Processed: $processedItems" -ForegroundColor White
+Write-Host "Total Items With Unique Permissions: $($reportData.Count)" -ForegroundColor White
 Write-Host "Total Errors Encountered: $errorCount" -ForegroundColor $(if ($errorCount -gt 0) { "Red" } else { "Green" })
 Write-Host "`nScript completed!" -ForegroundColor Cyan
 
