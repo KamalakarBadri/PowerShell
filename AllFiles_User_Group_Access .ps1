@@ -1,6 +1,6 @@
 $TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
 $ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
-$ThumbPrint = "B799789F78628CAE56B4D0F380FD551EB754E0DB"
+$ThumbPrint = 
 Connect-PnPOnline -Url $siteUrl -ClientId $clientId -Thumbprint $Thumbprint -Tenant $Tenantid
 Write-Host "Connected to SharePoint site: $siteUrl" -ForegroundColor Green
 
