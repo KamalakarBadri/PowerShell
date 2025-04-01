@@ -181,7 +181,7 @@ foreach ($siteUrl in $siteUrls) {
                                             Read        = if ($readSources.Count -gt 0) { $readSources -join ", " } else { "" }
                                             Edit        = if ($editSources.Count -gt 0) { $editSources -join ", " } else { "" }
                                             FullControl = if ($fullControl) { "Yes" } else { "" }
-                                            SharingLinks = if ($sharingLinks.Count -gt 0) { $sharingLinks -join "`n" } else { "" }
+                                            #SharingLinks = if ($sharingLinks.Count -gt 0) { $sharingLinks -join "`n" } else { "" }
                                         }
                                         $reportData += $reportEntry
                                     }
