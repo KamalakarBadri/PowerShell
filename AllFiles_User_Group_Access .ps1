@@ -1,3 +1,6 @@
+$TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
+$ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
+$ThumbPrint = "B799789F78628CAE56B4D0F380FD551EB754E0DB"
 Connect-PnPOnline -Url $siteUrl -ClientId $clientId -Thumbprint $Thumbprint -Tenant $Tenantid
 Write-Host "Connected to SharePoint site: $siteUrl" -ForegroundColor Green
 
@@ -59,8 +62,42 @@ foreach ($list in $lists.value) {
             try {
                 # Get item type and details
                 $itemType = if ($item.FileSystemObjectType -eq 0) { "File" } else { "Folder" }
-                $itemName = $item.FieldValues.FileLeafRef ?? $item.FieldValues.Title
-                Write-Host "Item Type: $itemType | Name: $itemName" -ForegroundColor White
+                $itemName = ""
+                $itemLocation = ""
+
+                if ($item.FileSystemObjectType -eq 0) {
+                    # File - get file details
+                    $fileUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/file"
+                    Write-Host "API CALL: GET $fileUrl" -ForegroundColor Gray
+                    try {
+                        $file = Invoke-PnPSPRestMethod -Url $fileUrl -Method Get
+                        $itemName = $file.Name
+                        $itemLocation = $file.ServerRelativeUrl
+                        Write-Host "SUCCESS: Retrieved file details - $($file.ServerRelativeUrl)" -ForegroundColor Green
+                    } catch {
+                        Write-Host "ERROR: Failed to get file details - $_" -ForegroundColor Red
+                        $itemName = $item.FieldValues.FileLeafRef ?? "Unknown"
+                        $itemLocation = "Error retrieving location"
+                        $errorCount++
+                    }
+                } else {
+                    # Folder - get folder details
+                    $folderUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/folder"
+                    Write-Host "API CALL: GET $folderUrl" -ForegroundColor Gray
+                    try {
+                        $folder = Invoke-PnPSPRestMethod -Url $folderUrl -Method Get
+                        $itemName = $folder.Name
+                        $itemLocation = $folder.ServerRelativeUrl
+                        Write-Host "SUCCESS: Retrieved folder details - $($folder.ServerRelativeUrl)" -ForegroundColor Green
+                    } catch {
+                        Write-Host "ERROR: Failed to get folder details - $_" -ForegroundColor Red
+                        $itemName = $item.FieldValues.FileLeafRef ?? $item.FieldValues.Title ?? "Unknown"
+                        $itemLocation = "Error retrieving location"
+                        $errorCount++
+                    }
+                }
+
+                Write-Host "Item Type: $itemType | Name: $itemName | Location: $itemLocation" -ForegroundColor White
 
                 # Get sharing information with principal details
                 $permUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation"
@@ -194,6 +231,7 @@ foreach ($list in $lists.value) {
                     ItemID = $item.Id
                     ItemType = $itemType
                     ItemName = $itemName
+                    ItemLocation = $itemLocation
                     ReadAccess = $directPermissions.Read -join ", "
                     EditAccess = $directPermissions.Edit -join ", "
                     FullControlAccess = $directPermissions.FullControl -join ", "
@@ -209,7 +247,9 @@ foreach ($list in $lists.value) {
                 Write-Host "ERROR: Failed to process item $($item.Id) - $_" -ForegroundColor Red
                 $reportData += [PSCustomObject]@{
                     ItemID = $item.Id
+                    ItemType = "ERROR"
                     ItemName = "ERROR PROCESSING"
+                    ItemLocation = "N/A"
                     Error = $_.Exception.Message
                 }
             }
