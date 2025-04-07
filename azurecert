@@ -1,0 +1,18 @@
+# Generate a new self-signed certificate
+$cert = New-SelfSignedCertificate -CertStoreLocation "cert:\CurrentUser\My" `
+  -Subject "CN=AzureAppAuth" `
+  -KeySpec KeyExchange `
+  -KeyExportPolicy Exportable `
+  -NotAfter (Get-Date).AddYears(2) `
+  -KeyLength 2048
+
+# Export the certificate (PFX format with password)
+$password = ConvertTo-SecureString -String "YourSecurePassword" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath "C:\temp\AzureAppAuth.pfx" -Password $password
+
+# Get the thumbprint
+$thumbprint = $cert.Thumbprint
+Write-Host "Certificate Thumbprint: $thumbprint"
+
+# Optionally export the public key (CER format)
+Export-Certificate -Cert $cert -FilePath "C:\temp\AzureAppAuth.cer" -Type CERT
