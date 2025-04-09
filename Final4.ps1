@@ -172,45 +172,32 @@ foreach ($siteUrl in $SiteUrls) {
                                     try {
                                         $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
                                         foreach ($member in $members.value) {
+                                            # Get member name regardless of principal type
+                                            $memberName = $null
+                                            
                                             if ($member.PrincipalType -eq 1) {
-                                                # Regular user
-                                                $memberUpn = $member.UserPrincipalName ?? $member.Email
-                                                $memberName = $member.Title ?? $memberUpn
-                                                
-                                                # Add to appropriate permission collection with group name
+                                                # User
+                                                $memberName = $member.Title ?? ($member.UserPrincipalName ?? $member.Email)
+                                            }
+                                            elseif ($member.PrincipalType -eq 4) {
+                                                # Security Group
+                                                $memberName = $member.Title ?? $member.LoginName
+                                            }
+                                            elseif ($member.PrincipalType -eq 8) {
+                                                # SharePoint Group
+                                                $memberName = $member.Title ?? $member.LoginName
+                                            }
+                                            else {
+                                                # Other principal types (like 5 for distribution lists)
+                                                $memberName = $member.Title ?? $member.LoginName ?? $member.Email ?? "Unknown Principal"
+                                            }
+                                            
+                                            if ($memberName) {
+                                                # Add ALL group members to appropriate permission collection with group name
                                                 switch ($role) {
                                                     1 { $readUsers += "$memberName (via $groupName)" }
                                                     2 { $editUsers += "$memberName (via $groupName)" }
                                                     3 { $fullControlUsers += "$memberName (via $groupName)" }
-                                                }
-                                            }
-                                            elseif ($member.PrincipalType -in @(4,8)) {
-                                                # Nested group - get its members (depth level 2)
-                                                $nestedGroupName = $member.Title
-                                                $nestedGroupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($member.Id))/Users"
-                                                try {
-                                                    $nestedMembers = Invoke-PnPSPRestMethod -Url $nestedGroupMembersUrl -Method Get -ErrorAction Stop
-                                                    foreach ($nestedMember in $nestedMembers.value) {
-                                                        if ($nestedMember.PrincipalType -eq 1) {
-                                                            $nestedMemberUpn = $nestedMember.UserPrincipalName ?? $nestedMember.Email
-                                                            $nestedMemberName = $nestedMember.Title ?? $nestedMemberUpn
-                                                            
-                                                            # Add to appropriate permission collection with full path
-                                                            switch ($role) {
-                                                                1 { $readUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
-                                                                2 { $editUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
-                                                                3 { $fullControlUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                catch {
-                                                    Write-Host "      Error getting members for nested group $nestedGroupName : $_" -ForegroundColor Yellow
-                                                    switch ($role) {
-                                                        1 { $readUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
-                                                        2 { $editUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
-                                                        3 { $fullControlUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
-                                                    }
                                                 }
                                             }
                                         }
@@ -228,7 +215,7 @@ foreach ($siteUrl in $SiteUrls) {
                             }
                         }
 
-                        # Process sharing links - Updated to handle empty links
+                        # Process sharing links
                         if ($permsInfo.permissionsInformation.links) {
                             foreach ($link in $permsInfo.permissionsInformation.links) {
                                 if ($link.linkDetails -and $link.linkDetails.Url) {
