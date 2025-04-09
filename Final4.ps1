@@ -19,60 +19,6 @@ $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Ap
     "Theme Gallery", "TaxonomyHiddenList", "User Information List", "Web Part Gallery", "wfpub", "wfsvc", 
     "Workflow History", "Workflow Tasks", "Pages")
 
-# Function to recursively get all members of a group including nested groups
-function Get-AllGroupMembers {
-    param (
-        [string]$siteUrl,
-        [string]$groupId,
-        [int]$depth = 0,
-        [int]$maxDepth = 10
-    )
-    
-    $members = @()
-    
-    if ($depth -ge $maxDepth) {
-        Write-Host "      Maximum recursion depth ($maxDepth) reached for group $groupId" -ForegroundColor Yellow
-        return $members
-    }
-    
-    $groupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($groupId)/Users"
-    try {
-        $groupMembers = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
-        
-        foreach ($member in $groupMembers.value) {
-            if ($member.PrincipalType -eq 1) {
-                # User
-                $memberUpn = $member.UserPrincipalName ?? $member.Email
-                $memberName = $member.Title ?? $memberUpn
-                $members += [PSCustomObject]@{
-                    Name = $memberName
-                    Type = "User"
-                    Path = ""
-                }
-            }
-            elseif ($member.PrincipalType -in @(4,8)) {
-                # Nested Group - recursively get members
-                $nestedGroupName = $member.Title
-                Write-Host "      Found nested group: $nestedGroupName (depth $depth)" -ForegroundColor DarkGray
-                $nestedMembers = Get-AllGroupMembers -siteUrl $siteUrl -groupId $member.Id -depth ($depth + 1) -maxDepth $maxDepth
-                
-                foreach ($nestedMember in $nestedMembers) {
-                    $members += [PSCustomObject]@{
-                        Name = $nestedMember.Name
-                        Type = $nestedMember.Type
-                        Path = "$nestedGroupName > $($nestedMember.Path)"
-                    }
-                }
-            }
-        }
-    }
-    catch {
-        Write-Host "      Error getting members for group $groupId : $_" -ForegroundColor Yellow
-    }
-    
-    return $members
-}
-
 # Loop through each SharePoint site
 foreach ($siteUrl in $SiteUrls) {
     Write-Host "`n====================================================================" -ForegroundColor Cyan
@@ -220,25 +166,52 @@ foreach ($siteUrl in $SiteUrls) {
                                     }
                                 }
                                 elseif ($principal.principalType -in @(4,8)) {
-                                    # Group - recursively get ALL members including nested groups
+                                    # Group - get ALL members and add them with group name
                                     $groupName = $principal.name
-                                    Write-Host "      Processing group: $groupName" -ForegroundColor DarkGray
-                                    
+                                    $groupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($principal.id))/Users"
                                     try {
-                                        $allMembers = Get-AllGroupMembers -siteUrl $siteUrl -groupId $principal.id
-                                        
-                                        foreach ($member in $allMembers) {
-                                            $displayName = $member.Name
-                                            if ($member.Path) {
-                                                $displayName = "$displayName (via $($member.Path))"
-                                            } else {
-                                                $displayName = "$displayName (via $groupName)"
+                                        $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
+                                        foreach ($member in $members.value) {
+                                            if ($member.PrincipalType -eq 1) {
+                                                # Regular user
+                                                $memberUpn = $member.UserPrincipalName ?? $member.Email
+                                                $memberName = $member.Title ?? $memberUpn
+                                                
+                                                # Add to appropriate permission collection with group name
+                                                switch ($role) {
+                                                    1 { $readUsers += "$memberName (via $groupName)" }
+                                                    2 { $editUsers += "$memberName (via $groupName)" }
+                                                    3 { $fullControlUsers += "$memberName (via $groupName)" }
+                                                }
                                             }
-                                            
-                                            switch ($role) {
-                                                1 { $readUsers += $displayName }
-                                                2 { $editUsers += $displayName }
-                                                3 { $fullControlUsers += $displayName }
+                                            elseif ($member.PrincipalType -in @(4,8)) {
+                                                # Nested group - get its members (depth level 2)
+                                                $nestedGroupName = $member.Title
+                                                $nestedGroupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($member.Id))/Users"
+                                                try {
+                                                    $nestedMembers = Invoke-PnPSPRestMethod -Url $nestedGroupMembersUrl -Method Get -ErrorAction Stop
+                                                    foreach ($nestedMember in $nestedMembers.value) {
+                                                        if ($nestedMember.PrincipalType -eq 1) {
+                                                            $nestedMemberUpn = $nestedMember.UserPrincipalName ?? $nestedMember.Email
+                                                            $nestedMemberName = $nestedMember.Title ?? $nestedMemberUpn
+                                                            
+                                                            # Add to appropriate permission collection with full path
+                                                            switch ($role) {
+                                                                1 { $readUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
+                                                                2 { $editUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
+                                                                3 { $fullControlUsers += "$nestedMemberName (via $groupName > $nestedGroupName)" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                catch {
+                                                    Write-Host "      Error getting members for nested group $nestedGroupName : $_" -ForegroundColor Yellow
+                                                    switch ($role) {
+                                                        1 { $readUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
+                                                        2 { $editUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
+                                                        3 { $fullControlUsers += "$nestedGroupName [members not accessible] (via $groupName)" }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
