@@ -192,6 +192,17 @@ foreach ($siteUrl in $SiteUrls) {
                                                 $memberName = $member.Title ?? $member.LoginName ?? $member.Email ?? "Unknown Principal"
                                             }
                                             
+                                            # If member name is still empty, get the group title
+                                            if ([string]::IsNullOrEmpty($memberName)) {
+                                                try {
+                                                    $groupInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/SiteGroups/GetById($($principal.id))" -Method Get -ErrorAction Stop
+                                                    $memberName = $groupInfo.Title ?? $groupInfo.LoginName ?? $groupName
+                                                }
+                                                catch {
+                                                    $memberName = $groupName
+                                                }
+                                            }
+                                            
                                             if ($memberName) {
                                                 # Add ALL group members to appropriate permission collection with group name
                                                 switch ($role) {
