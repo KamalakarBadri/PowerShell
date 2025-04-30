@@ -9,11 +9,9 @@
     Author: GeekByte
     Creation Date: 2024-04-02
 #>
-
-# Configuration Parameters
 $TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
 $ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
-#$ClientSecret = ""
+$ClientSecret = "CyG8Q~FYHuCMSyVmt4sNxc2c24Ziz4a.t"
 
 # Date range (UTC)
 $StartDate = "2025-01-10T00:00:00Z"
@@ -21,10 +19,10 @@ $EndDate = "2025-04-02T23:59:59Z"
 
 # Sites and operations
 $Sites = @(
-    "https://geekbyteonline.sharepoint.com/sites/New365Site1",
-    "https://geekbyteonline.sharepoint.com/sites/New365Site2",
-    "https://geekbyteonline.sharepoint.com/sites/New365Site3",
-    "https://geekbyteonline.sharepoint.com/sites/New365Site4",
+    "https://geekbyteonline.sharepoint.com/sites/New365",
+    "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
+    "https://geekbyteonline.sharepoint.com/sites/geekbyte",
+    "https://geekbyteonline.sharepoint.com/sites/geetkteam",
     "https://geekbyteonline.sharepoint.com/sites/New365Site5"
 )
 
@@ -147,7 +145,7 @@ function Get-SearchStatus {
     }
 }
 
-# 4. Retrieve Records with pagination
+# 4. Retrieve Records with pagination and token refresh
 function Get-AuditRecords {
     param (
         [string]$AccessToken,
@@ -178,7 +176,16 @@ function Get-AuditRecords {
             }
         }
         catch {
-            if ($_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Response.StatusCode -eq 503) {
+            # Check if token expired (401 Unauthorized)
+            if ($_.Exception.Response.StatusCode -eq 401) {
+                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Access token expired. Refreshing token..." -ForegroundColor Yellow
+                $script:AccessToken = Get-AccessToken
+                $Headers.Authorization = "Bearer $script:AccessToken"
+                
+                # Retry the same request with new token
+                continue
+            }
+            elseif ($_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Response.StatusCode -eq 503) {
                 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Rate limit hit when retrieving records. Waiting $RETRY_DELAY_SECONDS seconds..." -ForegroundColor Yellow
                 Start-Sleep -Seconds $RETRY_DELAY_SECONDS
                 continue
@@ -192,7 +199,6 @@ function Get-AuditRecords {
 
     return $AllRecords
 }
-
 # 5. Save to CSV with proper file naming
 function Save-AuditToCsv {
     param (
