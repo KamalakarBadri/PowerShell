@@ -20,7 +20,7 @@ init(autoreset=True)
 # Configuration
 TENANT_ID = "0e439a1f-a497-462b-9e6b-4e582e203607"
 CLIENT_ID = "73efa35d-6188-42d4-b258-838a977eb149"
-CLIENT_SECRET = "CyG8Q~FYHuCMSyVmt4sNxt5IejrMc2c24Ziz4a.t"
+CLIENT_SECRET = "yG8Q~FYHuCMSyVmt4sNxt5IejrMc2c24Ziz4a.t"
 
 # SharePoint Upload Configuration
 SITE_ID = 'cf2d90f2-6092-4b2b-a89e-1cf4981c633d'
