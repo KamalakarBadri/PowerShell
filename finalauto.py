@@ -33,7 +33,7 @@ DEBUG_MODE = False  # Shows full tokens when True
 # Sites and operations
 SITES = [
     "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
-    "https://geekbyteonline.sharepoint.com/sites/Pharmacy",
+    "https://geekbyteonline.sharepoint.com/sites/geekbyteteam",
     "https://geekbyteonline.sharepoint.com/sites/Radiation-Imaging",
     "https://geekbyteonline.sharepoint.com/sites/geetkteam",
     "https://geekbyteonline.sharepoint.com/sites/New365Site5"
@@ -42,7 +42,7 @@ SITES = [
 # Mapping of site names to resource names
 SITE_TO_RESOURCE = {
     "2DayRetention": "2-DayRetention",
-    "Pharmacy": "Pharmacy",
+    "Geekbyteteam": "Pharmacy",
     "Radiation-Imaging": "Radiation Imaging",
     "geetkteam": "Geetk Team",
     "New365Site5": "New 365 Site 5"
@@ -797,7 +797,7 @@ class AuditLogCollector:
 
                       # TESTING: Add 60-minute delay after each file upload
                     self.log("TEST MODE: Sleeping for 60 minutes after upload...", Fore.RED)
-                    time.sleep(3600)  # 60 minutes = 3600 seconds
+                    time.sleep(4000)  # 60 minutes = 3600 seconds
                     
                     # # Optionally remove the local file after successful upload
                     # try:
