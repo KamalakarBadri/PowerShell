@@ -46,6 +46,10 @@ SITE_TO_RESOURCE = {
     "geetkteam": "Geetk Team",
     "New365Site5": "New 365 Site 5"
 }
+SITE_TO_SP_COLUMN = {
+    "2DayRetention": "_x0032_DayRetention",
+    "Geekbyteteam": "Geekbyteteam"
+}
 
 SITE_NAMES = [site.split('/')[-1] for site in SITES]  # For Excel report generation
 OPERATIONS = ["PageViewed", "FileAccessed", "FileDownloaded"]
@@ -289,6 +293,13 @@ class AuditLogCollector:
             "ReportMonth": self.REPORT_MONTH,
             "ReportYear": self.REPORT_YEAR
         }
+        # Add site summary columns
+        site_columns = self.get_site_summary_columns()
+        for site, summary in site_columns.items():
+            # Use internal SharePoint column name if available
+            sp_column = SITE_TO_SP_COLUMN.get(site, site)
+            item_data[sp_column] = summary
+
         if self.process_start_time:
             item_data["ProcessStartTime"] = self.process_start_time.isoformat()
         if self.process_end_time:
@@ -967,6 +978,8 @@ class AuditLogCollector:
             lines.append(f"{row['Site']} - {row['Operation']} - {row['RecordCount']}")
         return "\n".join(lines)
 
+
+
     def run(self):
         try:
             # Record process start time
@@ -1028,30 +1041,29 @@ class AuditLogCollector:
             # Record process end time and update SharePoint list
             self.process_end_time = datetime.now().astimezone()
             duration = (self.process_end_time - self.process_start_time).total_seconds()
-            
+
             summary_details = (
-    f"Process completed in {duration:.2f} seconds. "
-    f"{sum(item['RecordCount'] for item in self.summary_data)} total records processed.\n\n"
-    f"Summary:\n{self.get_summary_details_text()}"
-)
-self.update_sharepoint_list(
-    "Completed",
-    summary_details,
-    self.uploaded_files
-)
-            
-            self.log("All operations completed successfully!", Fore.GREEN)
+                f"Process completed in {duration:.2f} seconds. "
+                f"{sum(item['RecordCount'] for item in self.summary_data)} total records processed.\n\n"
                 
+            )
+            self.update_sharepoint_list(
+                "Completed",
+                summary_details,
+                self.uploaded_files
+            )
+            self.log("All operations completed successfully!", Fore.GREEN)
+
         except Exception as e:
             # Update SharePoint list with error status if something goes wrong
             error_time = datetime.now().astimezone()
             error_duration = (error_time - self.process_start_time).total_seconds() if self.process_start_time else 0
-            
+
             self.update_sharepoint_list(
                 "Error",
                 f"Process failed after {error_duration:.2f} seconds with error: {str(e)}"
             )
-            
+
             self.log(f"Fatal error: {e}", Fore.RED)
             raise
 
