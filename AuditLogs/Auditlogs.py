@@ -65,6 +65,7 @@ class AuditLogCollector:
         self.setup_logging()
         
         # Initialize variables
+        self.sharepoint_item_id = None  # Track the SharePoint list item ID
         self.access_token = None
         self.token_generation_time = None
         self.existing_searches = {}
@@ -257,62 +258,76 @@ class AuditLogCollector:
         
         self.log(f"Max retries ({max_retries}) exceeded for this request", Fore.RED, logging.ERROR)
         return None
+    
+
+    def create_sharepoint_item(self):
+        """Always create a new SharePoint list item for this report and return its ID."""
+        url = f"https://graph.microsoft.com/v1.0/sites/{SITE_ID}/lists/{LIST_ID}/items"
+        filter_title = f"Audit logs from {self.START_DATE.split('T')[0]} to {self.END_DATE.split('T')[0]}"
+        payload = {
+            "fields": {
+                "Title": filter_title,
+                "Status": "Started",
+                "ReportMonth": self.REPORT_MONTH,
+                "ReportYear": self.REPORT_YEAR
+            }
+        }
+        response = self.make_api_request("POST", url, json_data=payload)
+        if response and response.status_code == 201:
+            return response.json()["id"]
+        return None
 
     def update_sharepoint_list(self, status, details=None, files=None):
         """
-        Update SharePoint list with process status and details
-        Args:
-            status: "Started", "Uploading", or "Completed"
-            details: Additional information about the status
-            files: List of files uploaded (for "Uploading" status)
+        Update SharePoint list with process status and details in a single row.
         """
-    # Prepare the item data based on status
+        title = f"Audit logs from {self.START_DATE.split('T')[0]} to {self.END_DATE.split('T')[0]}"
         item_data = {
-            "Title": f"Audit Log Collection - {status}",
+            "Title": title,
             "Status": status,
             "Details": details or "",
             "ReportMonth": self.REPORT_MONTH,
             "ReportYear": self.REPORT_YEAR
         }
-
-    # Only add process times if they exist
         if self.process_start_time:
             item_data["ProcessStartTime"] = self.process_start_time.isoformat()
         if self.process_end_time:
             item_data["ProcessEndTime"] = self.process_end_time.isoformat()
-
         if status == "Uploading" and files:
             item_data["UploadedFiles"] = "\n".join([os.path.basename(f) for f in files])
             item_data["FilesCount"] = len(files)
         elif status == "Completed":
             duration = (self.process_end_time - self.process_start_time).total_seconds() if self.process_start_time and self.process_end_time else 0
-            item_data["DurationSeconds"] = str(duration)  # Convert to string to ensure proper serialization
+            item_data["DurationSeconds"] = str(duration / 60)  # Minutes
             item_data["TotalRecords"] = str(sum(item["RecordCount"] for item in self.summary_data))
 
-        url = f"https://graph.microsoft.com/v1.0/sites/{SITE_ID}/lists/{LIST_ID}/items"
-    
-    # The fields need to be wrapped in a 'fields' object
-        payload = {
-            "fields": item_data
-        }
+        # Always create a new SharePoint item and get its ID
+        if not self.sharepoint_item_id:
+            self.sharepoint_item_id = self.create_sharepoint_item()
+        if not self.sharepoint_item_id:
+            self.log("Failed to create SharePoint list item", Fore.RED)
+            return False
+
+        url = f"https://graph.microsoft.com/v1.0/sites/{SITE_ID}/lists/{LIST_ID}/items/{self.sharepoint_item_id}/fields"
+        payload = item_data
         self.log(f"Payload: {json.dumps(payload, indent=2)}", Fore.CYAN)
-        
+
         response = self.make_api_request(
-            "POST",
+            "PATCH",
             url,
             json_data=payload
-    )
-    
+        )
         if not response:
             self.log(f"Failed to update SharePoint list with {status} status", Fore.RED)
             return False
-        
-        if response.status_code == 201:
+        if response.status_code in (200, 204):
             self.log(f"Successfully updated SharePoint list with {status} status", Fore.GREEN)
             return True
         else:
             self.log(f"Error updating SharePoint list: {response.status_code} - {response.text}", Fore.RED)
             return False
+
+
 
     def check_existing_search(self, site, operation):
         """Check if a search already exists with the same parameters"""
@@ -943,6 +958,15 @@ class AuditLogCollector:
 
         self.log(f"Completed processing all {processed_searches} searches", Fore.GREEN)
 
+    def get_summary_details_text(self):
+        """Format summary details as a single string for SharePoint."""
+        if not self.summary_data:
+            return "No summary data available."
+        lines = []
+        for row in self.summary_data:
+            lines.append(f"{row['Site']} - {row['Operation']} - {row['RecordCount']}")
+        return "\n".join(lines)
+
     def run(self):
         try:
             # Record process start time
@@ -1005,13 +1029,16 @@ class AuditLogCollector:
             self.process_end_time = datetime.now().astimezone()
             duration = (self.process_end_time - self.process_start_time).total_seconds()
             
-           
-            
-            self.update_sharepoint_list(
-                "Completed",
-                f"Process completed in {duration:.2f} seconds. {sum(item['RecordCount'] for item in self.summary_data)} total records processed.",
-                self.uploaded_files
-            )
+            summary_details = (
+    f"Process completed in {duration:.2f} seconds. "
+    f"{sum(item['RecordCount'] for item in self.summary_data)} total records processed.\n\n"
+    f"Summary:\n{self.get_summary_details_text()}"
+)
+self.update_sharepoint_list(
+    "Completed",
+    summary_details,
+    self.uploaded_files
+)
             
             self.log("All operations completed successfully!", Fore.GREEN)
                 
@@ -1031,4 +1058,4 @@ class AuditLogCollector:
 if __name__ == "__main__":
     collector = AuditLogCollector()
     collector.run()
-    
+
