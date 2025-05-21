@@ -978,7 +978,21 @@ class AuditLogCollector:
             lines.append(f"{row['Site']} - {row['Operation']} - {row['RecordCount']}")
         return "\n".join(lines)
 
-
+    def get_site_summary_columns(self):
+        """
+        Returns a dict: {site_name: 'operation1: count, operation2: count, ...'}
+        For use as SharePoint list columns.
+        """
+        site_ops = {}
+        for row in self.summary_data:
+            site = row['Site']
+            op = row['Operation']
+            count = row['RecordCount']
+            if site not in site_ops:
+                site_ops[site] = []
+            site_ops[site].append(f"{op}: {count}")
+        # Join operations for each site
+        return {site: ", ".join(ops) for site, ops in site_ops.items()}
 
     def run(self):
         try:
