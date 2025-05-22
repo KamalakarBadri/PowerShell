@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CSV Notepad</title>
+</head>
+<body>
+    <h1>CSV Notepad</h1>
+    <input type="text" id="noteInput" placeholder="Type and press Enter to save" 
+           style="width: 300px; padding: 8px; font-size: 16px;">
+    
+    <h2>Saved Notes</h2>
+    <table border="1" style="width: 100%; border-collapse: collapse;">
+        <thead>
+            <tr style="background-color: #f2f2f2;">
+                <th style="padding: 8px;">Note</th>
+                <th style="padding: 8px; width: 120px;">Actions</th>
+            </tr>
+        </thead>
+        <tbody id="notesList">
+            <!-- Notes will appear here -->
+        </tbody>
+    </table>
+
+    <script>
+        // Load notes when page loads
+        window.onload = loadNotes;
+        
+        // Save note on Enter key
+        document.getElementById('noteInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                const noteText = this.value.trim();
+                if (noteText) {
+                    saveNote(noteText);
+                    this.value = '';
+                }
+            }
+        });
+
+        function saveNote(noteText) {
+            fetch('/save', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({note: noteText})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    loadNotes();
+                }
+            });
+        }
+
+        function loadNotes() {
+            fetch('/load')
+            .then(response => response.json())
+            .then(data => {
+                const notesList = document.getElementById('notesList');
+                notesList.innerHTML = '';
+                
+                data.notes.forEach((note, index) => {
+                    const row = document.createElement('tr');
+                    
+                    const noteCell = document.createElement('td');
+                    noteCell.style.padding = '8px';
+                    noteCell.textContent = note;
+                    row.appendChild(noteCell);
+                    
+                    const actionsCell = document.createElement('td');
+                    actionsCell.style.padding = '8px';
+                    actionsCell.style.textAlign = 'center';
+                    
+                    const copyBtn = document.createElement('button');
+                    copyBtn.textContent = 'Copy';
+                    copyBtn.onclick = () => {
+                        navigator.clipboard.writeText(note)
+                            .then(() => alert('Copied to clipboard!'))
+                            .catch(err => console.error('Failed to copy: ', err));
+                    };
+                    actionsCell.appendChild(copyBtn);
+                    
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.textContent = 'Delete';
+                    deleteBtn.style.marginLeft = '5px';
+                    deleteBtn.onclick = () => {
+                        if (confirm('Delete this note?')) {
+                            deleteNote(index);
+                        }
+                    };
+                    actionsCell.appendChild(deleteBtn);
+                    
+                    row.appendChild(actionsCell);
+                    notesList.appendChild(row);
+                });
+            });
+        }
+
+        function deleteNote(index) {
+            fetch('/delete', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({index: index})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    loadNotes();
+                }
+            });
+        }
+    </script>
+</body>
+</html>
