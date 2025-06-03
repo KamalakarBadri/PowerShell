@@ -1,0 +1,189 @@
+<#
+.SYNOPSIS
+    Uploads files and folders to OneDrive using Microsoft Graph API.
+
+.DESCRIPTION
+    This script recursively uploads files and folders from a local path to a specified OneDrive location
+    using Microsoft Graph REST API with manual authentication.
+
+.NOTES
+    Required Permissions:
+    - Files.ReadWrite (for personal OneDrive)
+    - Files.ReadWrite.All (for SharePoint/Teams drives)
+
+    How to get Access Token:
+    1. Go to Microsoft Graph Explorer: https://developer.microsoft.com/en-us/graph/graph-explorer
+    2. Sign in with your account
+    3. Run a query (like GET /me/drive/root/children)
+    4. Copy the access token from the "Access Token" tab
+
+    How to get Drive ID:
+    - For personal OneDrive: use "me/drive"
+    - For SharePoint/Teams: use "drives/{drive-id}" (get drive-id from SharePoint site properties)
+
+.PARAMETER AccessToken
+    The OAuth 2.0 access token for authentication (obtained as described above).
+
+.PARAMETER DriveId
+    The ID of the OneDrive drive (use "me/drive" for personal OneDrive).
+
+.PARAMETER LocalPath
+    The local path to upload files and folders from (e.g., "C:\Backup").
+
+.PARAMETER OneDrivePath
+    The destination path in OneDrive (e.g., ":/Documents/Backup:" or ":/" for root).
+
+.EXAMPLE
+    # Upload to personal OneDrive
+    .\Upload-ToOneDrive.ps1 -AccessToken "eyJ0eX..." -DriveId "me/drive" -LocalPath "C:\Backup" -OneDrivePath ":/Backup:"
+
+.EXAMPLE
+    # Upload to SharePoint document library
+    .\Upload-ToOneDrive.ps1 -AccessToken "eyJ0eX..." -DriveId "drives/b!8b..." -LocalPath "D:\ProjectFiles" -OneDrivePath ":/Shared Documents:"
+#>
+
+param (
+    [Parameter(Mandatory=$true, HelpMessage="OAuth 2.0 access token for authentication")]
+    [string]$AccessToken,
+    
+    [Parameter(Mandatory=$true, HelpMessage="OneDrive drive ID (use 'me/drive' for personal OneDrive)")]
+    [string]$DriveId,
+    
+    [Parameter(Mandatory=$true, HelpMessage="Local path to upload files from")]
+    [ValidateScript({Test-Path $_ -PathType Container})]
+    [string]$LocalPath,
+    
+    [Parameter(Mandatory=$true, HelpMessage="Destination path in OneDrive (format ':/path:')")]
+    [string]$OneDrivePath
+)
+
+# Initialize headers for API requests
+$headers = @{
+    "Authorization" = "Bearer $AccessToken"
+    "Content-Type" = "application/json"
+}
+
+# Function to create a folder in OneDrive
+function Create-OneDriveFolder {
+    param (
+        [string]$ParentPath,
+        [string]$FolderName
+    )
+    
+    $uri = "https://graph.microsoft.com/v1.0/$DriveId/items/root$ParentPath/children"
+    
+    $body = @{
+        "name" = $FolderName
+        "folder" = @{}
+        "@microsoft.graph.conflictBehavior" = "rename"
+    } | ConvertTo-Json -Depth 5
+    
+    try {
+        Write-Verbose "Creating folder '$FolderName' at $ParentPath"
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -ContentType "application/json"
+        Write-Verbose "Created folder with ID: $($response.id)"
+        return $response.id
+    }
+    catch {
+        Write-Error "Error creating folder '$FolderName': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Function to upload a file to OneDrive (simple upload for files < 4MB)
+function Upload-OneDriveFile {
+    param (
+        [string]$ParentPath,
+        [string]$FilePath,
+        [string]$FileName
+    )
+    
+    $fileSize = (Get-Item $FilePath).Length
+    $uri = "https://graph.microsoft.com/v1.0/$DriveId/items/root$ParentPath:/$($FileName):/content"
+    
+    try {
+        Write-Verbose "Uploading file '$FileName' ($([math]::Round($fileSize/1MB, 2)) MB) to $ParentPath"
+        
+        # Use FileStream for better memory handling with large files
+        $fileStream = [System.IO.File]::OpenRead($FilePath)
+        $response = Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -Body $fileStream -ContentType "application/octet-stream"
+        $fileStream.Close()
+        
+        Write-Verbose "Uploaded file with ID: $($response.id)"
+        return $response.id
+    }
+    catch {
+        Write-Error "Error uploading file '$FileName': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Function to process a directory recursively
+function Process-Directory {
+    param (
+        [string]$LocalDir,
+        [string]$OneDriveDir
+    )
+    
+    # Get all files in the current directory
+    $files = Get-ChildItem -Path $LocalDir -File
+    
+    foreach ($file in $files) {
+        Write-Progress -Activity "Uploading Files" -Status $file.FullName -PercentComplete -1
+        
+        # Check file size to determine upload method (4MB is Graph API simple upload limit)
+        $fileSizeMB = $file.Length / 1MB
+        if ($fileSizeMB -gt 4) {
+            Write-Warning "File '$($file.Name)' is large ($([math]::Round($fileSizeMB, 2)) MB). Consider implementing upload session for better reliability."
+        }
+        
+        Write-Host "Uploading file: $($file.Name)" -ForegroundColor Cyan
+        $fileId = Upload-OneDriveFile -ParentPath $OneDriveDir -FilePath $file.FullName -FileName $file.Name
+        
+        if ($fileId) {
+            Write-Host "✓ Uploaded successfully" -ForegroundColor Green
+        }
+    }
+    
+    # Get all subdirectories in the current directory
+    $subDirs = Get-ChildItem -Path $LocalDir -Directory
+    
+    foreach ($dir in $subDirs) {
+        Write-Host "Creating folder: $($dir.Name)" -ForegroundColor Yellow
+        $folderId = Create-OneDriveFolder -ParentPath $OneDriveDir -FolderName $dir.Name
+        
+        if ($folderId) {
+            Write-Host "✓ Folder created, processing contents..." -ForegroundColor Green
+            Process-Directory -LocalDir $dir.FullName -OneDriveDir "$OneDriveDir/$($dir.Name)"
+        }
+    }
+}
+
+# Main script execution
+try {
+    # Normalize OneDrive path format (should be :/path: or :/ for root)
+    if (-not $OneDrivePath.StartsWith(":")) { $OneDrivePath = ":$OneDrivePath" }
+    if (-not $OneDrivePath.EndsWith(":")) { $OneDrivePath = "$OneDrivePath:" }
+    
+    Write-Host @"
+Starting OneDrive Upload Process
+--------------------------------
+Local Path:    $LocalPath
+OneDrive Path: $OneDrivePath
+Drive ID:      $DriveId
+"@ -ForegroundColor Magenta
+
+    # Start processing
+    $startTime = Get-Date
+    Process-Directory -LocalDir $LocalPath -OneDriveDir $OneDrivePath
+    
+    $duration = (Get-Date) - $startTime
+    Write-Host "`nUpload process completed in $($duration.TotalSeconds.ToString('0.0')) seconds" -ForegroundColor Green
+}
+catch {
+    Write-Error "Fatal error in main script execution: $($_.Exception.Message)"
+    exit 1
+}
+finally {
+    Write-Progress -Activity "Uploading Files" -Completed
+}
