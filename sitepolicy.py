@@ -146,11 +146,13 @@ def get_subsites(sharepoint_token):
             for subsite in data['d']['results']:
                 title = subsite.get('Title', 'Unknown')
                 url = subsite.get('Url', '')
+                created = subsite.get('Created', 'Unknown')
                 subsites.append({
                     'Title': title,
-                    'Url': url
+                    'Url': url,
+                    'Created': created
                 })
-                print(f"Found subsite: {title} - {url}")
+                print(f"Found subsite: {title} - {url} (Created: {created})")
         
         print(f"Total subsites found: {len(subsites)}")
         return subsites
@@ -163,8 +165,8 @@ def get_subsites(sharepoint_token):
         print(f"Error getting subsites: {err}")
         raise
 
-def get_site_policy(site_url, sharepoint_token):
-    """Get policy name for a specific site"""
+def get_site_policy_and_properties(site_url, sharepoint_token):
+    """Get policy name and additional properties for a specific site"""
     # Construct the API endpoint for getting site properties
     api_url = f"{site_url}/_api/web/allproperties"
     
@@ -175,14 +177,21 @@ def get_site_policy(site_url, sharepoint_token):
     }
     
     try:
-        print(f"Getting policy for: {site_url}")
+        print(f"Getting properties for: {site_url}")
         response = requests.get(api_url, headers=headers)
         response.raise_for_status()
         
         data = response.json()
-        policy_name = "No Policy Found"
         
-        # Look for policy name in different possible locations
+        # Initialize default values
+        site_properties = {
+            'PolicyName': "No Policy Found",
+            'CloseDate': "Not Set",
+            'DeleteDate': "Not Set",
+            'SiteClosed': "Unknown"
+        }
+        
+        # Look for properties in different possible locations
         if 'd' in data:
             properties = data['d']
             
@@ -191,31 +200,92 @@ def get_site_policy(site_url, sharepoint_token):
             
             for field in policy_fields:
                 if field in properties and properties[field]:
-                    policy_name = properties[field]
+                    site_properties['PolicyName'] = properties[field]
                     break
             
-            # If not found in direct properties, check in custom properties
-            if policy_name == "No Policy Found" and 'AllProperties' in properties:
+            # Check for close date fields
+            close_date_fields = ['CloseDate', 'closedate', 'SiteCloseDate', 'siteclosedate']
+            for field in close_date_fields:
+                if field in properties and properties[field]:
+                    site_properties['CloseDate'] = properties[field]
+                    break
+            
+            # Check for delete date fields
+            delete_date_fields = ['DeleteDate', 'deletedate', 'SiteDeleteDate', 'sitedeletedate']
+            for field in delete_date_fields:
+                if field in properties and properties[field]:
+                    site_properties['DeleteDate'] = properties[field]
+                    break
+            
+            # Check for site closed status
+            closed_fields = ['SiteClosed', 'siteclosed', 'IsClosed', 'isclosed', 'Closed', 'closed']
+            for field in closed_fields:
+                if field in properties and properties[field] is not None:
+                    site_properties['SiteClosed'] = str(properties[field])
+                    break
+            
+            # If not found in direct properties, check in custom properties or AllProperties
+            if 'AllProperties' in properties:
                 all_props = properties['AllProperties']
-                for field in policy_fields:
-                    if field in all_props and all_props[field]:
-                        policy_name = all_props[field]
-                        break
+                
+                # Check policy in AllProperties
+                if site_properties['PolicyName'] == "No Policy Found":
+                    for field in policy_fields:
+                        if field in all_props and all_props[field]:
+                            site_properties['PolicyName'] = all_props[field]
+                            break
+                
+                # Check close date in AllProperties
+                if site_properties['CloseDate'] == "Not Set":
+                    for field in close_date_fields:
+                        if field in all_props and all_props[field]:
+                            site_properties['CloseDate'] = all_props[field]
+                            break
+                
+                # Check delete date in AllProperties
+                if site_properties['DeleteDate'] == "Not Set":
+                    for field in delete_date_fields:
+                        if field in all_props and all_props[field]:
+                            site_properties['DeleteDate'] = all_props[field]
+                            break
+                
+                # Check site closed in AllProperties
+                if site_properties['SiteClosed'] == "Unknown":
+                    for field in closed_fields:
+                        if field in all_props and all_props[field] is not None:
+                            site_properties['SiteClosed'] = str(all_props[field])
+                            break
         
-        print(f"Policy found: {policy_name}")
-        return policy_name
+        print(f"Properties found - Policy: {site_properties['PolicyName']}, " +
+              f"CloseDate: {site_properties['CloseDate']}, " +
+              f"DeleteDate: {site_properties['DeleteDate']}, " +
+              f"SiteClosed: {site_properties['SiteClosed']}")
+        
+        return site_properties
         
     except requests.exceptions.HTTPError as err:
-        print(f"HTTP Error getting policy for {site_url}: {err}")
+        print(f"HTTP Error getting properties for {site_url}: {err}")
+        error_msg = f"Error: {response.status_code}"
         if response.status_code == 404:
-            return "Site Not Found"
+            error_msg = "Site Not Found"
         elif response.status_code == 403:
-            return "Access Denied"
-        else:
-            return f"Error: {response.status_code}"
+            error_msg = "Access Denied"
+        
+        return {
+            'PolicyName': error_msg,
+            'CloseDate': error_msg,
+            'DeleteDate': error_msg,
+            'SiteClosed': error_msg
+        }
     except Exception as err:
-        print(f"Error getting policy for {site_url}: {err}")
-        return "Error Retrieving Policy"
+        print(f"Error getting properties for {site_url}: {err}")
+        error_msg = "Error Retrieving Properties"
+        return {
+            'PolicyName': error_msg,
+            'CloseDate': error_msg,
+            'DeleteDate': error_msg,
+            'SiteClosed': error_msg
+        }
 
 def generate_report(subsites_data, output_format='both'):
     """Generate report in JSON and/or CSV format"""
