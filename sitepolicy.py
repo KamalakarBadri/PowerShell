@@ -394,17 +394,37 @@ def generate_report(subsites_data, output_format='both'):
         csv_filename = f"sharepoint_policy_report_{timestamp}.csv"
         with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Site Title', 'Site URL', 'Created Date', 'Policy Name', 'Close Date', 'Delete Date', 'Site Closed'])
+            
+            # Create headers for each column
+            headers = [
+                'Site_Title',
+                'Site_URL', 
+                'Created_Date',
+                'Hierarchy_Level',
+                'Parent_Site',
+                'Full_Path',
+                'Policy_Name',
+                'Close_Date',
+                'Delete_Date', 
+                'Site_Closed'
+            ]
+            writer.writerow(headers)
+            
+            # Write data rows with each property in its own column
             for site in subsites_data:
-                writer.writerow([
-                    site['Title'], 
-                    site['Url'], 
-                    site['Created'],
-                    site['PolicyName'], 
-                    site['CloseDate'], 
-                    site['DeleteDate'], 
-                    site['SiteClosed']
-                ])
+                row = [
+                    site.get('Title', ''),
+                    site.get('Url', ''),
+                    site.get('Created', ''),
+                    site.get('Level', ''),
+                    site.get('ParentTitle', ''),
+                    site.get('FullPath', ''),
+                    site.get('PolicyName', ''),
+                    site.get('CloseDate', ''),
+                    site.get('DeleteDate', ''),
+                    site.get('SiteClosed', '')
+                ]
+                writer.writerow(row)
         print(f"CSV report saved: {csv_filename}")
     
     return subsites_data
@@ -423,9 +443,9 @@ def main():
         sharepoint_token = get_access_token(sharepoint_jwt, scope_sharepoint)
         print("SharePoint access token retrieved successfully")
         
-        print("\nStep 2: Fetching all subsites...")
-        # Get all subsites
-        subsites = get_subsites(sharepoint_token)
+        print("\nStep 2: Discovering all subsites recursively...")
+        # Get all subsites recursively
+        subsites = get_all_subsites_recursive(sharepoint_token, max_depth=5)
         
         if not subsites:
             print("No subsites found!")
@@ -436,13 +456,17 @@ def main():
         subsites_with_properties = []
         
         for i, subsite in enumerate(subsites, 1):
-            print(f"\nProcessing {i}/{len(subsites)}: {subsite['Title']}")
+            indent = "  " * subsite['Level']
+            print(f"\n{indent}Processing {i}/{len(subsites)} (Level {subsite['Level']}): {subsite['Title']}")
             site_properties = get_site_policy_and_properties(subsite['Url'], sharepoint_token)
             
             subsites_with_properties.append({
                 'Title': subsite['Title'],
                 'Url': subsite['Url'],
                 'Created': subsite['Created'],
+                'Level': subsite['Level'],
+                'ParentTitle': subsite['ParentTitle'],
+                'FullPath': subsite['FullPath'],
                 'PolicyName': site_properties['PolicyName'],
                 'CloseDate': site_properties['CloseDate'],
                 'DeleteDate': site_properties['DeleteDate'],
@@ -452,39 +476,59 @@ def main():
             # Add a small delay to avoid throttling
             time.sleep(0.5)
         
-        print("\nStep 4: Generating reports...")
+        print("\nStep 4: Generating comprehensive reports...")
         # Generate reports
         generate_report(subsites_with_properties, 'both')
         
-        print("\n=== Summary ===")
+        print("\n=== Comprehensive Summary ===")
         print(f"Total subsites processed: {len(subsites_with_properties)}")
         
-        # Summary statistics
+        # Summary statistics by level
+        level_stats = {}
         policy_counts = {}
         closed_counts = {'True': 0, 'False': 0, 'Unknown': 0}
         
         for site in subsites_with_properties:
+            level = site['Level']
+            if level not in level_stats:
+                level_stats[level] = {'count': 0, 'policies': {}, 'closed': 0}
+            
+            level_stats[level]['count'] += 1
+            
             policy = site['PolicyName']
             policy_counts[policy] = policy_counts.get(policy, 0) + 1
+            
+            if policy not in level_stats[level]['policies']:
+                level_stats[level]['policies'][policy] = 0
+            level_stats[level]['policies'][policy] += 1
             
             closed_status = site['SiteClosed'].lower()
             if closed_status in ['true', '1', 'yes']:
                 closed_counts['True'] += 1
+                level_stats[level]['closed'] += 1
             elif closed_status in ['false', '0', 'no']:
                 closed_counts['False'] += 1
             else:
                 closed_counts['Unknown'] += 1
         
-        print("\nPolicy distribution:")
+        print(f"\nHierarchy breakdown:")
+        for level in sorted(level_stats.keys()):
+            stats = level_stats[level]
+            print(f"  Level {level}: {stats['count']} sites ({stats['closed']} closed)")
+            for policy, count in stats['policies'].items():
+                print(f"    - {policy}: {count} sites")
+        
+        print(f"\nOverall policy distribution:")
         for policy, count in policy_counts.items():
             print(f"  {policy}: {count} sites")
         
-        print(f"\nSite closure status:")
+        print(f"\nOverall site closure status:")
         print(f"  Closed sites: {closed_counts['True']}")
         print(f"  Open sites: {closed_counts['False']}")
         print(f"  Unknown status: {closed_counts['Unknown']}")
         
-        print("\nReport generation completed successfully!")
+        print("\nComprehensive report generation completed successfully!")
+        print("The report includes full hierarchy with parent-child relationships.")
         return subsites_with_properties
         
     except Exception as e:
