@@ -126,17 +126,21 @@ def get_access_token(jwt, scope):
         print(f"Error: {err}")
         raise
 
-def get_subsites(sharepoint_token):
-    """Get all subsites from the specified SharePoint location"""
+def get_subsites(base_url, sharepoint_token, level=0, parent_title="Root"):
+    """Get all subsites from the specified SharePoint location (recursive)"""
     headers = {
         "Authorization": f"Bearer {sharepoint_token}",
         "Accept": "application/json;odata=verbose",
         "Content-Type": "application/json"
     }
     
+    # Construct the API URL for getting subsites
+    api_url = f"{base_url}/_api/web/webs"
+    indent = "  " * level
+    
     try:
-        print(f"Fetching subsites from: {BASE_SUBSITES_URL}")
-        response = requests.get(BASE_SUBSITES_URL, headers=headers)
+        print(f"{indent}Fetching subsites from: {api_url}")
+        response = requests.get(api_url, headers=headers)
         response.raise_for_status()
         
         data = response.json()
@@ -147,23 +151,106 @@ def get_subsites(sharepoint_token):
                 title = subsite.get('Title', 'Unknown')
                 url = subsite.get('Url', '')
                 created = subsite.get('Created', 'Unknown')
-                subsites.append({
+                
+                subsite_info = {
                     'Title': title,
                     'Url': url,
-                    'Created': created
-                })
-                print(f"Found subsite: {title} - {url} (Created: {created})")
+                    'Created': created,
+                    'Level': level,
+                    'ParentTitle': parent_title,
+                    'FullPath': f"{parent_title} > {title}" if parent_title != "Root" else title
+                }
+                
+                subsites.append(subsite_info)
+                print(f"{indent}Found subsite (Level {level}): {title} - {url} (Created: {created})")
         
-        print(f"Total subsites found: {len(subsites)}")
+        print(f"{indent}Total subsites found at level {level}: {len(subsites)}")
         return subsites
         
     except requests.exceptions.HTTPError as err:
-        print(f"HTTP Error getting subsites: {err}")
-        print(f"Response: {response.text}")
-        raise
+        print(f"{indent}HTTP Error getting subsites from {api_url}: {err}")
+        if response.status_code == 404:
+            print(f"{indent}No subsites found or endpoint not accessible")
+            return []
+        else:
+            print(f"{indent}Response: {response.text}")
+            raise
     except Exception as err:
-        print(f"Error getting subsites: {err}")
-        raise
+        print(f"{indent}Error getting subsites from {api_url}: {err}")
+        return []
+
+def get_all_subsites_recursive(sharepoint_token, max_depth=5):
+    """Get all subsites recursively from the base location"""
+    all_subsites = []
+    processed_urls = set()  # Prevent infinite loops
+    
+    print("=== Starting Recursive Subsite Discovery ===")
+    
+    # Start with the base URL
+    base_site_info = {
+        'Title': 'XYX (Root Site)',
+        'Url': 'https://geekbyteonline.sharepoint.com/sites/New365/XYX',
+        'Created': 'Unknown',
+        'Level': -1,
+        'ParentTitle': 'Root',
+        'FullPath': 'XYX (Root Site)'
+    }
+    
+    # Queue for processing sites (site_info, current_level)
+    sites_to_process = [(base_site_info, 0)]
+    
+    while sites_to_process and len(sites_to_process[0]) > 0:
+        current_site, current_level = sites_to_process.pop(0)
+        
+        if current_level > max_depth:
+            print(f"Reached maximum depth ({max_depth}), skipping deeper levels")
+            continue
+            
+        if current_site['Url'] in processed_urls:
+            print(f"Already processed {current_site['Url']}, skipping to avoid loops")
+            continue
+            
+        processed_urls.add(current_site['Url'])
+        
+        # Add current site to results if it's not the root
+        if current_level >= 0:
+            all_subsites.append(current_site)
+        
+        # Get subsites of current site
+        try:
+            subsites = get_subsites(
+                current_site['Url'], 
+                sharepoint_token, 
+                current_level, 
+                current_site['Title']
+            )
+            
+            # Add found subsites to processing queue
+            for subsite in subsites:
+                subsite['Level'] = current_level
+                sites_to_process.append((subsite, current_level + 1))
+                
+            # Small delay to avoid throttling
+            time.sleep(0.3)
+            
+        except Exception as e:
+            print(f"Error processing {current_site['Url']}: {str(e)}")
+            continue
+    
+    print(f"\n=== Recursive Discovery Complete ===")
+    print(f"Total sites found across all levels: {len(all_subsites)}")
+    
+    # Print hierarchy summary
+    level_counts = {}
+    for site in all_subsites:
+        level = site['Level']
+        level_counts[level] = level_counts.get(level, 0) + 1
+    
+    print("Sites by level:")
+    for level in sorted(level_counts.keys()):
+        print(f"  Level {level}: {level_counts[level]} sites")
+    
+    return all_subsites
 
 def get_site_policy_and_properties(site_url, sharepoint_token):
     """Get policy name and additional properties for a specific site"""
@@ -307,9 +394,17 @@ def generate_report(subsites_data, output_format='both'):
         csv_filename = f"sharepoint_policy_report_{timestamp}.csv"
         with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Site Title', 'Site URL', 'Policy Name'])
+            writer.writerow(['Site Title', 'Site URL', 'Created Date', 'Policy Name', 'Close Date', 'Delete Date', 'Site Closed'])
             for site in subsites_data:
-                writer.writerow([site['Title'], site['Url'], site['PolicyName']])
+                writer.writerow([
+                    site['Title'], 
+                    site['Url'], 
+                    site['Created'],
+                    site['PolicyName'], 
+                    site['CloseDate'], 
+                    site['DeleteDate'], 
+                    site['SiteClosed']
+                ])
         print(f"CSV report saved: {csv_filename}")
     
     return subsites_data
@@ -336,18 +431,22 @@ def main():
             print("No subsites found!")
             return
         
-        print(f"\nStep 3: Getting policy information for {len(subsites)} subsites...")
-        # Get policy for each subsite
-        subsites_with_policy = []
+        print(f"\nStep 3: Getting policy and property information for {len(subsites)} subsites...")
+        # Get policy and properties for each subsite
+        subsites_with_properties = []
         
         for i, subsite in enumerate(subsites, 1):
             print(f"\nProcessing {i}/{len(subsites)}: {subsite['Title']}")
-            policy_name = get_site_policy(subsite['Url'], sharepoint_token)
+            site_properties = get_site_policy_and_properties(subsite['Url'], sharepoint_token)
             
-            subsites_with_policy.append({
+            subsites_with_properties.append({
                 'Title': subsite['Title'],
                 'Url': subsite['Url'],
-                'PolicyName': policy_name
+                'Created': subsite['Created'],
+                'PolicyName': site_properties['PolicyName'],
+                'CloseDate': site_properties['CloseDate'],
+                'DeleteDate': site_properties['DeleteDate'],
+                'SiteClosed': site_properties['SiteClosed']
             })
             
             # Add a small delay to avoid throttling
@@ -355,23 +454,38 @@ def main():
         
         print("\nStep 4: Generating reports...")
         # Generate reports
-        generate_report(subsites_with_policy, 'both')
+        generate_report(subsites_with_properties, 'both')
         
         print("\n=== Summary ===")
-        print(f"Total subsites processed: {len(subsites_with_policy)}")
+        print(f"Total subsites processed: {len(subsites_with_properties)}")
         
         # Summary statistics
         policy_counts = {}
-        for site in subsites_with_policy:
+        closed_counts = {'True': 0, 'False': 0, 'Unknown': 0}
+        
+        for site in subsites_with_properties:
             policy = site['PolicyName']
             policy_counts[policy] = policy_counts.get(policy, 0) + 1
+            
+            closed_status = site['SiteClosed'].lower()
+            if closed_status in ['true', '1', 'yes']:
+                closed_counts['True'] += 1
+            elif closed_status in ['false', '0', 'no']:
+                closed_counts['False'] += 1
+            else:
+                closed_counts['Unknown'] += 1
         
         print("\nPolicy distribution:")
         for policy, count in policy_counts.items():
             print(f"  {policy}: {count} sites")
         
+        print(f"\nSite closure status:")
+        print(f"  Closed sites: {closed_counts['True']}")
+        print(f"  Open sites: {closed_counts['False']}")
+        print(f"  Unknown status: {closed_counts['Unknown']}")
+        
         print("\nReport generation completed successfully!")
-        return subsites_with_policy
+        return subsites_with_properties
         
     except Exception as e:
         print(f"An error occurred: {str(e)}")
