@@ -565,4 +565,332 @@ def parse_site_users_xml(xml_content):
                     user_id_elem = properties.find('d:Id', namespaces)
                     title_elem = properties.find('d:Title', namespaces)  
                     email_elem = properties.find('d:Email', namespaces)
-                    login_name_elem = properties.fi
+                    login_name_elem = properties.find('d:LoginName', namespaces)
+                    is_site_admin_elem = properties.find('d:IsSiteAdmin', namespaces)
+                    
+                    # Get values safely
+                    user_id = user_id_elem.text if user_id_elem is not None else None
+                    title = title_elem.text if title_elem is not None else None
+                    email = email_elem.text if email_elem is not None else None
+                    login_name = login_name_elem.text if login_name_elem is not None else None
+                    is_site_admin = is_site_admin_elem.text == 'true' if is_site_admin_elem is not None else False
+                    
+                    if is_site_admin:
+                        admins.append({
+                            'user_id': user_id,
+                            'title': title,
+                            'email': email,
+                            'login_name': login_name,
+                            'is_site_admin': is_site_admin
+                        })
+        
+        logger.info(f"Found {len(admins)} site administrators")
+        return admins
+        
+    except Exception as e:
+        logger.exception("Failed to parse site users XML")
+        raise Exception(f"Failed to parse XML response: {str(e)}")
+
+def get_site_admins(site_url):
+    """Get all site administrators for a SharePoint site/OneDrive"""
+    try:
+        # Ensure site URL ends properly
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        # Construct SharePoint API URL
+        site_users_url = f"{site_url}_api/web/siteusers"
+        logger.info(f"Fetching site admins from URL: {site_users_url}")
+        
+        # Get SharePoint token
+        sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
+        if not sharepoint_token:
+            sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
+        
+        if not sharepoint_token:
+            raise Exception("Failed to obtain SharePoint access token")
+        
+        # Call SharePoint API to get site users
+        sharepoint_headers = {
+            "Authorization": f"Bearer {sharepoint_token}",
+            "Accept": "application/xml"
+        }
+        
+        logger.info(f"Making request to: {site_users_url}")
+        site_users_response = requests.get(site_users_url, headers=sharepoint_headers)
+        
+        if site_users_response.status_code != 200:
+            logger.error(f"SharePoint API failed: {site_users_response.status_code} - {site_users_response.text}")
+            raise Exception(f"Failed to get site users from {site_users_url}: {site_users_response.text}")
+        
+        # Parse XML and find all admins
+        admins = parse_site_users_xml(site_users_response.text)
+        logger.info(f"Found admins: {[a['email'] or a['login_name'] for a in admins]}")
+        return admins
+        
+    except Exception as e:
+        logger.exception(f"Failed to get site admins from {site_url}")
+        raise
+
+def resolve_site_url(input_str):
+    """Resolve the actual site URL from various input types"""
+    try:
+        # If it's already a URL
+        if input_str.startswith('http'):
+            if "my.sharepoint.com" in input_str.lower():
+                # OneDrive URL
+                if input_str.endswith('/Documents'):
+                    return input_str[:-10]
+                return input_str
+            else:
+                # SharePoint site URL
+                return input_str
+        
+        # If it's a UPN (contains @)
+        elif '@' in input_str:
+            return get_onedrive_url(input_str)
+        
+        # Otherwise assume it's a site name
+        else:
+            if not input_str.startswith('sites/'):
+                input_str = f"sites/{input_str}"
+            return f"https://{CONFIG['tenant_name'].split('.')[0]}.sharepoint.com/{input_str}"
+            
+    except Exception as e:
+        logger.exception("Failed to resolve site URL")
+        raise
+
+def get_request_digest(site_url, token):
+    """Get request digest for SharePoint API calls"""
+    try:
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=verbose"
+        }
+        
+        response = requests.post(
+            f"{site_url}_api/contextinfo",
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            return response.json()['d']['GetContextWebInformation']['FormDigestValue']
+        else:
+            raise Exception(f"Failed to get request digest: {response.text}")
+    except Exception as e:
+        logger.exception("Failed to get request digest")
+        raise
+
+def ensure_user(site_url, token, request_digest, user_upn):
+    """Ensure user exists on site and return user ID"""
+    try:
+        ensure_url = f"{site_url}_api/web/ensureuser('{user_upn}')"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
+            "X-RequestDigest": request_digest
+        }
+        
+        response = requests.post(ensure_url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return data['d']['Id']
+        else:
+            logger.error(f"Failed to ensure user {user_upn}: {response.text}")
+            return None
+    except Exception as e:
+        logger.exception(f"Error ensuring user {user_upn}")
+        return None
+
+def set_site_admin(site_url, token, request_digest, user_id, is_admin=True):
+    """Set or remove site admin permissions for user"""
+    try:
+        admin_url = f"{site_url}_api/web/siteusers/getbyid({user_id})"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
+            "X-RequestDigest": request_digest,
+            "IF-MATCH": "*",
+            "X-HTTP-Method": "MERGE"
+        }
+        
+        body = {
+            "__metadata": {"type": "SP.User"},
+            "IsSiteAdmin": is_admin
+        }
+        
+        logger.info(f"Setting admin status to {is_admin} for user {user_id} via {admin_url}")
+        response = requests.post(admin_url, headers=headers, json=body)
+        
+        if response.status_code in [200, 204]:
+            logger.info(f"Successfully set site admin to {is_admin} for user ID {user_id}")
+            return True
+        else:
+            logger.error(f"Failed to set site admin for user ID {user_id}: {response.text}")
+            return False
+    except Exception as e:
+        logger.exception(f"Error setting site admin for user ID {user_id}")
+        return False
+
+def add_user_as_admin(site_url, upn):
+    """Add a user as admin to a SharePoint site/OneDrive"""
+    try:
+        # Ensure site URL ends properly
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        # Get SharePoint token
+        sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
+        if not sharepoint_token:
+            sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
+        
+        if not sharepoint_token:
+            raise Exception("Failed to obtain SharePoint access token")
+        
+        # Get request digest
+        request_digest = get_request_digest(site_url, sharepoint_token)
+        if not request_digest:
+            raise Exception("Failed to get request digest")
+        
+        # First ensure the user exists on the site
+        user_id = ensure_user(site_url, sharepoint_token, request_digest, upn)
+        if not user_id:
+            raise Exception(f"Failed to ensure user {upn} exists on site")
+        
+        # Set user as admin
+        if not set_site_admin(site_url, sharepoint_token, request_digest, user_id, True):
+            raise Exception(f"Failed to set admin privileges for user {upn}")
+        
+        logger.info(f"Successfully added {upn} as admin to {site_url}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Failed to add {upn} as admin to {site_url}")
+        raise
+
+def remove_admin_privileges(site_url, user_id):
+    """Remove admin privileges from a user on a SharePoint site/OneDrive"""
+    try:
+        # Ensure site URL ends properly
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        # Get SharePoint token
+        sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
+        if not sharepoint_token:
+            sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
+        
+        if not sharepoint_token:
+            raise Exception("Failed to obtain SharePoint access token")
+        
+        # Get request digest
+        request_digest = get_request_digest(site_url, sharepoint_token)
+        if not request_digest:
+            raise Exception("Failed to get request digest")
+        
+        # Remove admin privileges
+        if not set_site_admin(site_url, sharepoint_token, request_digest, user_id, False):
+            raise Exception(f"Failed to remove admin privileges for user {user_id}")
+        
+        logger.info(f"Successfully removed admin privileges for user {user_id} from {site_url}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Failed to remove admin privileges for user {user_id} from {site_url}")
+        raise
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/get_admins', methods=['POST'])
+def get_admins():
+    try:
+        data = request.json
+        input_str = data.get('input', '').strip()
+        
+        logger.info(f"Getting admins for input: {input_str}")
+        
+        if not input_str:
+            return jsonify({"error": "Input is required"}), 400
+        
+        # Resolve the site URL from various input types
+        site_url = resolve_site_url(input_str)
+        logger.info(f"Resolved site URL: {site_url}")
+        
+        # Determine site type
+        if "my.sharepoint.com" in site_url.lower():
+            site_type = "OneDrive"
+        else:
+            site_type = "SharePoint Site"
+        
+        # Get site admins
+        admins = get_site_admins(site_url)
+        
+        logger.info(f"Found {len(admins)} admins for site {site_url}")
+        
+        return jsonify({
+            "success": True,
+            "site_url": site_url,
+            "site_type": site_type,
+            "admins": admins
+        })
+        
+    except Exception as e:
+        logger.exception("Error occurred during admin listing")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/manage_admin', methods=['POST'])
+def manage_admin():
+    try:
+        data = request.json
+        site_url = data.get('site_url', '').strip()
+        action = data.get('action', '').strip()
+        upn = data.get('upn', '').strip()
+        user_id = data.get('user_id', '').strip()
+        
+        logger.info(f"Managing admin: site_url={site_url}, action={action}, upn={upn}, user_id={user_id}")
+        
+        if not site_url or action not in ['add', 'remove']:
+            return jsonify({"error": "Invalid parameters provided"}), 400
+        
+        if action == 'add' and not upn:
+            return jsonify({"error": "User UPN is required for add operations"}), 400
+        if action == 'remove' and not user_id:
+            return jsonify({"error": "User ID is required for remove operations"}), 400
+        
+        # Perform the action
+        if action == 'add':
+            add_user_as_admin(site_url, upn)
+            # After adding, get the updated admin list to return
+            admins_url = f"{site_url}/_api/web/siteusers"
+            logger.info(f"Fetching updated admin list from: {admins_url}")
+            admins = get_site_admins(site_url)
+            added_admin = next((a for a in admins if a['email'] == upn or a['login_name'] == upn), None)
+            if not added_admin:
+                logger.error(f"User {upn} not found in admin list. Admin list contains: {[a['email'] or a['login_name'] for a in admins]}")
+                raise Exception(f"User was added as admin but cannot be found in admin list (checked URL: {admins_url})")
+            user_id = added_admin['user_id']
+        else:
+            remove_admin_privileges(site_url, user_id)
+        
+        logger.info(f"Successfully {action} admin privileges for {upn or user_id} on {site_url}")
+        return jsonify({
+            "success": True,
+            "message": f"Successfully {action} admin privileges",
+            "user_id": user_id,
+            "site_url": site_url,
+            "action": action
+        })
+        
+    except Exception as e:
+        logger.exception("Error occurred during admin management")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5055, debug=True)
