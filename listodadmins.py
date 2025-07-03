@@ -25,9 +25,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-CONFIG = {
 
+# Token cache
+TOKEN_CACHE = {
+    "graph": {"token": None, "expires": 0},
+    "sharepoint": {"token": None, "expires": 0}
+}
 
 def get_token_with_certificate(scope):
     """Get access token using certificate-based authentication"""
@@ -110,38 +113,151 @@ def get_token_with_secret(scope):
         logger.exception("Client secret authentication failed")
         return None
 
-def parse_site_users_xml(xml_content):
-    """Parse SharePoint site users XML and return all admins"""
+def get_cached_token(scope_type):
+    """Get cached token if it's still valid, otherwise get a new one"""
+    cache = TOKEN_CACHE[scope_type]
+    
+    # If token exists and hasn't expired (with 5 minute buffer)
+    if cache["token"] and cache["expires"] > time.time() + 300:
+        logger.debug("Using cached token")
+        return cache["token"]
+    
+    # Get new token
+    scope = CONFIG['scopes'][scope_type]
+    
+    # Try certificate first
+    token = get_token_with_certificate(scope)
+    if not token:
+        # Fall back to client secret
+        token = get_token_with_secret(scope)
+    
+    if token:
+        # Cache the token with expiration (assuming 1 hour lifetime)
+        cache["token"] = token
+        cache["expires"] = time.time() + 3600
+        return token
+    
+    return None
+
+def get_site_owner(site_url):
+    """Get site owner details from SharePoint site"""
     try:
-        logger.debug("Parsing XML for site admins")
+        # Ensure site URL ends properly
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        # Construct SharePoint API URL for site owner
+        site_owner_url = f"{site_url}_api/site/owner"
+        logger.info(f"Fetching site owner from URL: {site_owner_url}")
+        
+        # Get SharePoint token
+        sharepoint_token = get_cached_token("sharepoint")
+        if not sharepoint_token:
+            raise Exception("Failed to obtain SharePoint access token")
+        
+        # Call SharePoint API to get site owner
+        sharepoint_headers = {
+            "Authorization": f"Bearer {sharepoint_token}",
+            "Accept": "application/xml"
+        }
+        
+        logger.info(f"Making request to: {site_owner_url}")
+        site_owner_response = requests.get(site_owner_url, headers=sharepoint_headers)
+        
+        if site_owner_response.status_code != 200:
+            logger.error(f"SharePoint API failed: {site_owner_response.status_code} - {site_owner_response.text}")
+            raise Exception(f"Failed to get site owner from {site_owner_url}: {site_owner_response.text}")
+        
+        # Parse XML response
+        owner_info = parse_site_owner_xml(site_owner_response.text)
+        logger.info(f"Found owner: {owner_info.get('email') or owner_info.get('login_name')}")
+        return owner_info
+        
+    except Exception as e:
+        logger.exception(f"Failed to get site owner from {site_url}")
+        raise
+
+def parse_site_owner_xml(xml_content):
+    """Parse SharePoint site owner XML and return owner details"""
+    try:
+        logger.debug("Parsing XML for site owner")
         
         # Parse XML
         root = ET.fromstring(xml_content)
         
-        # Define namespaces
-        namespaces = {
+        # Register namespaces to handle default namespace
+        ns = {
+            'atom': 'http://www.w3.org/2005/Atom',
             'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices',
-            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata',
-            'atom': 'http://www.w3.org/2005/Atom'
+            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'
+        }
+        
+        # Find the content element
+        content = root.find('.//atom:content', ns)
+        if content is None:
+            raise Exception("No content found in owner XML response")
+        
+        # Find properties
+        properties = content.find('.//m:properties', ns)
+        if properties is None:
+            raise Exception("No properties found in owner XML response")
+        
+        # Extract owner details
+        user_id_elem = properties.find('.//d:Id', ns)
+        title_elem = properties.find('.//d:Title', ns)  
+        email_elem = properties.find('.//d:Email', ns)
+        login_name_elem = properties.find('.//d:LoginName', ns)
+        user_principal_name_elem = properties.find('.//d:UserPrincipalName', ns)
+        
+        # Get values safely
+        owner_info = {
+            'user_id': user_id_elem.text if user_id_elem is not None else None,
+            'title': title_elem.text if title_elem is not None else None,
+            'email': email_elem.text if email_elem is not None else None,
+            'login_name': login_name_elem.text if login_name_elem is not None else None,
+            'user_principal_name': user_principal_name_elem.text if user_principal_name_elem is not None else None
+        }
+        
+        logger.info(f"Parsed owner info: {owner_info}")
+        return owner_info
+        
+    except Exception as e:
+        logger.exception("Failed to parse site owner XML")
+        raise Exception(f"Failed to parse owner XML response: {str(e)}")
+
+def parse_site_users_xml(xml_content):
+    """Parse SharePoint site users XML and return all users with admin privileges"""
+    try:
+        logger.debug("Parsing XML for site users")
+        
+        # Parse XML
+        root = ET.fromstring(xml_content)
+        
+        # Register namespaces
+        ns = {
+            'atom': 'http://www.w3.org/2005/Atom',
+            'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices',
+            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'
         }
         
         # Find all entries
-        entries = root.findall('.//atom:entry', namespaces)
+        entries = root.findall('.//atom:entry', ns)
         logger.debug(f"Found {len(entries)} entries in XML")
         
-        admins = []
+        users = []
         
         for entry in entries:
-            content = entry.find('atom:content', namespaces)
+            content = entry.find('.//atom:content', ns)
             if content is not None:
-                properties = content.find('m:properties', namespaces)
+                properties = content.find('.//m:properties', ns)
                 if properties is not None:
                     # Extract user details
-                    user_id_elem = properties.find('d:Id', namespaces)
-                    title_elem = properties.find('d:Title', namespaces)  
-                    email_elem = properties.find('d:Email', namespaces)
-                    login_name_elem = properties.find('d:LoginName', namespaces)
-                    is_site_admin_elem = properties.find('d:IsSiteAdmin', namespaces)
+                    user_id_elem = properties.find('.//d:Id', ns)
+                    title_elem = properties.find('.//d:Title', ns)  
+                    email_elem = properties.find('.//d:Email', ns)
+                    login_name_elem = properties.find('.//d:LoginName', ns)
+                    is_site_admin_elem = properties.find('.//d:IsSiteAdmin', ns)
+                    user_principal_name_elem = properties.find('.//d:UserPrincipalName', ns)
                     
                     # Get values safely
                     user_id = user_id_elem.text if user_id_elem is not None else None
@@ -149,25 +265,26 @@ def parse_site_users_xml(xml_content):
                     email = email_elem.text if email_elem is not None else None
                     login_name = login_name_elem.text if login_name_elem is not None else None
                     is_site_admin = is_site_admin_elem.text == 'true' if is_site_admin_elem is not None else False
+                    user_principal_name = user_principal_name_elem.text if user_principal_name_elem is not None else None
                     
-                    if is_site_admin:
-                        admins.append({
-                            'user_id': user_id,
-                            'title': title,
-                            'email': email,
-                            'login_name': login_name,
-                            'is_site_admin': is_site_admin
-                        })
+                    users.append({
+                        'user_id': user_id,
+                        'title': title,
+                        'email': email,
+                        'login_name': login_name,
+                        'is_site_admin': is_site_admin,
+                        'user_principal_name': user_principal_name
+                    })
         
-        logger.info(f"Found {len(admins)} site administrators")
-        return admins
+        logger.info(f"Found {len(users)} total users")
+        return users
         
     except Exception as e:
         logger.exception("Failed to parse site users XML")
         raise Exception(f"Failed to parse XML response: {str(e)}")
 
-def get_site_admins(site_url):
-    """Get all site administrators for a SharePoint site/OneDrive"""
+def get_site_users(site_url):
+    """Get all site users for a SharePoint site/OneDrive"""
     try:
         # Ensure site URL ends properly
         if not site_url.endswith('/'):
@@ -175,13 +292,10 @@ def get_site_admins(site_url):
         
         # Construct SharePoint API URL
         site_users_url = f"{site_url}_api/web/siteusers"
-        logger.info(f"Fetching site admins from URL: {site_users_url}")
+        logger.info(f"Fetching site users from URL: {site_users_url}")
         
         # Get SharePoint token
-        sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
-        if not sharepoint_token:
-            sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
-        
+        sharepoint_token = get_cached_token("sharepoint")
         if not sharepoint_token:
             raise Exception("Failed to obtain SharePoint access token")
         
@@ -198,14 +312,48 @@ def get_site_admins(site_url):
             logger.error(f"SharePoint API failed: {site_users_response.status_code} - {site_users_response.text}")
             raise Exception(f"Failed to get site users from {site_users_url}: {site_users_response.text}")
         
-        # Parse XML and find all admins
-        admins = parse_site_users_xml(site_users_response.text)
-        logger.info(f"Found admins: {[a['email'] or a['login_name'] for a in admins]}")
-        return admins
+        # Parse XML and get all users
+        users = parse_site_users_xml(site_users_response.text)
+        return users
         
     except Exception as e:
-        logger.exception(f"Failed to get site admins from {site_url}")
+        logger.exception(f"Failed to get site users from {site_url}")
         raise
+
+def filter_admins_exclude_owner(users, owner_info):
+    """Filter out admins excluding the owner"""
+    try:
+        admins = [user for user in users if user['is_site_admin']]
+        
+        # Filter out owner from admins list
+        owner_login = owner_info.get('login_name')
+        owner_email = owner_info.get('email')
+        owner_upn = owner_info.get('user_principal_name')
+        
+        other_admins = []
+        for admin in admins:
+            admin_login = admin.get('login_name')
+            admin_email = admin.get('email')
+            admin_upn = admin.get('user_principal_name')
+            
+            # Check if this admin is not the owner
+            is_owner = False
+            if owner_login and admin_login and owner_login == admin_login:
+                is_owner = True
+            elif owner_email and admin_email and owner_email == admin_email:
+                is_owner = True
+            elif owner_upn and admin_upn and owner_upn == admin_upn:
+                is_owner = True
+            
+            if not is_owner:
+                other_admins.append(admin)
+        
+        logger.info(f"Found {len(other_admins)} additional admins (excluding owner)")
+        return other_admins
+        
+    except Exception as e:
+        logger.exception("Failed to filter admins")
+        return []
 
 def read_onedrive_urls_from_csv(file_path):
     """Read OneDrive URLs from a CSV file with 'Web URL' header"""
@@ -229,66 +377,65 @@ def read_onedrive_urls_from_csv(file_path):
         logger.exception(f"Failed to read URLs from {file_path}")
         raise
 
-def extract_owner_from_url(onedrive_url):
-    """Extract owner information from OneDrive URL"""
-    try:
-        # Extract the personal folder part from OneDrive URL
-        # Example: https://tenant-my.sharepoint.com/personal/username_domain_com/
-        if '/personal/' in onedrive_url:
-            parts = onedrive_url.split('/personal/')
-            if len(parts) > 1:
-                owner_part = parts[1].split('/')[0]
-                # Convert back to email format
-                owner_email = owner_part.replace('_', '.').replace('@', '_', 1).replace('_', '@', 1)
-                return owner_email
-        return "Unknown"
-    except Exception as e:
-        logger.warning(f"Could not extract owner from URL {onedrive_url}: {e}")
-        return "Unknown"
-
 def save_to_csv(results, filename):
-    """Save results to CSV file"""
+    """Save results to CSV file with all additional admins in the same row"""
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['onedrive_url', 'owner', 'admin_count', 'admin_name', 'admin_email', 'admin_login_name', 'status', 'error']
+            fieldnames = [
+                'onedrive_url', 'status', 'error',
+                'owner_name', 'owner_email', 'owner_login_name', 'owner_upn',
+                'additional_admin_count',
+                'admin_names', 'admin_emails', 'admin_login_names', 'admin_upns'
+            ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             writer.writeheader()
             for result in results:
                 if result['status'] == 'success':
-                    if result['admins']:
-                        for admin in result['admins']:
-                            writer.writerow({
-                                'onedrive_url': result['onedrive_url'],
-                                'owner': result['owner'],
-                                'admin_count': len(result['admins']),
-                                'admin_name': admin.get('title', ''),
-                                'admin_email': admin.get('email', ''),
-                                'admin_login_name': admin.get('login_name', ''),
-                                'status': result['status'],
-                                'error': ''
-                            })
-                    else:
-                        writer.writerow({
-                            'onedrive_url': result['onedrive_url'],
-                            'owner': result['owner'],
-                            'admin_count': 0,
-                            'admin_name': '',
-                            'admin_email': '',
-                            'admin_login_name': '',
-                            'status': result['status'],
-                            'error': 'No admins found'
-                        })
-                else:
+                    owner = result.get('owner', {})
+                    admins = result.get('additional_admins', [])
+                    
+                    # Combine all admin details into semicolon-separated strings
+                    admin_names = []
+                    admin_emails = []
+                    admin_login_names = []
+                    admin_upns = []
+                    
+                    for admin in admins:
+                        admin_names.append(str(admin.get('title', '')) if admin.get('title') is not None else '')
+                        admin_emails.append(str(admin.get('email', '')) if admin.get('email') is not None else '')
+                        admin_login_names.append(str(admin.get('login_name', '')) if admin.get('login_name') is not None else '')
+                        admin_upns.append(str(admin.get('user_principal_name', '')) if admin.get('user_principal_name') is not None else '')
+                    
                     writer.writerow({
                         'onedrive_url': result['onedrive_url'],
-                        'owner': result['owner'],
-                        'admin_count': 0,
-                        'admin_name': '',
-                        'admin_email': '',
-                        'admin_login_name': '',
                         'status': result['status'],
-                        'error': result.get('error', '')
+                        'error': '',
+                        'owner_name': str(owner.get('title', '')) if owner.get('title') is not None else '',
+                        'owner_email': str(owner.get('email', '')) if owner.get('email') is not None else '',
+                        'owner_login_name': str(owner.get('login_name', '')) if owner.get('login_name') is not None else '',
+                        'owner_upn': str(owner.get('user_principal_name', '')) if owner.get('user_principal_name') is not None else '',
+                        'additional_admin_count': len(admins),
+                        'admin_names': '; '.join(filter(None, admin_names)),
+                        'admin_emails': '; '.join(filter(None, admin_emails)),
+                        'admin_login_names': '; '.join(filter(None, admin_login_names)),
+                        'admin_upns': '; '.join(filter(None, admin_upns))
+                    })
+                else:
+                    # Write error row
+                    writer.writerow({
+                        'onedrive_url': result['onedrive_url'],
+                        'status': result['status'],
+                        'error': str(result.get('error', '')) if result.get('error') is not None else '',
+                        'owner_name': '',
+                        'owner_email': '',
+                        'owner_login_name': '',
+                        'owner_upn': '',
+                        'additional_admin_count': 0,
+                        'admin_names': '',
+                        'admin_emails': '',
+                        'admin_login_names': '',
+                        'admin_upns': ''
                     })
         
         logger.info(f"Results saved to {filename}")
@@ -296,9 +443,10 @@ def save_to_csv(results, filename):
     except Exception as e:
         logger.exception(f"Failed to save results to {filename}")
         raise
-
+        
+        
 def process_onedrive_urls(urls):
-    """Process a list of OneDrive URLs and get admin information"""
+    """Process a list of OneDrive URLs and get owner and admin information"""
     results = []
     
     for i, url in enumerate(urls, 1):
@@ -309,29 +457,32 @@ def process_onedrive_urls(urls):
             if url.endswith('/Documents'):
                 url = url[:-10]
             
-            # Extract owner information
-            owner = extract_owner_from_url(url)
+            # Get site owner
+            owner_info = get_site_owner(url)
             
-            # Get site admins
-            admins = get_site_admins(url)
+            # Get all site users
+            all_users = get_site_users(url)
+            
+            # Filter admins excluding owner
+            additional_admins = filter_admins_exclude_owner(all_users, owner_info)
             
             result = {
                 'onedrive_url': url,
-                'owner': owner,
                 'status': 'success',
-                'admins': admins
+                'owner': owner_info,
+                'additional_admins': additional_admins
             }
             
-            logger.info(f"✓ Successfully processed {url} - Found {len(admins)} admins")
+            logger.info(f" Successfully processed {url} - Owner: {owner_info.get('email', 'Unknown')}, Additional admins: {len(additional_admins)}")
             
         except Exception as e:
-            logger.error(f"✗ Failed to process {url}: {str(e)}")
+            logger.error(f" Failed to process {url}: {str(e)}")
             result = {
                 'onedrive_url': url,
-                'owner': extract_owner_from_url(url),
                 'status': 'error',
                 'error': str(e),
-                'admins': []
+                'owner': {},
+                'additional_admins': []
             }
         
         results.append(result)
@@ -346,7 +497,8 @@ def print_summary(results):
     total_urls = len(results)
     successful = sum(1 for r in results if r['status'] == 'success')
     failed = total_urls - successful
-    total_admins = sum(len(r['admins']) for r in results if r['status'] == 'success')
+    total_additional_admins = sum(len(r['additional_admins']) for r in results if r['status'] == 'success')
+    urls_with_additional_admins = sum(1 for r in results if r['status'] == 'success' and len(r['additional_admins']) > 0)
     
     print("\n" + "="*50)
     print("PROCESSING SUMMARY")
@@ -354,7 +506,8 @@ def print_summary(results):
     print(f"Total OneDrive URLs processed: {total_urls}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
-    print(f"Total administrators found: {total_admins}")
+    print(f"OneDrive sites with additional admins: {urls_with_additional_admins}")
+    print(f"Total additional administrators found: {total_additional_admins}")
     print("="*50)
     
     if failed > 0:
@@ -362,6 +515,19 @@ def print_summary(results):
         for result in results:
             if result['status'] == 'error':
                 print(f"  - {result['onedrive_url']}: {result['error']}")
+    
+    if urls_with_additional_admins > 0:
+        print("\nOneDrive sites with additional admins:")
+        for result in results:
+            if result['status'] == 'success' and len(result['additional_admins']) > 0:
+                owner_email = result['owner'].get('email', 'Unknown')
+                admin_count = len(result['additional_admins'])
+                print(f"  - {result['onedrive_url']}")
+                print(f"    Owner: {owner_email}")
+                print(f"    Additional admins: {admin_count}")
+                for admin in result['additional_admins']:
+                    admin_email = admin.get('email', admin.get('login_name', 'Unknown'))
+                    print(f"      - {admin_email}")
 
 def main():
     """Main function to process OneDrive URLs and generate admin report"""
