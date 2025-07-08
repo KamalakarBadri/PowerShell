@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configuration
+CONFIG = 
 
 # Token cache
 TOKEN_CACHE = {
@@ -444,7 +446,7 @@ def save_to_csv(results, filename):
         logger.exception(f"Failed to save results to {filename}")
         raise
         
-        
+
 def process_onedrive_urls(urls):
     """Process a list of OneDrive URLs and get owner and admin information"""
     results = []
