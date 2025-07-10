@@ -21,8 +21,9 @@ SCOPE = "https://graph.microsoft.com/.default"
 CERTIFICATE_PATH = "certificate.pem"
 PRIVATE_KEY_PATH = "private_key.pem"
 
-# Sites to search for
-SITE_NAMES = ["New365", "AnotherSite", "ThirdSite"]
+# Sites to search for (supports both main sites and subsites)
+# Format: "MainSite" for main sites, "MainSite/SubSite" for subsites
+SITE_NAMES = ["New365", "AnotherSite", "ThirdSite", "New365/ProjectA", "AnotherSite/Department1"]
 
 # Threading configuration
 MAX_WORKERS = 5  # Number of parallel threads for permission checking
@@ -143,7 +144,30 @@ def get_access_token():
         return None
 
 def get_site_guid(site_name, token):
-    """Get the site GUID from Microsoft Graph API"""
+    """Get the site GUID from Microsoft Graph API - supports both main sites and subsites"""
+    
+    # Check if it's a subsite (contains '/')
+    if '/' in site_name:
+        main_site_name, subsite_name = site_name.split('/', 1)
+        print(f"Detected subsite request: Main site '{main_site_name}', Subsite '{subsite_name}'")
+        
+        # First get the main site
+        main_site_info = get_main_site_guid(main_site_name, token)
+        if not main_site_info:
+            print(f"Main site '{main_site_name}' not found")
+            return None
+        
+        print(f"Found main site: {main_site_info['display_name']}")
+        
+        # Then get the subsite
+        return get_subsite_guid(main_site_info['site_guid'], subsite_name, token, site_name)
+    
+    else:
+        # It's a main site
+        return get_main_site_guid(site_name, token)
+
+def get_main_site_guid(site_name, token):
+    """Get the main site GUID from Microsoft Graph API"""
     endpoint = f"https://graph.microsoft.com/v1.0/sites?search={site_name}"
     headers = {"Authorization": f"Bearer {token}"}
     
@@ -164,11 +188,43 @@ def get_site_guid(site_name, token):
                     'display_name': site['displayName']
                 }
         
-        print(f"No exact match found for site: {site_name}")
+        print(f"No exact match found for main site: {site_name}")
         return None
         
     except Exception as e:
-        print(f"Error searching for site {site_name}: {e}")
+        print(f"Error searching for main site {site_name}: {e}")
+        return None
+
+def get_subsite_guid(main_site_guid, subsite_name, token, original_site_name):
+    """Get the subsite GUID from the main site"""
+    endpoint = f"https://graph.microsoft.com/v1.0/sites/{main_site_guid}/sites"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        response = requests.get(endpoint, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Search for the subsite by name
+        for subsite in data.get('value', []):
+            if subsite['name'].lower() == subsite_name.lower():
+                full_id = subsite['id']
+                subsite_guid = full_id.split(',')[1]
+                return {
+                    'site_name': original_site_name,
+                    'main_site_guid': main_site_guid,
+                    'full_id': full_id,
+                    'site_guid': subsite_guid,
+                    'web_url': subsite['webUrl'],
+                    'display_name': subsite['displayName'],
+                    'is_subsite': True
+                }
+        
+        print(f"No exact match found for subsite: {subsite_name}")
+        return None
+        
+    except Exception as e:
+        print(f"Error searching for subsite {subsite_name}: {e}")
         return None
 
 def get_document_libraries(site_guid, token):
@@ -315,16 +371,19 @@ def process_item_permissions(site_guid, drive_id, item, token):
     return item
 
 def process_site(site_name, token):
-    """Process a single SharePoint site"""
+    """Process a single SharePoint site (main site or subsite)"""
     print(f"\nProcessing site: {site_name}")
     
-    # Get site GUID
+    # Get site GUID (handles both main sites and subsites)
     site_info = get_site_guid(site_name, token)
     if not site_info:
         return None
     
     print(f"Found site: {site_info['display_name']}")
     print(f"Site GUID: {site_info['site_guid']}")
+    
+    if site_info.get('is_subsite'):
+        print(f"This is a subsite under main site GUID: {site_info['main_site_guid']}")
     
     # Get document libraries
     libraries = get_document_libraries(site_info['site_guid'], token)
