@@ -21,9 +21,22 @@ SCOPE = "https://graph.microsoft.com/.default"
 CERTIFICATE_PATH = "certificate.pem"
 PRIVATE_KEY_PATH = "private_key.pem"
 
-# Sites to search for (supports both main sites and subsites)
-# Format: "MainSite" for main sites, "MainSite/SubSite" for subsites
-SITE_NAMES = ["New365", "AnotherSite", "ThirdSite", "New365/ProjectA", "AnotherSite/Department1"]
+# Updated API endpoints for nested sites structure
+# Format: sites/mainsiteguid/sites/subsiteguid/drives/drive_id
+DRIVE_ENDPOINTS = [
+    {
+        "name": "Main_Site_Subsite_Documents",
+        "main_site_guid": "your-main-site-guid",
+        "sub_site_guid": "your-sub-site-guid", 
+        "drive_id": "your-drive-id"
+    },
+    {
+        "name": "Another_Main_Site_Subsite_Library",
+        "main_site_guid": "another-main-site-guid",
+        "sub_site_guid": "another-sub-site-guid",
+        "drive_id": "another-drive-id"
+    }
+]
 
 # Threading configuration
 MAX_WORKERS = 5  # Number of parallel threads for permission checking
@@ -143,118 +156,41 @@ def get_access_token():
         print(f"Failed to get access token: {e}")
         return None
 
-def get_site_guid(site_name, token):
-    """Get the site GUID from Microsoft Graph API - supports both main sites and subsites"""
+def get_drive_info(drive_config, token):
+    """Get drive information from the nested site structure"""
+    # Build the endpoint for nested site structure
+    drive_endpoint = (
+        f"https://graph.microsoft.com/v1.0/sites/{drive_config['main_site_guid']}/"
+        f"sites/{drive_config['sub_site_guid']}/drives/{drive_config['drive_id']}"
+    )
     
-    # Check if it's a subsite (contains '/')
-    if '/' in site_name:
-        main_site_name, subsite_name = site_name.split('/', 1)
-        print(f"Detected subsite request: Main site '{main_site_name}', Subsite '{subsite_name}'")
-        
-        # First get the main site
-        main_site_info = get_main_site_guid(main_site_name, token)
-        if not main_site_info:
-            print(f"Main site '{main_site_name}' not found")
-            return None
-        
-        print(f"Found main site: {main_site_info['display_name']}")
-        
-        # Then get the subsite
-        return get_subsite_guid(main_site_info['site_guid'], subsite_name, token, site_name)
-    
-    else:
-        # It's a main site
-        return get_main_site_guid(site_name, token)
-
-def get_main_site_guid(site_name, token):
-    """Get the main site GUID from Microsoft Graph API"""
-    endpoint = f"https://graph.microsoft.com/v1.0/sites?search={site_name}"
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
-        response = requests.get(endpoint, headers=headers)
+        response = requests.get(drive_endpoint, headers=headers)
         response.raise_for_status()
         data = response.json()
         
-        for site in data.get('value', []):
-            if site['name'].lower() == site_name.lower():
-                full_id = site['id']
-                site_guid = full_id.split(',')[1]
-                return {
-                    'site_name': site_name,
-                    'full_id': full_id,
-                    'site_guid': site_guid,
-                    'web_url': site['webUrl'],
-                    'display_name': site['displayName']
-                }
-        
-        print(f"No exact match found for main site: {site_name}")
-        return None
+        return {
+            'main_site_guid': drive_config['main_site_guid'],
+            'sub_site_guid': drive_config['sub_site_guid'],
+            'drive_id': drive_config['drive_id'],
+            'drive_name': data.get('name', 'Unknown'),
+            'drive_type': data.get('driveType', 'Unknown'),
+            'web_url': data.get('webUrl', ''),
+            'endpoint': drive_endpoint
+        }
         
     except Exception as e:
-        print(f"Error searching for main site {site_name}: {e}")
+        print(f"Error getting drive info from {drive_endpoint}: {e}")
         return None
 
-def get_subsite_guid(main_site_guid, subsite_name, token, original_site_name):
-    """Get the subsite GUID from the main site"""
-    endpoint = f"https://graph.microsoft.com/v1.0/sites/{main_site_guid}/sites"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    try:
-        response = requests.get(endpoint, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Search for the subsite by name
-        for subsite in data.get('value', []):
-            if subsite['name'].lower() == subsite_name.lower():
-                full_id = subsite['id']
-                subsite_guid = full_id.split(',')[1]
-                return {
-                    'site_name': original_site_name,
-                    'main_site_guid': main_site_guid,
-                    'full_id': full_id,
-                    'site_guid': subsite_guid,
-                    'web_url': subsite['webUrl'],
-                    'display_name': subsite['displayName'],
-                    'is_subsite': True
-                }
-        
-        print(f"No exact match found for subsite: {subsite_name}")
-        return None
-        
-    except Exception as e:
-        print(f"Error searching for subsite {subsite_name}: {e}")
-        return None
-
-def get_document_libraries(site_guid, token):
-    """Get all document libraries (drives) for a site"""
-    endpoint = f"https://graph.microsoft.com/v1.0/sites/{site_guid}/drives"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    try:
-        response = requests.get(endpoint, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        
-        libraries = []
-        for drive in data.get('value', []):
-            if drive.get('driveType') == 'documentLibrary':
-                libraries.append({
-                    'id': drive['id'],
-                    'name': drive['name'],
-                    'webUrl': drive['webUrl']
-                })
-        
-        return libraries
-        
-    except Exception as e:
-        print(f"Error getting document libraries: {e}")
-        return None
-
-def get_folder_contents(site_guid, drive_id, item_id, token, path=""):
-    """Recursively get all contents of a folder"""
-    endpoint = f"https://graph.microsoft.com/v1.0/sites/{site_guid}/drives/{drive_id}/items/{item_id}/children"
+def get_folder_contents(main_site_guid, sub_site_guid, drive_id, item_id, token, path=""):
+    """Recursively get all contents of a folder from nested site structure"""
+    endpoint = (
+        f"https://graph.microsoft.com/v1.0/sites/{main_site_guid}/"
+        f"sites/{sub_site_guid}/drives/{drive_id}/items/{item_id}/children"
+    )
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
@@ -279,10 +215,12 @@ def get_folder_contents(site_guid, drive_id, item_id, token, path=""):
                 
                 all_items.append(item_info)
                 
+                # Recursively get folder contents
                 if item_info['type'] == 'folder':
                     child_items = get_folder_contents(
-                        site_guid, 
-                        drive_id, 
+                        main_site_guid,
+                        sub_site_guid,
+                        drive_id,
                         item['id'], 
                         token, 
                         item_info['path']
@@ -297,9 +235,12 @@ def get_folder_contents(site_guid, drive_id, item_id, token, path=""):
         print(f"Error getting folder contents: {e}")
         return []
 
-def get_item_permissions(site_guid, drive_id, item_id, token):
-    """Get permissions for a specific item"""
-    endpoint = f"https://graph.microsoft.com/v1.0/sites/{site_guid}/drives/{drive_id}/items/{item_id}/permissions"
+def get_item_permissions(main_site_guid, sub_site_guid, drive_id, item_id, token):
+    """Get permissions for a specific item from nested site structure"""
+    endpoint = (
+        f"https://graph.microsoft.com/v1.0/sites/{main_site_guid}/"
+        f"sites/{sub_site_guid}/drives/{drive_id}/items/{item_id}/permissions"
+    )
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
@@ -313,7 +254,7 @@ def get_item_permissions(site_guid, drive_id, item_id, token):
             retry_after = int(response.headers.get('Retry-After', 5))
             print(f"Rate limited. Waiting for {retry_after} seconds...")
             time.sleep(retry_after)
-            return get_item_permissions(site_guid, drive_id, item_id, token)
+            return get_item_permissions(main_site_guid, sub_site_guid, drive_id, item_id, token)
             
         response.raise_for_status()
         data = response.json()
@@ -329,33 +270,34 @@ def get_item_permissions(site_guid, drive_id, item_id, token):
                 'display_name': None
             }
             
-            # Only use grantedToV2
-            granted_to = perm.get('grantedToV2')
+            # Check different permission formats
+            granted_to = perm.get('grantedToV2') or perm.get('grantedTo')
             
-            if granted_to and 'user' in granted_to:
-                permission_info.update({
-                    'granted_to_type': 'user',
-                    'email': granted_to['user'].get('email'),
-                    'display_name': granted_to['user'].get('displayName')
-                })
-            elif granted_to and 'siteUser' in granted_to:
-                permission_info.update({
-                    'granted_to_type': 'user',
-                    'email': granted_to['siteUser'].get('email'),
-                    'display_name': granted_to['siteUser'].get('displayName')
-                })
-            elif granted_to and 'group' in granted_to:
-                permission_info.update({
-                    'granted_to_type': 'group',
-                    'email': granted_to['group'].get('email'),
-                    'display_name': granted_to['group'].get('displayName')
-                })
-            elif granted_to and 'siteGroup' in granted_to:
-                permission_info.update({
-                    'granted_to_type': 'group',
-                    'email': granted_to['siteGroup'].get('email'),
-                    'display_name': granted_to['siteGroup'].get('displayName')
-                })
+            if granted_to:
+                if 'user' in granted_to:
+                    permission_info.update({
+                        'granted_to_type': 'user',
+                        'email': granted_to['user'].get('email'),
+                        'display_name': granted_to['user'].get('displayName')
+                    })
+                elif 'siteUser' in granted_to:
+                    permission_info.update({
+                        'granted_to_type': 'user',
+                        'email': granted_to['siteUser'].get('email'),
+                        'display_name': granted_to['siteUser'].get('displayName')
+                    })
+                elif 'group' in granted_to:
+                    permission_info.update({
+                        'granted_to_type': 'group',
+                        'email': granted_to['group'].get('email'),
+                        'display_name': granted_to['group'].get('displayName')
+                    })
+                elif 'siteGroup' in granted_to:
+                    permission_info.update({
+                        'granted_to_type': 'group',
+                        'email': granted_to['siteGroup'].get('email'),
+                        'display_name': granted_to['siteGroup'].get('displayName')
+                    })
             
             permissions.append(permission_info)
         
@@ -365,117 +307,108 @@ def get_item_permissions(site_guid, drive_id, item_id, token):
         print(f"Error getting permissions for item {item_id}: {e}")
         return []
 
-def process_item_permissions(site_guid, drive_id, item, token):
+def process_item_permissions(main_site_guid, sub_site_guid, drive_id, item, token):
     """Process permissions for a single item (file or folder)"""
-    item['permissions'] = get_item_permissions(site_guid, drive_id, item['id'], token)
+    item['permissions'] = get_item_permissions(main_site_guid, sub_site_guid, drive_id, item['id'], token)
     return item
 
-def process_site(site_name, token):
-    """Process a single SharePoint site (main site or subsite)"""
-    print(f"\nProcessing site: {site_name}")
+def process_drive(drive_config, token):
+    """Process a single drive using nested site structure"""
+    print(f"\nProcessing drive: {drive_config['name']}")
+    print(f"Main Site GUID: {drive_config['main_site_guid']}")
+    print(f"Sub Site GUID: {drive_config['sub_site_guid']}")
+    print(f"Drive ID: {drive_config['drive_id']}")
     
-    # Get site GUID (handles both main sites and subsites)
-    site_info = get_site_guid(site_name, token)
-    if not site_info:
+    # Get drive information
+    drive_info = get_drive_info(drive_config, token)
+    if not drive_info:
+        print(f"Failed to get drive information for {drive_config['name']}")
         return None
     
-    print(f"Found site: {site_info['display_name']}")
-    print(f"Site GUID: {site_info['site_guid']}")
+    print(f"Drive Name: {drive_info['drive_name']}")
+    print(f"Drive Type: {drive_info['drive_type']}")
+    print(f"Endpoint: {drive_info['endpoint']}")
     
-    if site_info.get('is_subsite'):
-        print(f"This is a subsite under main site GUID: {site_info['main_site_guid']}")
+    # Get all items in the drive
+    print("Getting all items in drive...")
+    items = get_folder_contents(
+        drive_info['main_site_guid'],
+        drive_info['sub_site_guid'],
+        drive_info['drive_id'],
+        'root',
+        token,
+        f"/{drive_info['drive_name']}"
+    )
     
-    # Get document libraries
-    libraries = get_document_libraries(site_info['site_guid'], token)
-    if not libraries:
-        print("No document libraries found")
+    print(f"Found {len(items)} items (files and folders)")
+    
+    if not items:
+        print("No items found in this drive")
         return None
     
-    print(f"\nFound {len(libraries)} document libraries:")
-    
-    # Process each library
+    # Process permissions in parallel with rate limiting
+    print("Processing permissions...")
     all_items = []
-    for lib in libraries:
-        print(f"\nProcessing library: {lib['name']}")
-        print(f"Drive ID: {lib['id']}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for item in items:
+            futures.append(executor.submit(
+                process_item_permissions,
+                drive_info['main_site_guid'],
+                drive_info['sub_site_guid'],
+                drive_info['drive_id'],
+                item,
+                token
+            ))
         
-        # Get all items recursively
-        items = get_folder_contents(
-            site_info['site_guid'], 
-            lib['id'], 
-            'root', 
-            token,
-            f"/{lib['name']}"
-        )
-        
-        print(f"Found {len(items)} items (files and folders) in this library")
-        
-        # Process permissions in parallel with rate limiting
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for item in items:
-                futures.append(executor.submit(
-                    process_item_permissions,
-                    site_info['site_guid'],
-                    lib['id'],
-                    item,
-                    token
-                ))
-            
-            # Wait for all futures to complete
-            for future in as_completed(futures):
-                try:
-                    processed_item = future.result()
-                    all_items.append(processed_item)
-                except Exception as e:
-                    print(f"Error processing item permissions: {e}")
+        # Wait for all futures to complete
+        processed_count = 0
+        for future in as_completed(futures):
+            try:
+                processed_item = future.result()
+                all_items.append(processed_item)
+                processed_count += 1
+                if processed_count % 10 == 0:
+                    print(f"Processed {processed_count}/{len(items)} items...")
+            except Exception as e:
+                print(f"Error processing item permissions: {e}")
     
     return {
-        'site_info': site_info,
-        'libraries': libraries,
+        'drive_config': drive_config,
+        'drive_info': drive_info,
         'items': all_items
     }
 
-def generate_report(site_data, output_format='csv'):
+def generate_report(drive_data, output_format='csv'):
     """Generate comprehensive report of all files and folders with permissions"""
-    if not site_data or not site_data.get('items'):
+    if not drive_data or not drive_data.get('items'):
         print("No data to generate report")
         return
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    site_name = site_data['site_info']['site_name']
-    filename = f"{site_name}_full_permissions_report_{timestamp}.{output_format}"
+    drive_name = drive_data['drive_config']['name']
+    filename = f"{drive_name}_permissions_report_{timestamp}.{output_format}"
     
     if output_format == 'csv':
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'site_name', 'library_name', 'item_type', 'path', 'name', 
-                'size', 'created', 'last_modified', 'created_by', 'web_url',
-                'item_id', 'api_endpoint',
+                'drive_name', 'drive_endpoint', 'main_site_guid', 'sub_site_guid', 'drive_id',
+                'item_type', 'path', 'name', 'size', 'created', 'last_modified', 
+                'created_by', 'web_url', 'item_id', 'permissions_api_endpoint',
                 'unique_permissions', 'permission_owners', 'permission_writers', 
                 'permission_readers', 'all_permissions'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            for item in site_data['items']:
-                # Extract library info from the item's path
-                path_parts = item['path'].split('/')
-                library_name = path_parts[1] if len(path_parts) > 1 else 'Unknown'
-                
-                # Find the matching library to get the drive ID
-                library = next(
-                    (lib for lib in site_data['libraries'] 
-                     if lib['name'] == library_name),
-                    {'id': 'Unknown', 'name': library_name}
-                )
-                
-                # Build the exact API endpoint format you need
-                api_endpoint = (
+            for item in drive_data['items']:
+                # Build the permissions API endpoint for nested structure
+                permissions_endpoint = (
                     f"https://graph.microsoft.com/v1.0/sites/"
-                    f"{site_data['site_info']['site_guid']}/"
-                    f"drives/{library['id']}/"
-                    f"items/{item['id']}"
+                    f"{drive_data['drive_info']['main_site_guid']}/"
+                    f"sites/{drive_data['drive_info']['sub_site_guid']}/"
+                    f"drives/{drive_data['drive_info']['drive_id']}/"
+                    f"items/{item['id']}/permissions"
                 )
                 
                 # Organize permissions by role
@@ -486,22 +419,29 @@ def generate_report(site_data, output_format='csv'):
                 unique_perms = False
                 
                 for perm in item.get('permissions', []):
-                    perm_str = f"{perm['display_name']} ({perm['email'] or perm['granted_to_type']}) - {perm['roles']}"
+                    display_name = perm['display_name'] or 'Unknown'
+                    email = perm['email'] or perm['granted_to_type'] or 'Unknown'
+                    roles = perm['roles'] or 'Unknown'
+                    
+                    perm_str = f"{display_name} ({email}) - {roles}"
                     all_perms.append(perm_str)
                     
                     if not perm['inherited']:
                         unique_perms = True
                     
-                    if 'owner' in perm['roles'].lower():
-                        owners.append(f"{perm['display_name']} ({perm['email']})")
-                    elif 'write' in perm['roles'].lower() or 'edit' in perm['roles'].lower():
-                        writers.append(f"{perm['display_name']} ({perm['email']})")
-                    elif 'read' in perm['roles'].lower():
-                        readers.append(f"{perm['display_name']} ({perm['email']})")
+                    if roles and 'owner' in roles.lower():
+                        owners.append(f"{display_name} ({email})")
+                    elif roles and ('write' in roles.lower() or 'edit' in roles.lower()):
+                        writers.append(f"{display_name} ({email})")
+                    elif roles and 'read' in roles.lower():
+                        readers.append(f"{display_name} ({email})")
                 
                 writer.writerow({
-                    'site_name': site_data['site_info']['display_name'],
-                    'library_name': library['name'],
+                    'drive_name': drive_data['drive_info']['drive_name'],
+                    'drive_endpoint': drive_data['drive_info']['endpoint'],
+                    'main_site_guid': drive_data['drive_info']['main_site_guid'],
+                    'sub_site_guid': drive_data['drive_info']['sub_site_guid'],
+                    'drive_id': drive_data['drive_info']['drive_id'],
                     'item_type': item['type'],
                     'path': item['path'],
                     'name': item['name'],
@@ -511,7 +451,7 @@ def generate_report(site_data, output_format='csv'):
                     'created_by': item['createdBy'],
                     'web_url': item['webUrl'],
                     'item_id': item['id'],
-                    'api_endpoint': api_endpoint,
+                    'permissions_api_endpoint': permissions_endpoint,
                     'unique_permissions': 'Yes' if unique_perms else 'No',
                     'permission_owners': ', '.join(owners),
                     'permission_writers': ', '.join(writers),
@@ -519,7 +459,8 @@ def generate_report(site_data, output_format='csv'):
                     'all_permissions': ' | '.join(all_perms)
                 })
         
-        print(f"\nComprehensive report generated: {filename}")
+        print(f"\nReport generated: {filename}")
+        print(f"Total items processed: {len(drive_data['items'])}")
     else:
         print("Only CSV output format is currently supported")
 
@@ -531,11 +472,12 @@ def main():
         print("Failed to authenticate. Please check your certificate and configuration.")
         return
     
-    # Step 2: Process each site
-    for site_name in SITE_NAMES:
-        site_data = process_site(site_name, token)
-        if site_data:
-            generate_report(site_data)
+    # Step 2: Process each drive endpoint
+    for drive_config in DRIVE_ENDPOINTS:
+        drive_data = process_drive(drive_config, token)
+        if drive_data:
+            generate_report(drive_data)
+        print("-" * 50)
 
 if __name__ == "__main__":
     main()
