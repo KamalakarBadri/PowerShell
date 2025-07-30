@@ -1,219 +1,246 @@
 import csv
 import requests
-import xml.etree.ElementTree as ET
-import logging
-import uuid
-import base64
 import time
-import json
+import xml.etree.ElementTree as ET
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
+import base64
+import json
+import uuid
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Configuration
-CONFIG = {
-    # Authentication
-    "tenant_id": "0e439a1f-a46b-4e582e203607",
-    "client_id": "73efa35d-61-b258-838a977eb149",
-    "client_secret": "sNxt5IejrMc2c24Ziz4a.t",
-    "certificate_path": "certificate.pem",
-    "private_key_path": "private_key.pem",
-    
-    # SharePoint
-    "sharepoint_site": "https://TestT.sharepoint.com/sites/New365",
-    "sharepoint_scope": "https://TestT.sharepoint.com/.default",
-    
-    # Graph
-    "graph_scope": "https://graph.microsoft.com/.default",
-    "graph_site_id": "your-site-id",
-    "graph_list_id": "your-list-id"
-}
-
-def get_sharepoint_token():
-    """Get SharePoint access token using JWT with private key/certificate"""
-    try:
-        # Load certificate and private key
-        with open(CONFIG['certificate_path'], "rb") as cert_file:
-            certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
-        with open(CONFIG['private_key_path'], "rb") as key_file:
-            private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-
-        # Prepare JWT claims
-        now = int(time.time())
-        jwt_header = {
-            "alg": "RS256",
-            "typ": "JWT",
-            "x5t": base64.urlsafe_b64encode(certificate.fingerprint(hashes.SHA1())).decode().rstrip('=')
-        }
-        jwt_payload = {
-            "aud": f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
-            "exp": now + 300,
-            "iss": CONFIG['client_id'],
-            "jti": str(uuid.uuid4()),
-            "nbf": now,
-            "sub": CONFIG['client_id']
-        }
-
-        # Encode and sign JWT
-        encoded_header = base64.urlsafe_b64encode(json.dumps(jwt_header).encode()).decode().rstrip('=')
-        encoded_payload = base64.urlsafe_b64encode(json.dumps(jwt_payload).encode()).decode().rstrip('=')
-        jwt_unsigned = f"{encoded_header}.{encoded_payload}"
-        signature = private_key.sign(jwt_unsigned.encode(), padding.PKCS1v15(), hashes.SHA256())
-        encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip('=')
-        jwt = f"{jwt_unsigned}.{encoded_signature}"
-
-        # Request token
-        token_response = requests.post(
-            f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
-            data={
-                "client_id": CONFIG['client_id'],
-                "client_assertion": jwt,
-                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                "scope": CONFIG['sharepoint_scope'],
-                "grant_type": "client_credentials"
+class SharePointCSVUploader:
+    def __init__(self):
+        # Configuration - Update these with your actual values
+        self.config = {
+            "sharepoint": {
+                "site_url": "https://geekbyteonline.sharepoint.com/sites/New365",
+                "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+                "client_id": "73e-838a977eb149",
+                "cert_path": "certificate.pem",
+                "key_path": "private_key.pem",
+                "resource": "https://geekbyteonline.sharepoint.com",
+                "scope": "https://geekbyteonline.sharepoint.com/.default"
+            },
+            "graph": {
+                "site_id": "e0578a400-baa0-0ad7a1bf76dd",
+                "list_id": "f9b0f9-a6dc-7c9e8678219c",
+                "client_id": "73efa38-42d4-b258-838a977eb149",
+                "client_secret": "CyG8Q4sNxt5IejrMc2c24Ziz4a.t",
+                "scope": "https://graph.microsoft.com/.default"
             }
-        )
-
-        if token_response.status_code == 200:
-            return token_response.json()["access_token"]
-        else:
-            logger.error(f"SharePoint token request failed: {token_response.text}")
-            return None
-            
-    except Exception as e:
-        logger.exception("SharePoint authentication failed")
-        return None
-
-def get_graph_token():
-    """Get Graph API access token using client secret"""
-    try:
-        token_response = requests.post(
-            f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
-            data={
-                "client_id": CONFIG['client_id'],
-                "client_secret": CONFIG['client_secret'],
-                "scope": CONFIG['graph_scope'],
-                "grant_type": "client_credentials"
-            }
-        )
-
-        if token_response.status_code == 200:
-            return token_response.json()["access_token"]
-        else:
-            logger.error(f"Graph token request failed: {token_response.text}")
-            return None
-            
-    except Exception as e:
-        logger.exception("Graph authentication failed")
-        return None
-
-def ensure_user(email, sp_token):
-    """Ensure user exists in SharePoint using direct endpoint"""
-    try:
-        endpoint = f"{CONFIG['sharepoint_site']}/_api/web/ensureuser('{email}')"
-        headers = {
-            "Authorization": f"Bearer {sp_token}",
-            "Accept": "application/xml",
-            "Content-Type": "application/xml"
         }
-        
-        # First get request digest
-        digest_response = requests.post(
-            f"{CONFIG['sharepoint_site']}/_api/contextinfo",
-            headers=headers
-        )
-        
-        if digest_response.status_code != 200:
-            logger.error(f"Failed to get request digest: {digest_response.text}")
+
+        # Token management
+        self.sp_token = None
+        self.graph_token = None
+        self.token_expiry = 0
+
+    def _generate_sp_token(self):
+        """Generate SharePoint access token using certificate auth"""
+        try:
+            # Load certificate and private key
+            with open(self.config["sharepoint"]["cert_path"], "rb") as cert_file:
+                cert = load_pem_x509_certificate(cert_file.read(), default_backend())
+            with open(self.config["sharepoint"]["key_path"], "rb") as key_file:
+                private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
+
+            # Prepare JWT claims
+            now = int(time.time())
+            header = {
+                "alg": "RS256",
+                "typ": "JWT",
+                "x5t": base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip('=')
+            }
+            payload = {
+                "aud": f"https://login.microsoftonline.com/{self.config['sharepoint']['tenant_id']}/oauth2/v2.0/token",
+                "exp": now + 3600,  # 1 hour expiration
+                "iss": self.config["sharepoint"]["client_id"],
+                "jti": str(uuid.uuid4()),
+                "nbf": now,
+                "sub": self.config["sharepoint"]["client_id"]
+            }
+
+            # Encode and sign JWT
+            encoded_header = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip('=')
+            encoded_payload = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+            jwt = f"{encoded_header}.{encoded_payload}"
+            signature = private_key.sign(jwt.encode(), padding.PKCS1v15(), hashes.SHA256())
+            encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip('=')
+            signed_jwt = f"{jwt}.{encoded_signature}"
+
+            # Request token
+            response = requests.post(
+                f"https://login.microsoftonline.com/{self.config['sharepoint']['tenant_id']}/oauth2/v2.0/token",
+                data={
+                    "client_id": self.config["sharepoint"]["client_id"],
+                    "client_assertion": signed_jwt,
+                    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    "scope": self.config["sharepoint"]["scope"],
+                    "grant_type": "client_credentials"
+                },
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Token request failed: {response.status_code} - {response.text}")
+
+            return response.json()["access_token"]
+        except Exception as e:
+            print(f"ERROR generating SharePoint token: {str(e)}")
             return None
+
+    def _generate_graph_token(self):
+        """Generate Graph API token using client secret"""
+        try:
+            response = requests.post(
+                f"https://login.microsoftonline.com/{self.config['sharepoint']['tenant_id']}/oauth2/v2.0/token",
+                data={
+                    "client_id": self.config["graph"]["client_id"],
+                    "client_secret": self.config["graph"]["client_secret"],
+                    "scope": self.config["graph"]["scope"],
+                    "grant_type": "client_credentials"
+                },
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Graph token request failed: {response.status_code} - {response.text}")
+
+            return response.json()["access_token"]
+        except Exception as e:
+            print(f"ERROR generating Graph token: {str(e)}")
+            return None
+
+    def _refresh_tokens(self):
+        """Refresh tokens if they're expired or about to expire"""
+        current_time = time.time()
+        if current_time > self.token_expiry - 900:  # Refresh if less than 15 minutes remaining
+            new_sp_token = self._generate_sp_token()
+            new_graph_token = self._generate_graph_token()
             
-        request_digest = digest_response.json()['d']['GetContextWebInformation']['FormDigestValue']
-        headers['X-RequestDigest'] = request_digest
-        
-        # Call ensureuser
-        response = requests.post(endpoint, headers=headers)
-        
-        if response.status_code == 200:
+            if new_sp_token and new_graph_token:
+                self.sp_token = new_sp_token
+                self.graph_token = new_graph_token
+                self.token_expiry = current_time + 2700  # 45 minutes from now
+                print("Tokens refreshed successfully")
+                return True
+            else:
+                raise Exception("Failed to refresh one or more tokens")
+        return True
+
+    def ensure_user(self, email):
+        """Get user ID from SharePoint using exact ensureuser endpoint"""
+        try:
+            if not self._refresh_tokens():
+                return None
+
+            endpoint = f"{self.config['sharepoint']['site_url']}/_api/web/ensureuser('{email}')"
+            headers = {
+                "Authorization": f"Bearer {self.sp_token}",
+                "Accept": "application/xml",
+            }
+            
+            response = requests.post(endpoint, headers=headers, timeout=30)
+            
+            if response.status_code != 200:
+                raise Exception(f"EnsureUser failed: {response.status_code} - {response.text}")
+
             # Parse XML response
             root = ET.fromstring(response.text)
             ns = {
                 'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices',
                 'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'
             }
-            return root.find('.//d:Id', ns).text
-        else:
-            logger.error(f"Failed to ensure user {email}: {response.text}")
+            user_id = root.find('.//d:Id', ns).text
+            return user_id
+            
+        except Exception as e:
+            print(f"ERROR ensuring user {email}: {str(e)}")
             return None
-            
-    except Exception as e:
-        logger.exception(f"Error ensuring user {email}")
-        return None
 
-def create_list_item(user_id, full_url_path, graph_token):
-    """Create list item using Graph API"""
-    try:
-        endpoint = f"https://graph.microsoft.com/v1.0/sites/{CONFIG['graph_site_id']}/lists/{CONFIG['graph_list_id']}/items"
-        headers = {
-            "Authorization": f"Bearer {graph_token}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "fields": {
-                "Emaillookup": int(user_id),
-                "FULLURLPATH": full_url_path
+    def create_list_item(self, user_id, row_data):
+        """Create list item using Graph API with exact specified format"""
+        try:
+            if not self._refresh_tokens():
+                return False
+
+            # Prepare payload with EmaillookupID and all other fields
+            payload = {
+                "fields": {
+                    "EmailLookupId": user_id
+                }
             }
-        }
-        
-        response = requests.post(endpoint, headers=headers, json=payload)
-        if response.status_code == 201:
-            logger.info(f"Created item for user ID {user_id}")
+            
+            # Add all other fields from CSV
+            for field_name, field_value in row_data.items():
+                if field_name.lower() != "email":
+                    payload["fields"][field_name] = field_value
+
+            response = requests.post(
+                f"https://graph.microsoft.com/v1.0/sites/{self.config['graph']['site_id']}/lists/{self.config['graph']['list_id']}/items",
+                headers={
+                    "Authorization": f"Bearer {self.graph_token}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code != 201:
+                raise Exception(f"Create item failed: {response.status_code} - {response.text}")
+
             return True
-        else:
-            logger.error(f"Failed to create item: {response.text}")
+        except Exception as e:
+            print(f"ERROR creating list item: {str(e)}")
             return False
-            
-    except Exception as e:
-        logger.exception("Error creating list item")
-        return False
 
-def process_csv(csv_path):
-    """Process CSV file and upload data"""
-    # Get tokens
-    sp_token = get_sharepoint_token()
-    graph_token = get_graph_token()
+    def process_csv(self, file_path):
+        """Process CSV file and upload to SharePoint list"""
+        try:
+            print(f"Starting CSV processing: {file_path}")
+            if not self._refresh_tokens():
+                raise Exception("Failed to initialize authentication")
+
+            with open(file_path, mode='r', encoding='utf-8-sig') as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row_num, row in enumerate(reader, 1):
+                    email = row.get('Email', '').strip()
+                    if not email:
+                        print(f"Row {row_num}: Skipping - missing email")
+                        continue
+
+                    print(f"Processing row {row_num}: {email}")
+                    user_id = self.ensure_user(email)
+                    if not user_id:
+                        print(f"Row {row_num}: Failed to get user ID")
+                        continue
+
+                    # Create a copy of row without Email field
+                    item_data = {k: v for k, v in row.items() if k.lower() != "email"}
+                    
+                    if not self.create_list_item(user_id, item_data):
+                        print(f"Row {row_num}: Failed to create list item")
+                        continue
+
+                    print(f"Row {row_num}: Successfully processed")
+
+            print("CSV processing completed successfully")
+            return True
+
+        except Exception as e:
+            print(f"FATAL ERROR processing CSV: {str(e)}")
+            return False
+
+if __name__ == "__main__":
+    print("Starting SharePoint CSV Uploader")
+    uploader = SharePointCSVUploader()
+    success = uploader.process_csv("list.csv")
     
-    if not sp_token or not graph_token:
-        logger.error("Authentication failed")
-        return False
-    
-    with open(csv_path, mode='r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            email = row['Email'].strip()
-            path = row['FULLURLPATH'].strip()
-            
-            if not email or not path:
-                logger.warning(f"Skipping row with missing data: {row}")
-                continue
-                
-            user_id = ensure_user(f"i:0#.f|membership|{email}", sp_token)
-            if user_id:
-                if not create_list_item(user_id, path, graph_token):
-                    logger.warning(f"Failed to create item for {email}")
-            else:
-                logger.warning(f"Failed to ensure user {email}")
-
-    return True
-
-if __name__ == '__main__':
-    if process_csv("data.csv"):
-        logger.info("CSV processing completed successfully")
+    if success:
+        print("Upload completed successfully")
     else:
-        logger.error("CSV processing failed")
+        print("Upload failed with errors")
+    print("Script finished")
