@@ -16,7 +16,7 @@ from datetime import datetime
 
 # Configure minimal logging (only to console)
 logging.basicConfig(
-    level=logging.WARNING,  # Reduced from INFO to WARNING
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -24,15 +24,15 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    "tenant_id": "07-462b-9e6b-4e582e203607",
-    "tenant_name": "geekbmicrosoft.com",
-    "app_id": "73efa35d-6188-77eb149",
-    "client_secret": "",
+    "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+    "tenant_name": "geekbyteonline.onmicrosoft.com",
+    "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+    "client_secret": "t",
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
     "scopes": {
         "graph": "https://graph.microsoft.com/.default",
-        "sharepoint": "https://geline.sharepoint.com/.default"
+        "sharepoint": "https://geekbyteonline.sharepoint.com/.default"
     }
 }
 
@@ -88,7 +88,6 @@ def get_token_with_certificate(scope):
         )
 
         if token_response.status_code == 200:
-            logger.info("Successfully obtained token using certificate")
             return token_response.json()["access_token"]
         else:
             logger.error(f"Certificate token request failed: {token_response.text}")
@@ -113,7 +112,6 @@ def get_token_with_secret(scope):
         token_response = requests.post(token_url, data=token_data)
 
         if token_response.status_code == 200:
-            logger.info("Successfully obtained token using client secret")
             return token_response.json()["access_token"]
         else:
             logger.error(f"Client secret token request failed: {token_response.text}")
@@ -147,75 +145,6 @@ def get_cached_token(scope_type):
         return token
     
     return None
-
-def get_site_info(site_url):
-    """Get site information including ReadOnly state from SharePoint site"""
-    try:
-        # Ensure site URL ends properly
-        if not site_url.endswith('/'):
-            site_url += '/'
-        
-        # Construct SharePoint API URL for site information
-        site_info_url = f"{site_url}_api/site"
-        
-        # Get SharePoint token
-        sharepoint_token = get_cached_token("sharepoint")
-        if not sharepoint_token:
-            raise Exception("Failed to obtain SharePoint access token")
-        
-        # Call SharePoint API to get site info
-        sharepoint_headers = {
-            "Authorization": f"Bearer {sharepoint_token}",
-            "Accept": "application/xml"
-        }
-        
-        site_info_response = requests.get(site_info_url, headers=sharepoint_headers)
-        
-        if site_info_response.status_code != 200:
-            raise Exception(f"Failed to get site info from {site_info_url}: {site_info_response.text}")
-        
-        # Parse XML response for ReadOnly state
-        read_only_state = parse_site_info_xml(site_info_response.text)
-        return read_only_state
-        
-    except Exception as e:
-        logger.exception(f"Failed to get site info from {site_url}")
-        raise
-
-def parse_site_info_xml(xml_content):
-    """Parse SharePoint site info XML and return ReadOnly state"""
-    try:
-        # Parse XML
-        root = ET.fromstring(xml_content)
-        
-        # Register namespaces to handle default namespace
-        ns = {
-            'atom': 'http://www.w3.org/2005/Atom',
-            'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices',
-            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'
-        }
-        
-        # Find the content element
-        content = root.find('.//atom:content', ns)
-        if content is None:
-            raise Exception("No content found in site info XML response")
-        
-        # Find properties
-        properties = content.find('.//m:properties', ns)
-        if properties is None:
-            raise Exception("No properties found in site info XML response")
-        
-        # Extract ReadOnly state
-        read_only_elem = properties.find('.//d:ReadOnly', ns)
-        
-        # Get value safely
-        read_only_state = read_only_elem.text == 'true' if read_only_elem is not None else False
-        
-        return read_only_state
-        
-    except Exception as e:
-        logger.exception("Failed to parse site info XML")
-        raise Exception(f"Failed to parse site info XML response: {str(e)}")
 
 def get_site_owner(site_url):
     """Get site owner details from SharePoint site"""
@@ -440,76 +369,6 @@ def read_onedrive_urls_from_csv(file_path):
         print(f"Failed to read URLs from {file_path}: {str(e)}")
         raise
 
-def save_to_csv(results, filename):
-    """Save results to CSV file with all additional admins in the same row"""
-    try:
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = [
-                'onedrive_url', 'status', 'error', 'read_only',
-                'owner_name', 'owner_email', 'owner_login_name', 'owner_upn',
-                'additional_admin_count',
-                'admin_names', 'admin_emails', 'admin_login_names', 'admin_upns'
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            writer.writeheader()
-            for result in results:
-                if result['status'] == 'success':
-                    owner = result.get('owner', {})
-                    admins = result.get('additional_admins', [])
-                    read_only = result.get('read_only', False)
-                    
-                    # Combine all admin details into semicolon-separated strings
-                    admin_names = []
-                    admin_emails = []
-                    admin_login_names = []
-                    admin_upns = []
-                    
-                    for admin in admins:
-                        admin_names.append(str(admin.get('title', '')) if admin.get('title') is not None else '')
-                        admin_emails.append(str(admin.get('email', '')) if admin.get('email') is not None else '')
-                        admin_login_names.append(str(admin.get('login_name', '')) if admin.get('login_name') is not None else '')
-                        admin_upns.append(str(admin.get('user_principal_name', '')) if admin.get('user_principal_name') is not None else '')
-                    
-                    writer.writerow({
-                        'onedrive_url': result['onedrive_url'],
-                        'status': result['status'],
-                        'error': '',
-                        'read_only': read_only,
-                        'owner_name': str(owner.get('title', '')) if owner.get('title') is not None else '',
-                        'owner_email': str(owner.get('email', '')) if owner.get('email') is not None else '',
-                        'owner_login_name': str(owner.get('login_name', '')) if owner.get('login_name') is not None else '',
-                        'owner_upn': str(owner.get('user_principal_name', '')) if owner.get('user_principal_name') is not None else '',
-                        'additional_admin_count': len(admins),
-                        'admin_names': '; '.join(filter(None, admin_names)),
-                        'admin_emails': '; '.join(filter(None, admin_emails)),
-                        'admin_login_names': '; '.join(filter(None, admin_login_names)),
-                        'admin_upns': '; '.join(filter(None, admin_upns))
-                    })
-                else:
-                    # Write error row
-                    writer.writerow({
-                        'onedrive_url': result['onedrive_url'],
-                        'status': result['status'],
-                        'error': str(result.get('error', '')) if result.get('error') is not None else '',
-                        'read_only': '',
-                        'owner_name': '',
-                        'owner_email': '',
-                        'owner_login_name': '',
-                        'owner_upn': '',
-                        'additional_admin_count': 0,
-                        'admin_names': '',
-                        'admin_emails': '',
-                        'admin_login_names': '',
-                        'admin_upns': ''
-                    })
-        
-        print(f"Results saved to {filename}")
-        
-    except Exception as e:
-        print(f"Failed to save results to {filename}: {str(e)}")
-        raise
-
 def update_csv_dynamically(results, filename):
     """Update CSV file dynamically as results come in"""
     try:
@@ -518,7 +377,7 @@ def update_csv_dynamically(results, filename):
         
         with open(filename, 'a', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'onedrive_url', 'status', 'error', 'read_only',
+                'onedrive_url', 'status', 'error',
                 'owner_name', 'owner_email', 'owner_login_name', 'owner_upn',
                 'additional_admin_count',
                 'admin_names', 'admin_emails', 'admin_login_names', 'admin_upns'
@@ -532,7 +391,6 @@ def update_csv_dynamically(results, filename):
                 if result['status'] == 'success':
                     owner = result.get('owner', {})
                     admins = result.get('additional_admins', [])
-                    read_only = result.get('read_only', False)
                     
                     # Combine all admin details into semicolon-separated strings
                     admin_names = []
@@ -550,7 +408,6 @@ def update_csv_dynamically(results, filename):
                         'onedrive_url': result['onedrive_url'],
                         'status': result['status'],
                         'error': '',
-                        'read_only': read_only,
                         'owner_name': str(owner.get('title', '')) if owner.get('title') is not None else '',
                         'owner_email': str(owner.get('email', '')) if owner.get('email') is not None else '',
                         'owner_login_name': str(owner.get('login_name', '')) if owner.get('login_name') is not None else '',
@@ -567,7 +424,6 @@ def update_csv_dynamically(results, filename):
                         'onedrive_url': result['onedrive_url'],
                         'status': result['status'],
                         'error': str(result.get('error', '')) if result.get('error') is not None else '',
-                        'read_only': '',
                         'owner_name': '',
                         'owner_email': '',
                         'owner_login_name': '',
@@ -597,9 +453,6 @@ def process_onedrive_urls(urls, output_csv):
             if url.endswith('/Documents'):
                 url = url[:-10]
             
-            # Get site ReadOnly state
-            read_only_state = get_site_info(url)
-            
             # Get site owner
             owner_info = get_site_owner(url)
             
@@ -612,12 +465,11 @@ def process_onedrive_urls(urls, output_csv):
             result = {
                 'onedrive_url': url,
                 'status': 'success',
-                'read_only': read_only_state,
                 'owner': owner_info,
                 'additional_admins': additional_admins
             }
             
-            print(f"✓ Success: {url} - ReadOnly: {read_only_state}, Owner: {owner_info.get('email', 'Unknown')}, Additional admins: {len(additional_admins)}")
+            print(f"✓ Success: {url} - Owner: {owner_info.get('email', 'Unknown')}, Additional admins: {len(additional_admins)}")
             
         except Exception as e:
             print(f"✗ Failed: {url}: {str(e)}")
@@ -625,7 +477,6 @@ def process_onedrive_urls(urls, output_csv):
                 'onedrive_url': url,
                 'status': 'error',
                 'error': str(e),
-                'read_only': False,
                 'owner': {},
                 'additional_admins': []
             }
@@ -636,7 +487,7 @@ def process_onedrive_urls(urls, output_csv):
         update_csv_dynamically([result], output_csv)
         
         # Add a small delay to avoid rate limiting
-        time.sleep(0.5)
+        time.sleep(0.3)  # Reduced delay for faster processing
     
     return results
 
@@ -647,7 +498,6 @@ def print_summary(results):
     failed = total_urls - successful
     total_additional_admins = sum(len(r['additional_admins']) for r in results if r['status'] == 'success')
     urls_with_additional_admins = sum(1 for r in results if r['status'] == 'success' and len(r['additional_admins']) > 0)
-    read_only_sites = sum(1 for r in results if r['status'] == 'success' and r.get('read_only', False))
     
     print("\n" + "="*60)
     print("PROCESSING SUMMARY")
@@ -655,7 +505,6 @@ def print_summary(results):
     print(f"Total OneDrive URLs processed: {total_urls}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
-    print(f"ReadOnly sites: {read_only_sites}")
     print(f"OneDrive sites with additional admins: {urls_with_additional_admins}")
     print(f"Total additional administrators found: {total_additional_admins}")
     print("="*60)
@@ -672,10 +521,8 @@ def print_summary(results):
             if result['status'] == 'success' and len(result['additional_admins']) > 0:
                 owner_email = result['owner'].get('email', 'Unknown')
                 admin_count = len(result['additional_admins'])
-                read_only = result.get('read_only', False)
                 print(f"  - {result['onedrive_url']}")
                 print(f"    Owner: {owner_email}")
-                print(f"    ReadOnly: {read_only}")
                 print(f"    Additional admins: {admin_count}")
                 for admin in result['additional_admins']:
                     admin_email = admin.get('email', admin.get('login_name', 'Unknown'))
