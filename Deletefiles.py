@@ -4,6 +4,7 @@ import base64
 import time
 import requests
 import csv
+import os
 from datetime import datetime
 from urllib.parse import urlparse, quote
 from cryptography.hazmat.primitives import hashes
@@ -21,13 +22,27 @@ scope_sharepoint = "https://geekbyteonline.sharepoint.com/.default"
 CERTIFICATE_PATH = "certificate.pem"
 PRIVATE_KEY_PATH = "private_key.pem"
 
-# Input and output files
+# Input file
 CSV_INPUT_FILE = "files_to_process.csv"
-OUTPUT_FILE = "file_processing_results.csv"
+
+# Operation mode: "check" for status check only, "delete" to delete files
+OPERATION_MODE = "delete"  # Change to "delete" to enable deletion
+# OPERATION_MODE = "delete"  # Change to "delete" to enable deletion
 
 # Token management
 access_token = None
 token_expiry_time = 0
+
+# Global output file variable
+OUTPUT_FILE = None
+
+def get_output_filename():
+    """Generate output filename with timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if OPERATION_MODE == "check":
+        return f"file_check_results_{timestamp}.csv"
+    else:
+        return f"file_deletion_results_{timestamp}.csv"
 
 def load_certificate_and_key():
     """Load certificate and private key from PEM files"""
@@ -266,28 +281,65 @@ def read_csv_file(filename):
         print(f"Error reading CSV file: {str(e)}")
         return []
 
-def write_results_to_csv(results, filename):
-    """Write processing results to CSV file"""
+def initialize_output_csv(filename, mode):
+    """Initialize the output CSV file with headers"""
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow([
-                'File URL', 'Status', 'HTTP Status Code', 'Error Message', 'API URL', 'Timestamp'
-            ])
-            for result in results:
-                writer.writerow(result)
-        print(f"Results written to {filename}")
+            if mode == "check":
+                writer.writerow([
+                    'File URL', 'Status', 'HTTP Status Code', 'Error Message', 'API URL', 'Timestamp'
+                ])
+            else:
+                writer.writerow([
+                    'File URL', 'Status', 'HTTP Status Code', 'Error Message', 'API URL', 'Timestamp'
+                ])
+        print(f"Created new output file: {filename}")
     except Exception as e:
-        print(f"Error writing results to CSV: {str(e)}")
+        print(f"Error initializing output CSV: {str(e)}")
+
+def append_result_to_csv(filename, result):
+    """Append a single result to the CSV file"""
+    try:
+        with open(filename, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(result)
+        print(f"✓ Result saved to CSV for: {result[0]}")
+    except Exception as e:
+        print(f"Error appending to CSV: {str(e)}")
+
+def list_previous_output_files():
+    """List previous output files in the current directory"""
+    try:
+        csv_files = [f for f in os.listdir('.') if f.endswith('.csv') and ('file_check_results_' in f or 'file_deletion_results_' in f)]
+        if csv_files:
+            print("\nPrevious output files found:")
+            for file in sorted(csv_files, reverse=True)[:5]:  # Show only latest 5
+                print(f"  - {file}")
+        return csv_files
+    except Exception as e:
+        print(f"Error listing previous files: {str(e)}")
+        return []
 
 def main():
+    global OUTPUT_FILE
+    
     try:
-        print("Starting file deletion process...")
-        print("WARNING: FILES WILL BE MOVED TO RECYCLE BIN")
-        confirmation = input("Type 'YES' to confirm you want to delete files: ")
-        if confirmation != "YES":
-            print("Operation cancelled")
-            return
+        print(f"Starting file processing in '{OPERATION_MODE}' mode...")
+        
+        # Show previous output files
+        list_previous_output_files()
+        
+        if OPERATION_MODE == "delete":
+            print("\nWARNING: FILES WILL BE MOVED TO RECYCLE BIN")
+            confirmation = input("Type 'YES' to confirm you want to delete files: ")
+            if confirmation != "YES":
+                print("Operation cancelled")
+                return
+        
+        # Generate output filename with timestamp
+        OUTPUT_FILE = get_output_filename()
+        print(f"\nOutput will be saved to: {OUTPUT_FILE}")
         
         # Get access token (will be cached for 45 minutes)
         access_token = get_access_token()
@@ -298,11 +350,13 @@ def main():
             print(f"No URLs found in {CSV_INPUT_FILE}")
             return
         
+        # Initialize output CSV
+        initialize_output_csv(OUTPUT_FILE, OPERATION_MODE)
+        
         print(f"Found {len(file_urls)} files to process")
         print("=" * 80)
         
         # Process each file
-        results = []
         for i, file_url in enumerate(file_urls, 1):
             print(f"\nProcessing file {i}/{len(file_urls)}: {file_url}")
             
@@ -310,71 +364,114 @@ def main():
             base_url, server_relative_path = extract_base_url_from_file_url(file_url)
             if not base_url or not server_relative_path:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                results.append([
+                result_row = [
                     file_url, "URL_PARSE_ERROR", "N/A", f"Failed to parse URL: {file_url}", "N/A", timestamp
-                ])
+                ]
+                append_result_to_csv(OUTPUT_FILE, result_row)
                 print(f"✗ Failed to parse URL: {file_url}")
                 continue
             
-            # Check if file exists
-            check_api_url = build_api_url(base_url, server_relative_path, "check")
-            exists, status_code, error_message, check_api_url_used = try_with_subsites(
-                access_token, file_url, check_api_url, check_file_exists
-            )
-            
-            if not exists:
+            if OPERATION_MODE == "check":
+                # Check-only mode: just verify file existence
+                check_api_url = build_api_url(base_url, server_relative_path, "check")
+                exists, status_code, error_message, api_url_used = try_with_subsites(
+                    access_token, file_url, check_api_url, check_file_exists
+                )
+                
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                results.append([
-                    file_url, "SKIPPED", status_code, error_message, check_api_url_used, timestamp
-                ])
-                print(f"↷ File not found, skipping: {file_url}")
-                continue
-            
-            # File exists, proceed with deletion
-            delete_api_url = build_api_url(base_url, server_relative_path, "delete")
-            success, status_code, error_message, delete_api_url_used = try_with_subsites(
-                access_token, file_url, delete_api_url, delete_file
-            )
-            
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            result_row = [
-                file_url,
-                "SUCCESS" if success else "FAILED",
-                status_code,
-                error_message,
-                delete_api_url_used,
-                timestamp
-            ]
-            
-            results.append(result_row)
-            
-            if success:
-                print(f"✓ Successfully deleted: {file_url}")
+                
+                status = "EXISTS" if exists else "NOT_FOUND" if status_code == 404 else "ERROR"
+                result_row = [
+                    file_url,
+                    status,
+                    status_code,
+                    error_message,
+                    api_url_used,
+                    timestamp
+                ]
+                
+                append_result_to_csv(OUTPUT_FILE, result_row)
+                
+                if exists:
+                    print(f"✓ File exists: {file_url}")
+                elif status_code == 404:
+                    print(f"↷ File not found: {file_url}")
+                else:
+                    print(f"✗ Error checking file: {file_url}")
+                    print(f"  → Error: {error_message}")
+                    
             else:
-                print(f"✗ Failed to delete: {file_url}")
-                print(f"  → Error: {error_message}")
+                # Delete mode: check if file exists, then delete
+                check_api_url = build_api_url(base_url, server_relative_path, "check")
+                exists, status_code, error_message, check_api_url_used = try_with_subsites(
+                    access_token, file_url, check_api_url, check_file_exists
+                )
+                
+                if not exists:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    result_row = [
+                        file_url, "SKIPPED", status_code, error_message, check_api_url_used, timestamp
+                    ]
+                    append_result_to_csv(OUTPUT_FILE, result_row)
+                    print(f"↷ File not found, skipping: {file_url}")
+                    continue
+                
+                # File exists, proceed with deletion
+                delete_api_url = build_api_url(base_url, server_relative_path, "delete")
+                success, status_code, error_message, delete_api_url_used = try_with_subsites(
+                    access_token, file_url, delete_api_url, delete_file
+                )
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                result_row = [
+                    file_url,
+                    "SUCCESS" if success else "FAILED",
+                    status_code,
+                    error_message,
+                    delete_api_url_used,
+                    timestamp
+                ]
+                
+                append_result_to_csv(OUTPUT_FILE, result_row)
+                
+                if success:
+                    print(f"✓ Successfully deleted: {file_url}")
+                else:
+                    print(f"✗ Failed to delete: {file_url}")
+                    print(f"  → Error: {error_message}")
             
             # Small delay to avoid rate limiting
             time.sleep(0.5)
         
-        # Write results to output CSV
-        write_results_to_csv(results, OUTPUT_FILE)
-        
-        # Print summary
-        success_count = sum(1 for r in results if r[1] == "SUCCESS")
-        skipped_count = sum(1 for r in results if r[1] == "SKIPPED")
-        failed_count = sum(1 for r in results if r[1] == "FAILED")
-        
+        # Print final summary
         print("\n" + "=" * 80)
-        print(f"Deletion completed!")
-        print(f"Successfully deleted: {success_count}")
-        print(f"Skipped (not found): {skipped_count}")
-        print(f"Failed: {failed_count}")
+        print("Processing completed!")
         print(f"Results saved to: {OUTPUT_FILE}")
+        
+        # Show quick summary from output file
+        if os.path.exists(OUTPUT_FILE):
+            with open(OUTPUT_FILE, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.reader(csvfile)
+                rows = list(reader)
+                if len(rows) > 1:  # More than just header
+                    success_count = sum(1 for row in rows[1:] if row[1] in ["EXISTS", "SUCCESS"])
+                    skipped_count = sum(1 for row in rows[1:] if row[1] in ["NOT_FOUND", "SKIPPED"])
+                    error_count = sum(1 for row in rows[1:] if row[1] in ["ERROR", "FAILED", "URL_PARSE_ERROR"])
+                    
+                    if OPERATION_MODE == "check":
+                        print(f"Files found: {success_count}")
+                        print(f"Files not found: {skipped_count}")
+                        print(f"Errors: {error_count}")
+                    else:
+                        print(f"Successfully deleted: {success_count}")
+                        print(f"Skipped (not found): {skipped_count}")
+                        print(f"Failed: {error_count}")
         
     except Exception as e:
         print(f"An error occurred: {str(e)}")
+        if OUTPUT_FILE:
+            print(f"Partial results saved to: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
