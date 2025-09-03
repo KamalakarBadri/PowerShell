@@ -55,17 +55,33 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Configuration for both authentication methods
-CONFIG = {
-    "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
-    "tenant_name": "geekbyteonline.onmicrosoft.com",
-    "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
-    "client_secret": "CyG8Q~FYHuCMSyVmt4sNxt5IejrMc2c24Ziz4a.t",
-    "certificate_path": "certificate.pem",
-    "private_key_path": "private_key.pem",
-    "scopes": {
-        "graph": "https://graph.microsoft.com/.default",
-        "sharepoint": "https://geekbyteonline.sharepoint.com/.default"
+# Configuration for multiple tenants
+TENANTS = {
+    "tenant1": {
+        "name": "GeekByte Online",
+        "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+        "tenant_name": "geekbyteonline.onmicrosoft.com",
+        "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+        "client_secret": "CyG8Q~FYHuCMSyVmt4sNxt5IejrMc2c24Ziz4a.t",
+        "certificate_path": "certificate.pem",
+        "private_key_path": "private_key.pem",
+        "scopes": {
+            "graph": "https://graph.microsoft.com/.default",
+            "sharepoint": "https://geekbyteonline.sharepoint.com/.default"
+        }
+    },
+    "tenant2": {
+        "name": "Contoso",
+        "tenant_id": "YOUR_SECOND_TENANT_ID",
+        "tenant_name": "contoso.onmicrosoft.com",
+        "app_id": "YOUR_SECOND_APP_ID",
+        "client_secret": "YOUR_SECOND_CLIENT_SECRET",
+        "certificate_path": "certificate2.pem",
+        "private_key_path": "private_key2.pem",
+        "scopes": {
+            "graph": "https://graph.microsoft.com/.default",
+            "sharepoint": "https://contoso.sharepoint.com/.default"
+        }
     }
 }
 
@@ -99,9 +115,14 @@ HTML_TEMPLATE = """
         .header { background: #0078d4; color: white; padding: 6px; margin: -8px -8px 8px -8px; text-align: center; }
         .header h1 { font-size: 16px; margin: 0; }
         
-        .top-row { display: flex; gap: 8px; margin-bottom: 8px; }
-        .auth-controls { display: flex; gap: 10px; align-items: center; font-size: 11px; }
-        .auth-controls input[type="radio"] { margin: 0 3px 0 8px; }
+        .config-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+        .config-group { background: #f8f9fa; border: 1px solid #ddd; padding: 6px; border-radius: 2px; }
+        .config-group-title { font-weight: bold; font-size: 10px; color: #666; margin-bottom: 4px; }
+        .config-options { display: flex; gap: 8px; flex-wrap: wrap; }
+        .config-option { display: flex; align-items: center; }
+        .config-option label { margin-left: 3px; font-size: 11px; }
+        
+        .url-row { display: flex; gap: 8px; margin-bottom: 8px; }
         .url-input { flex: 1; padding: 4px; border: 1px solid #ccc; border-radius: 2px; }
         .btn { padding: 4px 8px; background: #0078d4; color: white; border: none; border-radius: 2px; cursor: pointer; font-size: 11px; }
         .btn:hover { background: #106ebe; }
@@ -209,8 +230,8 @@ HTML_TEMPLATE = """
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
         
         @media (max-width: 768px) {
-            .top-row { flex-direction: column; }
-            .auth-controls { flex-wrap: wrap; }
+            .config-row, .url-row { flex-direction: column; }
+            .config-options { flex-wrap: wrap; }
             .grid-2 { grid-template-columns: 1fr; }
         }
     </style>
@@ -221,22 +242,63 @@ HTML_TEMPLATE = """
             <h1>Graph API Explorer</h1>
         </div>
         
-        <div class="top-row">
-            <div class="auth-controls">
-                <strong>Method:</strong>
-                <select id="http-method" style="padding: 3px; font-size: 11px;">
-                    <option value="GET">GET</option>
-                    <option value="POST">POST</option>
-                    <option value="PUT">PUT</option>
-                    <option value="DELETE">DELETE</option>
-                </select>
-                <strong>Auth:</strong>
-                <label><input type="radio" name="auth-method" value="certificate" checked>Cert</label>
-                <label><input type="radio" name="auth-method" value="secret">Secret</label>
-                <strong>Scope:</strong>
-                <label><input type="radio" name="scope" value="graph" checked>Graph</label>
-                <label><input type="radio" name="scope" value="sharepoint">SP</label>
+        <div class="config-row">
+            <div class="config-group">
+                <div class="config-group-title">Tenant:</div>
+                <div class="config-options">
+                    <div class="config-option">
+                        <input type="radio" id="tenant1" name="tenant" value="tenant1" checked>
+                        <label for="tenant1">GeekByte</label>
+                    </div>
+                    <div class="config-option">
+                        <input type="radio" id="tenant2" name="tenant" value="tenant2">
+                        <label for="tenant2">Contoso</label>
+                    </div>
+                </div>
             </div>
+            
+            <div class="config-group">
+                <div class="config-group-title">Method:</div>
+                <div class="config-options">
+                    <select id="http-method" style="padding: 3px; font-size: 11px;">
+                        <option value="GET">GET</option>
+                        <option value="POST">POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="DELETE">DELETE</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="config-group">
+                <div class="config-group-title">Auth:</div>
+                <div class="config-options">
+                    <div class="config-option">
+                        <input type="radio" id="auth-cert" name="auth-method" value="certificate" checked>
+                        <label for="auth-cert">Certificate</label>
+                    </div>
+                    <div class="config-option">
+                        <input type="radio" id="auth-secret" name="auth-method" value="secret">
+                        <label for="auth-secret">Secret</label>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="config-group">
+                <div class="config-group-title">Scope:</div>
+                <div class="config-options">
+                    <div class="config-option">
+                        <input type="radio" id="scope-graph" name="scope" value="graph" checked>
+                        <label for="scope-graph">Graph</label>
+                    </div>
+                    <div class="config-option">
+                        <input type="radio" id="scope-sp" name="scope" value="sharepoint">
+                        <label for="scope-sp">SharePoint</label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="url-row">
             <input type="text" id="api-url" class="url-input" value="https://graph.microsoft.com/v1.0/users" placeholder="Enter API URL">
             <button class="btn" onclick="callApi()">Send</button>
         </div>
@@ -416,6 +478,7 @@ HTML_TEMPLATE = """
             tokenCache = {};
             setStatus('loading', 'Refreshing token...');
             
+            const tenant = document.querySelector('input[name="tenant"]:checked').value;
             const authMethod = document.querySelector('input[name="auth-method"]:checked').value;
             const scope = document.querySelector('input[name="scope"]:checked').value;
             
@@ -423,6 +486,7 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ 
+                    tenant: tenant,
                     auth_method: authMethod,
                     scope: scope,
                     force_refresh: true
@@ -445,6 +509,7 @@ HTML_TEMPLATE = """
         function callApi() {
             const url = document.getElementById('api-url').value.trim();
             const method = document.getElementById('http-method').value;
+            const tenant = document.querySelector('input[name="tenant"]:checked').value;
             const authMethod = document.querySelector('input[name="auth-method"]:checked').value;
             const scope = document.querySelector('input[name="scope"]:checked').value;
             const statusDiv = document.getElementById('status');
@@ -495,6 +560,7 @@ HTML_TEMPLATE = """
                 body: JSON.stringify({ 
                     url: url,
                     method: method,
+                    tenant: tenant,
                     auth_method: authMethod,
                     scope: scope,
                     headers: headers,
@@ -964,12 +1030,13 @@ def get_token():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
+        tenant_id = data.get('tenant', 'tenant1')
         auth_method = data.get('auth_method', 'certificate')
         scope_type = data.get('scope', 'graph')
         force_refresh = data.get('force_refresh', False)
         
         # Create cache key
-        cache_key = f"{auth_method}_{scope_type}"
+        cache_key = f"{tenant_id}_{auth_method}_{scope_type}"
         
         # Check if we have a valid cached token
         if not force_refresh and cache_key in TOKEN_CACHE:
@@ -978,12 +1045,13 @@ def get_token():
                 return jsonify({"token": token_data['token']})
         
         # Get new token
-        scope = CONFIG['scopes'][scope_type]
+        tenant_config = TENANTS.get(tenant_id, TENANTS['tenant1'])
+        scope = tenant_config['scopes'][scope_type]
         
         if auth_method == 'certificate':
-            access_token = get_token_with_certificate(scope)
+            access_token = get_token_with_certificate(tenant_config, scope)
         else:
-            access_token = get_token_with_secret(scope)
+            access_token = get_token_with_secret(tenant_config, scope)
         
         if access_token:
             # Cache token (expires in 55 minutes to be safe)
@@ -1015,13 +1083,17 @@ def handle_call_graph():
             return jsonify({"error": "URL not provided"}), 400
             
         method = data.get('method', 'GET')
+        tenant_id = data.get('tenant', 'tenant1')
         auth_method = data.get('auth_method', 'certificate')
         scope_type = data.get('scope', 'graph')
         custom_headers = data.get('headers', {})
         body = data.get('body')
         
+        # Get tenant config
+        tenant_config = TENANTS.get(tenant_id, TENANTS['tenant1'])
+        
         # Create cache key
-        cache_key = f"{auth_method}_{scope_type}"
+        cache_key = f"{tenant_id}_{auth_method}_{scope_type}"
         
         # Get token (either from cache or new)
         access_token = None
@@ -1031,11 +1103,11 @@ def handle_call_graph():
                 access_token = token_data['token']
         
         if not access_token:
-            scope = CONFIG['scopes'][scope_type]
+            scope = tenant_config['scopes'][scope_type]
             if auth_method == 'certificate':
-                access_token = get_token_with_certificate(scope)
+                access_token = get_token_with_certificate(tenant_config, scope)
             else:
-                access_token = get_token_with_secret(scope)
+                access_token = get_token_with_secret(tenant_config, scope)
             
             if access_token:
                 TOKEN_CACHE[cache_key] = {
@@ -1070,8 +1142,8 @@ def handle_call_graph():
         
         # Handle token expiration
         if response.status_code == 401:
-            scope = CONFIG['scopes'][scope_type]
-            new_token = get_token_with_certificate(scope) if auth_method == 'certificate' else get_token_with_secret(scope)
+            scope = tenant_config['scopes'][scope_type]
+            new_token = get_token_with_certificate(tenant_config, scope) if auth_method == 'certificate' else get_token_with_secret(tenant_config, scope)
             
             if new_token:
                 TOKEN_CACHE[cache_key] = {
@@ -1126,6 +1198,7 @@ def handle_call_graph():
             "content_type": content_type,
             "auth_method": auth_method,
             "scope": scope_type,
+            "tenant": tenant_id,
             "token": access_token,
             "method": method
         }
@@ -1136,15 +1209,15 @@ def handle_call_graph():
         logger.exception("Error in call_graph")
         return jsonify({"error": str(e), "token": None}), 500
 
-def get_token_with_certificate(scope):
+def get_token_with_certificate(tenant_config, scope):
     """Get access token using certificate-based authentication"""
     try:
-        if not os.path.exists(CONFIG['certificate_path']) or not os.path.exists(CONFIG['private_key_path']):
+        if not os.path.exists(tenant_config['certificate_path']) or not os.path.exists(tenant_config['private_key_path']):
             raise Exception("Certificate or private key file not found")
             
-        with open(CONFIG['certificate_path'], "rb") as cert_file:
+        with open(tenant_config['certificate_path'], "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
-        with open(CONFIG['private_key_path'], "rb") as key_file:
+        with open(tenant_config['private_key_path'], "rb") as key_file:
             private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
 
         now = int(time.time())
@@ -1154,12 +1227,12 @@ def get_token_with_certificate(scope):
             "x5t": base64.urlsafe_b64encode(certificate.fingerprint(hashes.SHA1())).decode().rstrip('=')
         }
         jwt_payload = {
-            "aud": f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
+            "aud": f"https://login.microsoftonline.com/{tenant_config['tenant_id']}/oauth2/v2.0/token",
             "exp": now + 300,
-            "iss": CONFIG['app_id'],
+            "iss": tenant_config['app_id'],
             "jti": str(uuid.uuid4()),
             "nbf": now,
-            "sub": CONFIG['app_id']
+            "sub": tenant_config['app_id']
         }
 
         encoded_header = base64.urlsafe_b64encode(json.dumps(jwt_header).encode()).decode().rstrip('=')
@@ -1170,9 +1243,9 @@ def get_token_with_certificate(scope):
         jwt = f"{jwt_unsigned}.{encoded_signature}"
 
         token_response = requests.post(
-            f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
+            f"https://login.microsoftonline.com/{tenant_config['tenant_id']}/oauth2/v2.0/token",
             data={
-                "client_id": CONFIG['app_id'],
+                "client_id": tenant_config['app_id'],
                 "client_assertion": jwt,
                 "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
                 "scope": scope,
@@ -1190,14 +1263,14 @@ def get_token_with_certificate(scope):
         logger.exception("Certificate authentication failed")
         return None
 
-def get_token_with_secret(scope):
+def get_token_with_secret(tenant_config, scope):
     """Get access token using client secret authentication"""
     try:
-        token_url = f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token"
+        token_url = f"https://login.microsoftonline.com/{tenant_config['tenant_id']}/oauth2/v2.0/token"
         
         token_data = {
-            "client_id": CONFIG['app_id'],
-            "client_secret": CONFIG['client_secret'],
+            "client_id": tenant_config['app_id'],
+            "client_secret": tenant_config['client_secret'],
             "scope": scope,
             "grant_type": "client_credentials"
         }
