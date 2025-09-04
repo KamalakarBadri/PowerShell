@@ -1,0 +1,2 @@
+https://graph.microsoft.com/v1.0/sites/geekbyteonline.sharepoint.com:/sites/
+
