@@ -1,3 +1,22 @@
+{
+    "tenant": "geekbyteonline.onmicrosoft.com",
+    "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+    "cert_path": "certificate.pem",
+    "key_path": "private_key.pem",
+    "sharepoint_url": "https://geekbyteonline.sharepoint.com",
+    "output_prefix": "sharepoint_sites",
+    "page_size": 100,
+    "preview_count": 5
+}
+
+
+
+
+
+
+
+
+
 import csv
 import json
 import uuid
@@ -35,33 +54,6 @@ def load_config(config_file="config.json"):
     except Exception as e:
         print(f"Error loading configuration: {str(e)}")
         raise
-
-def save_parameters_to_csv(config, output_filename):
-    """Save all parameters to a CSV file"""
-    try:
-        with open(output_filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Parameter', 'Value']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            writer.writeheader()
-            
-            # Write all parameters
-            writer.writerow({'Parameter': 'Tenant', 'Value': config.get('tenant')})
-            writer.writerow({'Parameter': 'Application ID', 'Value': config.get('app_id')})
-            writer.writerow({'Parameter': 'Certificate Path', 'Value': config.get('cert_path')})
-            writer.writerow({'Parameter': 'Private Key Path', 'Value': config.get('key_path')})
-            
-            sharepoint_url = config.get('sharepoint_url') or f"https://{config.get('tenant', '').split('.')[0]}.sharepoint.com"
-            writer.writerow({'Parameter': 'SharePoint URL', 'Value': sharepoint_url})
-            
-            writer.writerow({'Parameter': 'Output Prefix', 'Value': config.get('output_prefix')})
-            writer.writerow({'Parameter': 'Page Size', 'Value': config.get('page_size')})
-            writer.writerow({'Parameter': 'Preview Count', 'Value': config.get('preview_count')})
-            writer.writerow({'Parameter': 'Execution Time', 'Value': datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-            
-        print(f"Parameters saved to {output_filename}")
-    except Exception as e:
-        print(f"Error saving parameters to CSV: {str(e)}")
 
 def load_certificate_and_key(certificate_path, private_key_path):
     """Load certificate and private key from PEM files"""
@@ -490,9 +482,6 @@ def main():
     page_size = config.get('page_size')
     preview_count = config.get('preview_count')
     
-    # Save parameters to CSV
-    save_parameters_to_csv(config, f"{output_prefix}_parameters.csv")
-    
     # Define scopes
     scope_graph = "https://graph.microsoft.com/.default"
     scope_sharepoint = f"{sharepoint_url}/.default"
@@ -543,9 +532,9 @@ def main():
         all_sites_data = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "tenant": tenant_name,
-            "all_sites": [],
-            "sharepoint_sites": [],
-            "personal_sites": []
+            'all_sites': [],
+            'sharepoint_sites': [],
+            'personal_sites': []
         }
         
         # Method 1: Get all sites at once
