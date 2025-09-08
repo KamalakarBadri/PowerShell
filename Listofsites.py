@@ -1,22 +1,3 @@
-{
-    "tenant": "geekbyteonline.onmicrosoft.com",
-    "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
-    "cert_path": "certificate.pem",
-    "key_path": "private_key.pem",
-    "sharepoint_url": "https://geekbyteonline.sharepoint.com",
-    "output_prefix": "sharepoint_sites",
-    "page_size": 100,
-    "preview_count": 5
-}
-
-
-
-
-
-
-
-
-
 import csv
 import json
 import uuid
@@ -177,83 +158,30 @@ def make_sharepoint_request(token, endpoint):
         print(f"Error making SharePoint request: {err}")
         raise
 
-def get_all_sites_from_sharepoint(token, sharepoint_url):
-    """Get all sites using SharePoint REST API v2.0"""
-    print("\n=== Getting All Sites from SharePoint API ===")
-    
-    all_sites = []
-    sharepoint_sites = []
-    personal_sites = []
-    
-    # Use the SharePoint REST API endpoint
-    sites_endpoint = f"{sharepoint_url}/_api/v2.0/sites"
-    
-    try:
-        sites_data = make_sharepoint_request(token, sites_endpoint)
-        
-        for site in sites_data.get('value', []):
-            template_name = site.get('template', {}).get('name', 'Unknown')
-            
-            site_info = {
-                'id': site.get('id'),
-                'name': site.get('name'),
-                'title': site.get('title'),
-                'webUrl': site.get('webUrl'),
-                'createdDateTime': site.get('createdDateTime'),
-                'isPersonalSite': site.get('isPersonalSite', False),
-                'dataLocationCode': site.get('dataLocationCode'),
-                'siteCollection': site.get('siteCollection', {}),
-                'template': template_name,
-                'sensitivityLabel': site.get('sensitivityLabel', {})
-            }
-            
-            all_sites.append(site_info)
-            
-            # Separate personal sites from SharePoint sites
-            if site.get('isPersonalSite', False):
-                site_info['type'] = 'Personal Site'
-                personal_sites.append(site_info)
-                print(f"Personal Site: {site.get('title', site.get('name'))} - {site.get('webUrl')} - Template: {template_name}")
-            else:
-                site_info['type'] = 'SharePoint Site'
-                sharepoint_sites.append(site_info)
-                print(f"SharePoint Site: {site.get('title', site.get('name'))} - {site.get('webUrl')} - Template: {template_name}")
-        
-        return {
-            'all_sites': all_sites,
-            'sharepoint_sites': sharepoint_sites,
-            'personal_sites': personal_sites
-        }
-        
-    except Exception as e:
-        print(f"Error getting sites from SharePoint API: {str(e)}")
-        return {
-            'all_sites': [],
-            'sharepoint_sites': [],
-            'personal_sites': []
-        }
-
-def get_sites_with_pagination(token, sharepoint_url, page_size=100):
-    """Get all sites with pagination support"""
+def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
+    """Get all sites with proper pagination handling"""
     print(f"\n=== Getting All Sites with Pagination (page size: {page_size}) ===")
     
     all_sites = []
     sharepoint_sites = []
     personal_sites = []
-    skip = 0
     
-    while True:
+    # Initial endpoint
+    endpoint = f"{sharepoint_url}/_api/v2.0/sites?$top={page_size}"
+    batch_count = 0
+    
+    while endpoint:
+        batch_count += 1
         try:
-            # Use $top and $skip for pagination
-            sites_endpoint = f"{sharepoint_url}/_api/v2.0/sites?$top={page_size}&$skip={skip}"
-            sites_data = make_sharepoint_request(token, sites_endpoint)
+            print(f"Processing batch {batch_count}...")
+            sites_data = make_sharepoint_request(token, endpoint)
             
             current_batch = sites_data.get('value', [])
             
             if not current_batch:
                 break
             
-            print(f"Processing batch {skip // page_size + 1} - {len(current_batch)} sites")
+            print(f"  Found {len(current_batch)} sites in this batch")
             
             for site in current_batch:
                 template_name = site.get('template', {}).get('name', 'Unknown')
@@ -277,21 +205,27 @@ def get_sites_with_pagination(token, sharepoint_url, page_size=100):
                 if site.get('isPersonalSite', False):
                     site_info['type'] = 'Personal Site'
                     personal_sites.append(site_info)
-                    print(f"  Personal Site: {site.get('title', site.get('name'))} - Template: {template_name}")
+                    print(f"    Personal Site: {site.get('title', site.get('name'))} - Template: {template_name}")
                 else:
                     site_info['type'] = 'SharePoint Site'
                     sharepoint_sites.append(site_info)
-                    print(f"  SharePoint Site: {site.get('title', site.get('name'))} - Template: {template_name}")
+                    print(f"    SharePoint Site: {site.get('title', site.get('name'))} - Template: {template_name}")
             
-            skip += page_size
-            
-            # If we got fewer results than requested, we've reached the end
-            if len(current_batch) < page_size:
-                break
+            # Check for next link for pagination
+            endpoint = None
+            if '@odata.nextLink' in sites_data:
+                endpoint = sites_data['@odata.nextLink']
+                print(f"  Next page available: {endpoint}")
+            else:
+                print("  No more pages available")
                 
         except Exception as e:
-            print(f"Error getting sites batch starting at {skip}: {str(e)}")
+            print(f"Error getting sites batch {batch_count}: {str(e)}")
             break
+    
+    print(f"\nTotal sites retrieved: {len(all_sites)}")
+    print(f"SharePoint sites: {len(sharepoint_sites)}")
+    print(f"Personal sites: {len(personal_sites)}")
     
     return {
         'all_sites': all_sites,
@@ -537,25 +471,11 @@ def main():
             'personal_sites': []
         }
         
-        # Method 1: Get all sites at once
-        try:
-            print("Method 1: Getting all sites at once...")
-            sites_result = get_all_sites_from_sharepoint(sharepoint_token, sharepoint_url)
-            all_sites_data["all_sites"] = sites_result["all_sites"]
-            all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
-            all_sites_data["personal_sites"] = sites_result["personal_sites"]
-        except Exception as e:
-            print(f"Error with Method 1: {str(e)}")
-            
-            # Method 2: Try with pagination if the first method fails
-            try:
-                print("Method 2: Getting sites with pagination...")
-                sites_result = get_sites_with_pagination(sharepoint_token, sharepoint_url, page_size)
-                all_sites_data["all_sites"] = sites_result["all_sites"]
-                all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
-                all_sites_data["personal_sites"] = sites_result["personal_sites"]
-            except Exception as e2:
-                print(f"Error with Method 2: {str(e2)}")
+        # Use the pagination method to get all sites
+        sites_result = get_all_sites_with_pagination(sharepoint_token, sharepoint_url, page_size)
+        all_sites_data["all_sites"] = sites_result["all_sites"]
+        all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
+        all_sites_data["personal_sites"] = sites_result["personal_sites"]
         
         # Save all data to files
         save_sites_to_file(all_sites_data, f"{output_prefix}_backup.json")  # JSON backup
