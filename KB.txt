@@ -1,0 +1,27 @@
+Need service KB article for below proces..
+
+Data Security team will identify the files located in sharepoint and onedrive location whihc contains sensitive information, passwrds, crdetials etc. and generate the report...
+
+then that team will submit the ticket to sharepoint team to do this 
+
+primarily, they need to inform to all the users using email to check out thier list of detected files. the list is located in sharepoint site.
+
+We need to upload the list submitted by the data scurity team to that sharepoint site.
+
+after few weeks they will again open a ticket to delete the files from thier respected locations(sp and od)
+
+
+here we are using one script to upload the report to list and
+we will use script to delet the files .
+
+
+now i need detailed KB for this...first give me abstarct then give me KB
+
+
+
+I need 2 KBs for only sharepoint team part..
+
+One is uploading report to list..
+in this process we will create list with name XYZ, and create these columns file URL and user, and create a view with filter [me] , and make unique permissions , then run the script the report is in csv with same columns..
+two is deleting the files using the script..
+the report is again provided by team 
