@@ -30,7 +30,7 @@ CONFIG = {
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
     "repair_account": "edit@geekbyte.online",
-    "retention_site_url": "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
+    "new_id_site_url": "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
     "scopes": {
         "graph": "https://graph.microsoft.com/.default",
         "sharepoint": "https://geekbyteonline.sharepoint.com/.default"
@@ -222,6 +222,26 @@ HTML_TEMPLATE = """
             box-shadow: 0 8px 16px rgba(23, 162, 184, 0.3);
         }
         
+        .btn-warning {
+            background: linear-gradient(135deg, #ffc107 0%, #e0a800 100%);
+            color: #212529;
+        }
+        
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(255, 193, 7, 0.3);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(220, 53, 69, 0.3);
+        }
+        
         .btn-block {
             width: 100%;
             justify-content: center;
@@ -230,6 +250,12 @@ HTML_TEMPLATE = """
         .btn-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        
+        .btn-row-three {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 15px;
         }
         
@@ -446,7 +472,7 @@ HTML_TEMPLATE = """
                 font-size: 2rem;
             }
             
-            .btn-row {
+            .btn-row, .btn-row-three {
                 grid-template-columns: 1fr;
             }
             
@@ -528,7 +554,7 @@ HTML_TEMPLATE = """
             
             <div class="info-banner">
                 <i class="fas fa-info-circle"></i>
-                <strong>NameId Comparison:</strong> The tool compares NameIds between the current site and retention site. 
+                <strong>NameId Comparison:</strong> The tool compares NameIds between the current site and new ID site. 
                 A mismatch indicates PUID issues, but removal works regardless of NameId status.
             </div>
             
@@ -555,12 +581,15 @@ HTML_TEMPLATE = """
                 <input type="email" id="single-onedrive-owner-upn" class="form-control" placeholder="owner@geekbyteonline.onmicrosoft.com">
             </div>
             
-            <div class="btn-row">
+            <div class="btn-row-three">
                 <button id="single-find-user-btn" class="btn btn-info" onclick="findSingleUser()">
                     <i class="fas fa-search"></i> Find User
                 </button>
                 <button id="single-remove-user-btn" class="btn btn-success" onclick="removeSingleUser()" disabled>
                     <i class="fas fa-user-minus"></i> Remove User
+                </button>
+                <button id="single-remove-mismatch-btn" class="btn btn-warning" onclick="removeUserForMismatch()" disabled style="display: none;">
+                    <i class="fas fa-exclamation-triangle"></i> Remove for Mismatch
                 </button>
             </div>
             
@@ -896,6 +925,8 @@ HTML_TEMPLATE = """
             singleCurrentUserId = null;
             singleCurrentSiteUrl = null;
             document.getElementById('single-remove-user-btn').disabled = true;
+            document.getElementById('single-remove-mismatch-btn').disabled = true;
+            document.getElementById('single-remove-mismatch-btn').style.display = 'none';
             document.getElementById('single-results-section').style.display = 'none';
             document.getElementById('nameid-comparison').style.display = 'none';
             setSingleStatus('Enter user details to start');
@@ -935,9 +966,11 @@ HTML_TEMPLATE = """
         
         function findSingleUser() {
             const upn = document.getElementById('single-user-upn').value.trim();
+            currentUserUpn = upn;
             const removalType = document.getElementById('single-removal-type').value;
             const findBtn = document.getElementById('single-find-user-btn');
             const removeBtn = document.getElementById('single-remove-user-btn');
+            const mismatchBtn = document.getElementById('single-remove-mismatch-btn');
             const resultsSection = document.getElementById('single-results-section');
             
             let siteUrl = '';
@@ -959,6 +992,7 @@ HTML_TEMPLATE = """
             
             findBtn.disabled = true;
             removeBtn.disabled = true;
+            mismatchBtn.disabled = true;
             findBtn.innerHTML = '<div class="spinner"></div> Finding User...';
             setSingleStatus(removalType === 'site' ? 'Searching for user on the specified site...' : 'Getting OneDrive URL and searching for user...');
             resultsSection.style.display = 'none';
@@ -991,6 +1025,7 @@ HTML_TEMPLATE = """
                     setSingleStatus('Error: ' + data.error);
                     resultsSection.style.display = 'none';
                     removeBtn.disabled = true;
+                    mismatchBtn.disabled = true;
                 } else {
                     setSingleStatus(removalType === 'site' ? 'User found on site' : 'User found on OneDrive');
                     displaySingleUserInfo(data);
@@ -1011,6 +1046,7 @@ HTML_TEMPLATE = """
                 setSingleStatus('Request failed: ' + err.message);
                 resultsSection.style.display = 'none';
                 removeBtn.disabled = true;
+                mismatchBtn.disabled = true;
             });
         }
         
@@ -1037,9 +1073,11 @@ HTML_TEMPLATE = """
             
             const removeBtn = document.getElementById('single-remove-user-btn');
             const findBtn = document.getElementById('single-find-user-btn');
+            const mismatchBtn = document.getElementById('single-remove-mismatch-btn');
             
             removeBtn.disabled = true;
             findBtn.disabled = true;
+            mismatchBtn.disabled = true;
             removeBtn.innerHTML = '<div class="spinner"></div> Removing User...';
             setSingleStatus('Removing user from site...');
             
@@ -1055,6 +1093,7 @@ HTML_TEMPLATE = """
             .then(data => {
                 removeBtn.disabled = false;
                 findBtn.disabled = false;
+                mismatchBtn.disabled = false;
                 removeBtn.innerHTML = '<i class="fas fa-user-minus"></i> Remove User';
                 
                 if (data.error) {
@@ -1064,12 +1103,70 @@ HTML_TEMPLATE = """
                     displaySingleRemovalConfirmation(data);
                     singleCurrentUserId = null;
                     removeBtn.disabled = true;
+                    mismatchBtn.disabled = true;
                 }
             })
             .catch(err => {
                 removeBtn.disabled = false;
                 findBtn.disabled = false;
+                mismatchBtn.disabled = false;
                 removeBtn.innerHTML = '<i class="fas fa-user-minus"></i> Remove User';
+                setSingleStatus('Request failed: ' + err.message);
+            });
+        }
+        
+        function removeUserForMismatch() {
+            if (!singleCurrentUserId || !singleCurrentSiteUrl || !currentUserUpn) {
+                setSingleStatus('Error: Please find a user first');
+                return;
+            }
+
+            if (!confirm('WARNING: This will remove the user from the current site because of NameId mismatch. The user will need to be re-added with the correct permissions. Continue?')) {
+                return;
+            }
+
+            const removeBtn = document.getElementById('single-remove-user-btn');
+            const findBtn = document.getElementById('single-find-user-btn');
+            const mismatchBtn = document.getElementById('single-remove-mismatch-btn');
+            
+            removeBtn.disabled = true;
+            findBtn.disabled = true;
+            mismatchBtn.disabled = true;
+            mismatchBtn.innerHTML = '<div class="spinner"></div> Removing User for Mismatch...';
+            setSingleStatus('Removing user due to NameId mismatch...');
+
+            fetch('/remove_user_mismatch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    upn: currentUserUpn,
+                    current_site_url: singleCurrentSiteUrl
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                removeBtn.disabled = false;
+                findBtn.disabled = false;
+                mismatchBtn.disabled = false;
+                mismatchBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Remove for Mismatch';
+                
+                if (data.error) {
+                    setSingleStatus('Error: ' + data.error);
+                } else if (data.warning) {
+                    setSingleStatus('Warning: ' + data.warning);
+                } else {
+                    setSingleStatus('User successfully removed due to NameId mismatch');
+                    displayMismatchRemovalResult(data);
+                    singleCurrentUserId = null;
+                    removeBtn.disabled = true;
+                    mismatchBtn.disabled = true;
+                }
+            })
+            .catch(err => {
+                removeBtn.disabled = false;
+                findBtn.disabled = false;
+                mismatchBtn.disabled = false;
+                mismatchBtn.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Remove for Mismatch';
                 setSingleStatus('Request failed: ' + err.message);
             });
         }
@@ -1095,18 +1192,28 @@ HTML_TEMPLATE = """
         function displayNameIdComparison(comparison) {
             const comparisonDiv = document.getElementById('nameid-comparison');
             const contentDiv = document.getElementById('nameid-comparison-content');
-            
+            const mismatchBtn = document.getElementById('single-remove-mismatch-btn');
+
             const matchStatus = comparison.match ? 'nameid-match' : 'nameid-mismatch';
             const statusText = comparison.match ? 'MATCH' : 'MISMATCH';
             
+            // Show/hide mismatch removal button
+            if (comparison.match) {
+                mismatchBtn.style.display = 'none';
+            } else {
+                mismatchBtn.style.display = 'inline-block';
+                mismatchBtn.disabled = false;
+            }
+
             let warningMessage = '';
             if (!comparison.match) {
                 warningMessage = `
                     <div class="nameid-warning">
                         <strong><i class="fas fa-exclamation-triangle"></i> NameId Mismatch Detected</strong>
                         <p style="margin-top: 8px; margin-bottom: 0;">
-                            This indicates a PUID mismatch issue. The user removal will still work, 
-                            but the user may experience OneDrive access issues and need OneDrive repair.
+                            This indicates a PUID mismatch issue. You can remove the user from this site 
+                            and re-add them to fix the NameId. The removal button above will work regardless, 
+                            but for automatic mismatch handling use the "Remove for Mismatch" button.
                         </p>
                     </div>
                 `;
@@ -1119,8 +1226,8 @@ HTML_TEMPLATE = """
                         <p style="font-family: monospace; word-break: break-all;">${comparison.current_nameid || 'Not found'}</p>
                     </div>
                     <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
-                        <h5 style="margin-bottom: 10px; color: #495057;">Retention Site NameId</h5>
-                        <p style="font-family: monospace; word-break: break-all;">${comparison.retention_nameid || 'Not found'}</p>
+                        <h5 style="margin-bottom: 10px; color: #495057;">New ID Site NameId</h5>
+                        <p style="font-family: monospace; word-break: break-all;">${comparison.new_nameid || 'Not found'}</p>
                     </div>
                 </div>
                 <div style="padding: 10px; background: ${comparison.match ? '#d4edda' : '#f8d7da'}; border-radius: 4px;">
@@ -1139,6 +1246,28 @@ HTML_TEMPLATE = """
                 <h4>User Removed Successfully</h4>
                 <p>User ID <strong>${data.user_id}</strong> has been successfully removed from the site.</p>
                 <p><strong>Removal Time:</strong> ${new Date().toLocaleString()}</p>
+            `;
+            
+            confirmationDiv.style.display = 'block';
+        }
+        
+        function displayMismatchRemovalResult(data) {
+            const confirmationDiv = document.getElementById('single-confirmation-section');
+            
+            confirmationDiv.innerHTML = `
+                <div style="background: #f8d7da; padding: 15px; border-radius: 8px; margin-top: 15px;">
+                    <h4 style="color: #721c24; margin-bottom: 10px;">
+                        <i class="fas fa-exclamation-triangle"></i> User Removed Due to NameId Mismatch
+                    </h4>
+                    <p><strong>User:</strong> ${data.upn}</p>
+                    <p><strong>Removed From:</strong> ${data.current_site_url}</p>
+                    <p><strong>Current NameId:</strong> ${data.nameid_comparison.current_nameid || 'N/A'}</p>
+                    <p><strong>New NameId:</strong> ${data.nameid_comparison.new_nameid || 'N/A'}</p>
+                    <p><strong>Removal Time:</strong> ${data.removal_time}</p>
+                    <p style="margin-top: 10px; font-weight: bold;">
+                        The user should now be re-added to the site to get the correct NameId.
+                    </p>
+                </div>
             `;
             
             confirmationDiv.style.display = 'block';
@@ -1563,12 +1692,12 @@ def parse_site_users_json(json_content, target_upn):
         logger.exception("Failed to parse site users JSON")
         raise Exception(f"Failed to parse JSON response: {str(e)}")
 
-def get_retention_site_nameid(target_upn):
-    """Get NameId for user from retention site by ensuring user exists there"""
+def get_new_site_nameid(target_upn):
+    """Get NameId for user from new ID site by ensuring user exists there"""
     try:
-        retention_site_url = CONFIG['retention_site_url']
-        if not retention_site_url.endswith('/'):
-            retention_site_url += '/'
+        new_site_url = CONFIG['new_id_site_url']
+        if not new_site_url.endswith('/'):
+            new_site_url += '/'
         
         # Get SharePoint token
         sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
@@ -1576,17 +1705,17 @@ def get_retention_site_nameid(target_upn):
             sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
         
         if not sharepoint_token:
-            logger.error("Failed to obtain SharePoint access token for retention site")
+            logger.error("Failed to obtain SharePoint access token for new ID site")
             return None
         
         # Get request digest
-        request_digest = get_request_digest(retention_site_url, sharepoint_token)
+        request_digest = get_request_digest(new_site_url, sharepoint_token)
         if not request_digest:
-            logger.error("Failed to get request digest for retention site")
+            logger.error("Failed to get request digest for new ID site")
             return None
         
-        # Ensure user exists on retention site
-        ensure_url = f"{retention_site_url}_api/web/ensureuser"
+        # Ensure user exists on new ID site
+        ensure_url = f"{new_site_url}_api/web/ensureuser"
         headers = {
             "Authorization": f"Bearer {sharepoint_token}",
             "Accept": "application/json;odata=verbose",
@@ -1598,7 +1727,7 @@ def get_retention_site_nameid(target_upn):
             "logonName": target_upn
         }
         
-        logger.info(f"Ensuring user {target_upn} on retention site")
+        logger.info(f"Ensuring user {target_upn} on new ID site")
         response = requests.post(ensure_url, headers=headers, json=body)
         
         logger.info(f"Ensure user response status: {response.status_code}")
@@ -1613,20 +1742,20 @@ def get_retention_site_nameid(target_upn):
             user_id_obj = user_info.get('UserId')
             if user_id_obj and isinstance(user_id_obj, dict):
                 nameid = user_id_obj.get('NameId')
-                logger.info(f"Retrieved NameId from retention site: {nameid}")
+                logger.info(f"Retrieved NameId from new ID site: {nameid}")
                 return nameid
             else:
-                logger.warning("UserId object not found or invalid in retention site response")
+                logger.warning("UserId object not found or invalid in new ID site response")
                 # Try alternative extraction
                 if 'Id' in user_info:
                     logger.info(f"User ensured but no NameId found. User ID: {user_info.get('Id')}")
                 return None
         else:
-            logger.error(f"Failed to ensure user on retention site: {response.status_code} - {response.text}")
+            logger.error(f"Failed to ensure user on new ID site: {response.status_code} - {response.text}")
             return None
             
     except Exception as e:
-        logger.exception(f"Error getting NameId from retention site for user {target_upn}")
+        logger.exception(f"Error getting NameId from new ID site for user {target_upn}")
         return None
 
 def get_onedrive_url(onedrive_owner_upn):
@@ -2167,15 +2296,15 @@ def find_user():
         if not user_info:
             return jsonify({"error": f"User '{upn}' not found on the specified {site_type.lower()}. The user may not have explicit permissions or may be accessing the site through a group."}), 404
         
-        # Get NameId from retention site for comparison
-        logger.info(f"Getting NameId from retention site for {upn}")
-        retention_nameid = get_retention_site_nameid(upn)
+        # Get NameId from new ID site for comparison
+        logger.info(f"Getting NameId from new ID site for {upn}")
+        new_nameid = get_new_site_nameid(upn)
         
         # Prepare NameId comparison
         nameid_comparison = {
             'current_nameid': user_info.get('current_nameid'),
-            'retention_nameid': retention_nameid,
-            'match': user_info.get('current_nameid') == retention_nameid if user_info.get('current_nameid') and retention_nameid else False
+            'new_nameid': new_nameid,
+            'match': user_info.get('current_nameid') == new_nameid if user_info.get('current_nameid') and new_nameid else False
         }
         
         # Add additional info to response
@@ -2216,6 +2345,78 @@ def remove_user():
         
     except Exception as e:
         logger.exception("Error occurred during user removal")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/remove_user_mismatch', methods=['POST'])
+def remove_user_mismatch():
+    """Remove user from current site when NameId doesn't match new ID site"""
+    try:
+        data = request.json
+        upn = data.get('upn', '').strip()
+        current_site_url = data.get('current_site_url', '').strip()
+        
+        if not upn or not current_site_url:
+            return jsonify({"error": "User UPN and current site URL are required"}), 400
+        
+        # Ensure site URL ends properly
+        if not current_site_url.endswith('/'):
+            current_site_url += '/'
+        
+        logger.info(f"Processing mismatch removal for {upn} from {current_site_url}")
+        
+        # Get SharePoint token
+        sp_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
+        if not sp_token:
+            sp_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
+        
+        if not sp_token:
+            return jsonify({"error": "Failed to get SharePoint token"}), 500
+        
+        # Step 1: Find user on current site
+        user_info = find_user_on_site(upn, current_site_url)
+        if not user_info:
+            return jsonify({"error": f"User '{upn}' not found on current site"}), 404
+        
+        current_nameid = user_info.get('current_nameid')
+        user_id = user_info['user_id']
+        
+        # Step 2: Get new NameId from new ID site
+        new_nameid = get_new_site_nameid(upn)
+        
+        if not new_nameid:
+            return jsonify({"error": "Could not retrieve new NameId from reference site"}), 400
+        
+        # Step 3: Check if mismatch exists
+        nameid_match = current_nameid == new_nameid if current_nameid and new_nameid else False
+        
+        if nameid_match:
+            return jsonify({
+                "warning": "NameIds match - no removal needed",
+                "current_nameid": current_nameid,
+                "new_nameid": new_nameid,
+                "match": True
+            }), 200
+        
+        # Step 4: Remove user from current site (mismatch confirmed)
+        logger.info(f"NameId mismatch detected. Removing user {upn} from current site")
+        remove_user_from_site(user_id, current_site_url)
+        
+        return jsonify({
+            "success": True,
+            "message": "User successfully removed due to NameId mismatch",
+            "user_id": user_id,
+            "upn": upn,
+            "current_site_url": current_site_url,
+            "nameid_comparison": {
+                "current_nameid": current_nameid,
+                "new_nameid": new_nameid,
+                "match": False
+            },
+            "removal_time": time.strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
+    except Exception as e:
+        logger.exception("Error during mismatch removal")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/bulk_find_user', methods=['POST'])
