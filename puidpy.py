@@ -5,6 +5,8 @@ import uuid
 import base64
 import time
 import logging
+import argparse
+import sys
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -30,16 +32,19 @@ CONFIG = {
     }
 }
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('nameid_report.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging(mode):
+    """Setup logging based on mode"""
+    log_file = f"nameid_cleanup_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 def get_token_with_certificate(scope):
     """Get access token using certificate-based authentication"""
@@ -325,6 +330,47 @@ def get_user_by_login_name(site_url, token, target_upn):
         logger.exception("Error in direct user lookup")
         return None
 
+def remove_user_from_site(user_id, site_url):
+    """Remove a user from a SharePoint site/OneDrive"""
+    try:
+        # Ensure site URL ends properly
+        if not site_url.endswith('/'):
+            site_url += '/'
+        
+        # Construct SharePoint API URL for user removal
+        remove_user_url = f"{site_url}_api/web/siteusers/removebyid({user_id})"
+        logger.info(f"Remove user URL: {remove_user_url}")
+        
+        # Get SharePoint token
+        sharepoint_token = get_token_with_certificate(CONFIG['scopes']['sharepoint'])
+        if not sharepoint_token:
+            sharepoint_token = get_token_with_secret(CONFIG['scopes']['sharepoint'])
+        
+        if not sharepoint_token:
+            raise Exception("Failed to obtain SharePoint access token")
+        
+        # Call SharePoint API to remove user
+        sharepoint_headers = {
+            "Authorization": f"Bearer {sharepoint_token}",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose"
+        }
+        
+        logger.info("Calling SharePoint API to remove user")
+        remove_response = requests.post(remove_user_url, headers=sharepoint_headers)
+        
+        logger.info(f"Remove response: {remove_response.status_code} - {remove_response.text}")
+        
+        if remove_response.status_code not in [200, 204]:
+            raise Exception(f"Failed to remove user: {remove_response.text}")
+        
+        logger.info(f"Successfully removed user {user_id} from {site_url}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Failed to remove user {user_id} from site {site_url}")
+        raise
+
 def get_new_site_nameid(target_upn):
     """Get NameId for user from new ID site by ensuring user exists there"""
     try:
@@ -406,13 +452,14 @@ def get_request_digest(site_url, token):
         logger.exception("Error getting request digest")
         return None
 
-def process_onedrive_owner(target_upn, owner):
-    """Process a single OneDrive owner to check NameId mismatch (NO REMOVAL)"""
+def process_onedrive_owner(target_upn, owner, remove_mismatch=False):
+    """Process a single OneDrive owner to check NameId mismatch with optional removal"""
     result = {
         'onedrive_owner': owner,
         'found': False,
         'nameid_mismatch': False,
         'nameid_status': 'NOT_FOUND',
+        'removed': False,
         'error': None,
         'site_url': None,
         'user_id': None,
@@ -454,6 +501,15 @@ def process_onedrive_owner(target_upn, owner):
                     logger.info(f"🚨 NameId MISMATCH detected for {target_upn} on {owner}'s OneDrive")
                     logger.info(f"   Current NameId: {result['current_nameid']}")
                     logger.info(f"   New NameId:     {result['new_nameid']}")
+                    
+                    # Remove user if requested
+                    if remove_mismatch:
+                        logger.info(f"🔧 Removing user due to mismatch (remove_mismatch={remove_mismatch})")
+                        remove_user_from_site(result['user_id'], site_url)
+                        result['removed'] = True
+                        logger.info(f"✅ Successfully removed {target_upn} from {owner}'s OneDrive")
+                    else:
+                        logger.info(f"📊 Reporting only - user not removed (remove_mismatch={remove_mismatch})")
                 else:
                     logger.info(f"✅ NameId MATCH for {target_upn} on {owner}'s OneDrive")
             else:
@@ -486,7 +542,7 @@ def read_onedrive_owners_from_csv(csv_file_path):
         logger.exception(f"Error reading CSV file: {csv_file_path}")
         raise
 
-def generate_detailed_report(results, target_upn):
+def generate_detailed_report(results, target_upn, mode):
     """Generate a detailed report with statistics and recommendations"""
     
     # Calculate statistics
@@ -496,14 +552,19 @@ def generate_detailed_report(results, target_upn):
     match_count = len([r for r in results if r['nameid_status'] == 'MATCH'])
     incomplete_count = len([r for r in results if r['nameid_status'] == 'INCOMPLETE_DATA'])
     error_count = len([r for r in results if r['error']])
+    removed_count = len([r for r in results if r['removed']])
     
     # Generate report
     report = []
     report.append("=" * 80)
-    report.append("NAMEID MISMATCH REPORT - READ ONLY (NO USERS REMOVED)")
+    if mode == "report":
+        report.append("NAMEID MISMATCH REPORT - READ ONLY (NO USERS REMOVED)")
+    else:
+        report.append("NAMEID MISMATCH CLEANUP REPORT - USERS REMOVED")
     report.append("=" * 80)
     report.append(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report.append(f"Target User: {target_upn}")
+    report.append(f"Mode: {mode.upper()}")
     report.append("")
     report.append("SUMMARY STATISTICS:")
     report.append("-" * 40)
@@ -511,16 +572,24 @@ def generate_detailed_report(results, target_upn):
     report.append(f"User Found On: {found_count} OneDrives")
     report.append(f"NameId Matches: {match_count}")
     report.append(f"NameId Mismatches: {mismatch_count}")
+    if mode == "cleanup":
+        report.append(f"Users Removed: {removed_count}")
     report.append(f"Incomplete Data: {incomplete_count}")
     report.append(f"Errors: {error_count}")
     report.append("")
     
     if mismatch_count > 0:
-        report.append("🚨 RECOMMENDED ACTIONS:")
-        report.append("-" * 40)
-        report.append(f"Found {mismatch_count} OneDrive(s) with NameId mismatches that need attention.")
-        report.append("These users should be removed and re-added to fix PUID issues.")
-        report.append("")
+        if mode == "report":
+            report.append("🚨 RECOMMENDED ACTIONS:")
+            report.append("-" * 40)
+            report.append(f"Found {mismatch_count} OneDrive(s) with NameId mismatches that need attention.")
+            report.append("Run with '--mode cleanup' to automatically remove these users.")
+            report.append("")
+        else:
+            report.append("✅ ACTIONS TAKEN:")
+            report.append("-" * 40)
+            report.append(f"Successfully removed user from {removed_count} OneDrive(s) with NameId mismatches.")
+            report.append("")
     
     report.append("DETAILED RESULTS:")
     report.append("-" * 40)
@@ -534,11 +603,16 @@ def generate_detailed_report(results, target_upn):
     
     if mismatch_results:
         report.append("")
-        report.append("🚨 MISMATCHES (Require Action):")
+        if mode == "report":
+            report.append("🚨 MISMATCHES (Require Action):")
+        else:
+            report.append("✅ MISMATCHES (Removed):")
         for result in mismatch_results:
             report.append(f"  • {result['onedrive_owner']}")
             report.append(f"    Current NameId: {result['current_nameid']}")
             report.append(f"    New NameId:     {result['new_nameid']}")
+            if mode == "cleanup":
+                report.append(f"    Status:         {'REMOVED' if result['removed'] else 'NOT REMOVED'}")
             report.append(f"    Site URL:       {result['site_url']}")
     
     if match_results:
@@ -578,34 +652,59 @@ def generate_detailed_report(results, target_upn):
     
     return "\n".join(report)
 
+def confirm_cleanup(mismatch_count):
+    """Get confirmation before performing cleanup"""
+    print(f"\n🚨 WARNING: You are about to remove the user from {mismatch_count} OneDrive sites.")
+    print("This action cannot be undone!")
+    print("\nPlease confirm by typing 'YES' to continue or anything else to cancel:")
+    
+    confirmation = input().strip().upper()
+    return confirmation == 'YES'
+
 def main():
-    """Main function to generate NameId mismatch report (NO REMOVAL)"""
+    """Main function with both report and cleanup modes"""
     
-    # Configuration
-    TARGET_UPN = "user@geekbyteonline.onmicrosoft.com"  # Replace with target user UPN
-    CSV_FILE_PATH = "onedrive_owners.csv"  # Path to CSV file with OneDrive owners
-    MAX_WORKERS = 5  # Number of concurrent threads
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='NameId Mismatch Reporter and Cleanup Tool')
+    parser.add_argument('--target', '-t', required=True, help='Target user UPN (e.g., user@domain.com)')
+    parser.add_argument('--csv', '-c', required=True, help='Path to CSV file with OneDrive owners')
+    parser.add_argument('--mode', '-m', choices=['report', 'cleanup'], default='report',
+                       help='Operation mode: report (read-only) or cleanup (remove users)')
+    parser.add_argument('--workers', '-w', type=int, default=5, help='Number of concurrent workers')
     
-    logger.info(f"🚀 Starting NameId mismatch report generation for user: {TARGET_UPN}")
-    logger.info("📊 THIS IS A READ-ONLY REPORT - NO USERS WILL BE REMOVED")
+    args = parser.parse_args()
+    
+    # Setup logging
+    global logger
+    logger = setup_logging(args.mode)
+    
+    logger.info(f"🚀 Starting NameId mismatch tool in {args.mode} mode")
+    logger.info(f"Target User: {args.target}")
+    logger.info(f"CSV File: {args.csv}")
+    logger.info(f"Workers: {args.workers}")
+    
+    if args.mode == 'report':
+        logger.info("📊 REPORT MODE: No users will be removed")
+    else:
+        logger.info("🔧 CLEANUP MODE: Users will be removed from mismatched OneDrives")
     
     try:
         # Read OneDrive owners from CSV
-        onedrive_owners = read_onedrive_owners_from_csv(CSV_FILE_PATH)
+        onedrive_owners = read_onedrive_owners_from_csv(args.csv)
         
         if not onedrive_owners:
             logger.error("No OneDrive owners found in CSV file")
             return
         
+        # First, run in report mode to get mismatch count
+        logger.info(f"🔍 Scanning {len(onedrive_owners)} OneDrive sites...")
+        
         results = []
         
-        # Process OneDrives in parallel for better performance
-        logger.info(f"Processing {len(onedrive_owners)} OneDrive sites with {MAX_WORKERS} workers...")
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
             # Submit all tasks
             future_to_owner = {
-                executor.submit(process_onedrive_owner, TARGET_UPN, owner): owner 
+                executor.submit(process_onedrive_owner, args.target, owner, remove_mismatch=False): owner 
                 for owner in onedrive_owners
             }
             
@@ -619,14 +718,36 @@ def main():
                 completed += 1
                 logger.info(f"📈 Progress: {completed}/{total} ({completed/total*100:.1f}%) - {result['onedrive_owner']}: {result['nameid_status']}")
         
+        # Count mismatches
+        mismatch_count = len([r for r in results if r['nameid_mismatch']])
+        
+        # If in cleanup mode and mismatches found, get confirmation
+        if args.mode == 'cleanup' and mismatch_count > 0:
+            if not confirm_cleanup(mismatch_count):
+                logger.info("❌ Cleanup cancelled by user")
+                print("Operation cancelled.")
+                return
+            
+            # Re-process mismatched sites with removal
+            logger.info("🔄 Processing mismatches with removal...")
+            for result in results:
+                if result['nameid_mismatch'] and not result['removed']:
+                    try:
+                        remove_user_from_site(result['user_id'], result['site_url'])
+                        result['removed'] = True
+                        logger.info(f"✅ Removed {args.target} from {result['onedrive_owner']}'s OneDrive")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to remove user from {result['onedrive_owner']}: {str(e)}")
+                        result['error'] = f"Removal failed: {str(e)}"
+        
         # Generate and save reports
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         # 1. Save detailed CSV report
-        csv_output_file = f"nameid_report_{TARGET_UPN.split('@')[0]}_{timestamp}.csv"
+        csv_output_file = f"nameid_{args.mode}_{args.target.split('@')[0]}_{timestamp}.csv"
         with open(csv_output_file, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'onedrive_owner', 'found', 'nameid_status', 'nameid_mismatch', 
+                'onedrive_owner', 'found', 'nameid_status', 'nameid_mismatch', 'removed',
                 'current_nameid', 'new_nameid', 'user_email', 'user_login_name',
                 'is_site_admin', 'site_url', 'user_id', 'error', 'processed_at'
             ]
@@ -639,8 +760,8 @@ def main():
         logger.info(f"💾 Detailed CSV report saved to: {csv_output_file}")
         
         # 2. Generate and save summary report
-        summary_report = generate_detailed_report(results, TARGET_UPN)
-        summary_output_file = f"nameid_summary_{TARGET_UPN.split('@')[0]}_{timestamp}.txt"
+        summary_report = generate_detailed_report(results, args.target, args.mode)
+        summary_output_file = f"nameid_{args.mode}_summary_{args.target.split('@')[0]}_{timestamp}.txt"
         
         with open(summary_output_file, 'w', encoding='utf-8') as f:
             f.write(summary_report)
@@ -649,14 +770,15 @@ def main():
         
         # 3. Print summary to console
         print("\n" + "=" * 80)
-        print("REPORT GENERATION COMPLETE")
+        print(f"OPERATION COMPLETE - {args.mode.upper()} MODE")
         print("=" * 80)
         print(summary_report)
         
-        # 4. Save only mismatch results for easy action planning
-        mismatch_results = [r for r in results if r['nameid_mismatch']]
-        if mismatch_results:
-            mismatch_output_file = f"nameid_mismatches_only_{TARGET_UPN.split('@')[0]}_{timestamp}.csv"
+        # 4. Save action items if in report mode
+        if args.mode == 'report' and mismatch_count > 0:
+            mismatch_output_file = f"nameid_mismatches_{args.target.split('@')[0]}_{timestamp}.csv"
+            mismatch_results = [r for r in results if r['nameid_mismatch']]
+            
             with open(mismatch_output_file, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = ['onedrive_owner', 'current_nameid', 'new_nameid', 'site_url', 'user_id']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -672,10 +794,11 @@ def main():
                     })
             
             logger.info(f"🎯 Mismatch-only CSV saved to: {mismatch_output_file}")
-            logger.info(f"🔧 {len(mismatch_results)} OneDrive(s) require user removal and re-addition")
+            logger.info(f"🔧 Run with '--mode cleanup' to remove users from {mismatch_count} OneDrive(s)")
         
     except Exception as e:
-        logger.exception("Fatal error during report generation")
+        logger.exception("Fatal error during processing")
+        print(f"❌ Error: {str(e)}")
 
 if __name__ == "__main__":
     main()
