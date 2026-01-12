@@ -3,6 +3,7 @@ import json
 import uuid
 import base64
 import time
+import re
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -24,17 +25,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONFIG = {
-    "tenant_id": "0e439a1fb-9e6b-4e582e203607",
-    "tenant_name": "geekbyteonline.onmicrosoft.com",
-    "app_id": "73efa35d-618a977eb149",
-    "client_secret": "t",
-    "certificate_path": "certificate.pem",
-    "private_key_path": "private_key.pem",
-    "scopes": {
-        "graph": "https://graph.microsoft.com/.default",
-        "sharepoint": "https://ne.sharepoint.com/.default"
-    }
-}
+    "tenant_id": "0e439a1f-a497-462b82e203607",
+    "tenant_name": "geene.onmicrosoft.com",
+    "app_id": "73efa
 
 # Token cache
 TOKEN_CACHE = {
@@ -146,86 +139,69 @@ def get_cached_token(scope_type):
     
     return None
 
-def get_site_owner(site_url):
-    """Get site owner details from SharePoint site"""
+def get_group_owners(group_id):
+    """Get group owners using Microsoft Graph API"""
     try:
-        # Ensure site URL ends properly
-        if not site_url.endswith('/'):
-            site_url += '/'
+        graph_token = get_cached_token("graph")
+        if not graph_token:
+            raise Exception("Failed to obtain Graph access token")
         
-        # Construct SharePoint API URL for site owner
-        site_owner_url = f"{site_url}_api/site/owner"
+        # Graph API endpoint for group owners
+        graph_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/owners"
         
-        # Get SharePoint token
-        sharepoint_token = get_cached_token("sharepoint")
-        if not sharepoint_token:
-            raise Exception("Failed to obtain SharePoint access token")
-        
-        # Call SharePoint API to get site owner
-        sharepoint_headers = {
-            "Authorization": f"Bearer {sharepoint_token}",
-            "Accept": "application/xml"
+        headers = {
+            "Authorization": f"Bearer {graph_token}",
+            "Accept": "application/json"
         }
         
-        site_owner_response = requests.get(site_owner_url, headers=sharepoint_headers)
+        all_owners = []
+        next_link = graph_url
         
-        if site_owner_response.status_code != 200:
-            raise Exception(f"Failed to get site owner from {site_owner_url}: {site_owner_response.text}")
+        while next_link:
+            response = requests.get(next_link, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to get group owners: {response.text}")
+                return []
+            
+            data = response.json()
+            
+            # Extract owners from current page
+            for owner in data.get('value', []):
+                if owner.get('@odata.type') == '#microsoft.graph.user':
+                    all_owners.append({
+                        'id': owner.get('id'),
+                        'displayName': owner.get('displayName'),
+                        'mail': owner.get('mail'),
+                        'userPrincipalName': owner.get('userPrincipalName')
+                    })
+            
+            # Check for next page
+            next_link = data.get('@odata.nextLink')
         
-        # Parse XML response
-        owner_info = parse_site_owner_xml(site_owner_response.text)
-        return owner_info
+        return all_owners
         
     except Exception as e:
-        logger.exception(f"Failed to get site owner from {site_url}")
-        raise
+        logger.exception(f"Failed to get owners for group {group_id}")
+        return []
 
-def parse_site_owner_xml(xml_content):
-    """Parse SharePoint site owner XML and return owner details"""
+def extract_group_id_from_login_name(login_name):
+    """Extract group ID from SharePoint login name"""
     try:
-        # Parse XML
-        root = ET.fromstring(xml_content)
+        # Pattern for federated directory claim provider group IDs
+        # Example: "c:0o.c|federateddirectoryclaimprovider|52db6852-71aa-4407-a3eb-09fc2ffdb4c5"
+        pattern = r'c:0o\.c\|federateddirectoryclaimprovider\|([a-fA-F0-9\-]+)'
+        match = re.search(pattern, login_name)
         
-        # Register namespaces to handle default namespace
-        ns = {
-            'atom': 'http://www.w3.org/2005/Atom',
-            'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices',
-            'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'
-        }
+        if match:
+            return match.group(1)
         
-        # Find the content element
-        content = root.find('.//atom:content', ns)
-        if content is None:
-            raise Exception("No content found in owner XML response")
-        
-        # Find properties
-        properties = content.find('.//m:properties', ns)
-        if properties is None:
-            raise Exception("No properties found in owner XML response")
-        
-        # Extract owner details
-        user_id_elem = properties.find('.//d:Id', ns)
-        title_elem = properties.find('.//d:Title', ns)  
-        email_elem = properties.find('.//d:Email', ns)
-        login_name_elem = properties.find('.//d:LoginName', ns)
-        user_principal_name_elem = properties.find('.//d:UserPrincipalName', ns)
-        is_site_admin_elem = properties.find('.//d:IsSiteAdmin', ns)
-        
-        # Get values safely
-        owner_info = {
-            'user_id': user_id_elem.text if user_id_elem is not None else None,
-            'title': title_elem.text if title_elem is not None else None,
-            'email': email_elem.text if email_elem is not None else None,
-            'login_name': login_name_elem.text if login_name_elem is not None else None,
-            'user_principal_name': user_principal_name_elem.text if user_principal_name_elem is not None else None,
-            'is_site_admin': is_site_admin_elem.text == 'true' if is_site_admin_elem is not None else False
-        }
-        
-        return owner_info
+        # Try other patterns if needed
+        return None
         
     except Exception as e:
-        logger.exception("Failed to parse site owner XML")
-        raise Exception(f"Failed to parse owner XML response: {str(e)}")
+        logger.exception(f"Failed to extract group ID from {login_name}")
+        return None
 
 def parse_site_users_xml(xml_content):
     """Parse SharePoint site users XML and return all users with admin privileges"""
@@ -257,6 +233,7 @@ def parse_site_users_xml(xml_content):
                     login_name_elem = properties.find('.//d:LoginName', ns)
                     is_site_admin_elem = properties.find('.//d:IsSiteAdmin', ns)
                     user_principal_name_elem = properties.find('.//d:UserPrincipalName', ns)
+                    principal_type_elem = properties.find('.//d:PrincipalType', ns)
                     
                     # Get values safely
                     user_id = user_id_elem.text if user_id_elem is not None else None
@@ -265,6 +242,18 @@ def parse_site_users_xml(xml_content):
                     login_name = login_name_elem.text if login_name_elem is not None else None
                     is_site_admin = is_site_admin_elem.text == 'true' if is_site_admin_elem is not None else False
                     user_principal_name = user_principal_name_elem.text if user_principal_name_elem is not None else None
+                    principal_type = int(principal_type_elem.text) if principal_type_elem is not None and principal_type_elem.text else None
+                    
+                    # Check if this is a group
+                    is_group = (principal_type == 4 and is_site_admin)
+                    group_id = None
+                    group_owners = []
+                    
+                    if is_group and login_name:
+                        group_id = extract_group_id_from_login_name(login_name)
+                        if group_id:
+                            print(f"  Found group: {title} (ID: {group_id}), fetching owners...")
+                            group_owners = get_group_owners(group_id)
                     
                     users.append({
                         'user_id': user_id,
@@ -272,7 +261,11 @@ def parse_site_users_xml(xml_content):
                         'email': email,
                         'login_name': login_name,
                         'is_site_admin': is_site_admin,
-                        'user_principal_name': user_principal_name
+                        'user_principal_name': user_principal_name,
+                        'principal_type': principal_type,
+                        'is_group': is_group,
+                        'group_id': group_id,
+                        'group_owners': group_owners
                     })
         
         return users
@@ -316,7 +309,7 @@ def get_site_users(site_url):
         raise
 
 def get_all_admins(site_url):
-    """Get all site administrators for a SharePoint site"""
+    """Get all site administrators for a SharePoint site, expanding groups to get owners"""
     try:
         print(f"Getting admins for site: {site_url}")
         
@@ -341,7 +334,9 @@ def format_admins_for_csv(admins):
             'admin_emails': '',
             'admin_login_names': '',
             'admin_upns': '',
-            'admin_count': 0
+            'admin_count': 0,
+            'groups_with_owners': '',
+            'all_admins_expanded': ''
         }
     
     # Extract all admin details
@@ -349,36 +344,75 @@ def format_admins_for_csv(admins):
     admin_emails = []
     admin_login_names = []
     admin_upns = []
+    groups_with_owners = []
+    all_admins_expanded = []
     
     for admin in admins:
-        # Add name/display name
-        if admin.get('title'):
-            admin_names.append(str(admin['title']))
-        elif admin.get('user_principal_name'):
-            admin_names.append(str(admin['user_principal_name']))
-        elif admin.get('email'):
-            admin_names.append(str(admin['email']))
-        elif admin.get('login_name'):
-            admin_names.append(str(admin['login_name']))
-        
-        # Add email
-        if admin.get('email'):
-            admin_emails.append(str(admin['email']))
-        
-        # Add login name
-        if admin.get('login_name'):
-            admin_login_names.append(str(admin['login_name']))
-        
-        # Add user principal name
-        if admin.get('user_principal_name'):
-            admin_upns.append(str(admin['user_principal_name']))
+        # If it's a group with owners, format as "GroupName(Owner1, Owner2)"
+        if admin['is_group'] and admin.get('group_owners'):
+            group_name = admin['title'] or admin['login_name'] or "Unknown Group"
+            owner_emails = []
+            owner_names = []
+            
+            for owner in admin['group_owners']:
+                if owner.get('mail'):
+                    owner_emails.append(owner['mail'])
+                elif owner.get('userPrincipalName'):
+                    owner_emails.append(owner['userPrincipalName'])
+                
+                if owner.get('displayName'):
+                    owner_names.append(owner['displayName'])
+            
+            if owner_emails:
+                # Format: GroupName(owner1@email.com, owner2@email.com)
+                group_format = f"{group_name}({', '.join(owner_emails)})"
+                groups_with_owners.append(group_format)
+                all_admins_expanded.extend(owner_emails)
+                
+                # Also add to regular lists
+                admin_names.append(group_format)
+                admin_emails.append(', '.join(owner_emails))
+                admin_upns.append(', '.join(owner_emails))
+            else:
+                # No owners found, just show group
+                groups_with_owners.append(group_name)
+                all_admins_expanded.append(group_name)
+                admin_names.append(group_name)
+        else:
+            # Regular user
+            if admin.get('title'):
+                admin_names.append(str(admin['title']))
+            elif admin.get('user_principal_name'):
+                admin_names.append(str(admin['user_principal_name']))
+            elif admin.get('email'):
+                admin_names.append(str(admin['email']))
+            elif admin.get('login_name'):
+                admin_names.append(str(admin['login_name']))
+            
+            # Add email
+            if admin.get('email'):
+                admin_emails.append(str(admin['email']))
+                all_admins_expanded.append(str(admin['email']))
+            elif admin.get('user_principal_name'):
+                admin_emails.append(str(admin['user_principal_name']))
+                all_admins_expanded.append(str(admin['user_principal_name']))
+            
+            # Add login name
+            if admin.get('login_name'):
+                admin_login_names.append(str(admin['login_name']))
+            
+            # Add user principal name
+            if admin.get('user_principal_name'):
+                admin_upns.append(str(admin['user_principal_name']))
     
     return {
         'admin_names': ', '.join(admin_names),
         'admin_emails': ', '.join(admin_emails),
         'admin_login_names': ', '.join(admin_login_names),
         'admin_upns': ', '.join(admin_upns),
-        'admin_count': len(admins)
+        'admin_count': len(admins),
+        'groups_with_owners': ', '.join(groups_with_owners),
+        'all_admins_expanded': ', '.join(all_admins_expanded)
     }
 
 def read_sharepoint_urls_from_csv(file_path):
@@ -430,7 +464,12 @@ def update_csv_dynamically(results, filename):
             fieldnames = [
                 'site_url', 'status', 'error',
                 'admin_count',
-                'admin_names', 'admin_emails', 'admin_login_names', 'admin_upns'
+                'admin_names', 
+                'admin_emails', 
+                'admin_login_names', 
+                'admin_upns',
+                'groups_with_owners',  # Groups with owners in format: GroupName(owner1, owner2)
+                'all_admins_expanded'  # All admins expanded (users + group owners)
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
@@ -449,7 +488,9 @@ def update_csv_dynamically(results, filename):
                         'admin_names': formatted_admins['admin_names'],
                         'admin_emails': formatted_admins['admin_emails'],
                         'admin_login_names': formatted_admins['admin_login_names'],
-                        'admin_upns': formatted_admins['admin_upns']
+                        'admin_upns': formatted_admins['admin_upns'],
+                        'groups_with_owners': formatted_admins['groups_with_owners'],
+                        'all_admins_expanded': formatted_admins['all_admins_expanded']
                     })
                 else:
                     # Write error row
@@ -461,7 +502,9 @@ def update_csv_dynamically(results, filename):
                         'admin_names': '',
                         'admin_emails': '',
                         'admin_login_names': '',
-                        'admin_upns': ''
+                        'admin_upns': '',
+                        'groups_with_owners': '',
+                        'all_admins_expanded': ''
                     })
                 
                 # Flush to ensure data is written immediately
@@ -500,10 +543,19 @@ def process_sharepoint_sites(urls, output_csv):
             print(f"✓ Success: {url}")
             print(f"  Found {len(admins)} administrators")
             
-            if admins:
-                for admin in admins:
+            # Print detailed info about groups
+            for admin in admins:
+                if admin['is_group']:
+                    if admin.get('group_owners'):
+                        print(f"    - GROUP: {admin['title']}")
+                        for owner in admin['group_owners']:
+                            owner_email = owner.get('mail') or owner.get('userPrincipalName') or owner.get('displayName')
+                            print(f"        Owner: {owner_email}")
+                    else:
+                        print(f"    - GROUP: {admin['title']} (no owners found)")
+                else:
                     admin_info = admin.get('email') or admin.get('user_principal_name') or admin.get('login_name') or admin.get('title')
-                    print(f"    - {admin_info}")
+                    print(f"    - USER: {admin_info}")
             
         except Exception as e:
             print(f"✗ Failed: {url}: {str(e)}")
@@ -520,7 +572,7 @@ def process_sharepoint_sites(urls, output_csv):
         update_csv_dynamically([result], output_csv)
         
         # Add a small delay to avoid rate limiting
-        time.sleep(0.5)
+        time.sleep(1)  # Increased delay due to Graph API calls
     
     return results
 
@@ -529,7 +581,19 @@ def print_summary(results):
     total_sites = len(results)
     successful = sum(1 for r in results if r['status'] == 'success')
     failed = total_sites - successful
-    total_admins = sum(len(r['admins']) for r in results if r['status'] == 'success')
+    
+    total_admins = 0
+    total_groups = 0
+    groups_with_owners = 0
+    
+    for result in results:
+        if result['status'] == 'success':
+            for admin in result['admins']:
+                total_admins += 1
+                if admin['is_group']:
+                    total_groups += 1
+                    if admin.get('group_owners'):
+                        groups_with_owners += 1
     
     print("\n" + "="*60)
     print("PROCESSING SUMMARY")
@@ -538,6 +602,8 @@ def print_summary(results):
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
     print(f"Total administrators found: {total_admins}")
+    print(f"  - Groups as admins: {total_groups}")
+    print(f"  - Groups with owners resolved: {groups_with_owners}")
     print("="*60)
     
     if failed > 0:
@@ -550,7 +616,7 @@ def create_sample_input_file():
     """Create a sample input CSV file"""
     sample_data = [
         ["Site URL"],
-        ["https://geekbyteonline.sharepoint.com/sites/YourSiteName1"],
+        ["https://geekbyteonline.sharepoint.com/sites/New365"],
         ["https://geekbyteonline.sharepoint.com/sites/YourSiteName2"],
         ["https://geekbyteonline.sharepoint.com/sites/TeamSite"],
         ["https://geekbyteonline.sharepoint.com/sites/ProjectSite"]
@@ -591,7 +657,9 @@ def main():
         
         print(f"\nStarting processing of {len(urls)} SharePoint sites...")
         print(f"Results will be saved dynamically to: {output_csv}")
-        print("-" * 60)
+        print("=" * 60)
+        print("Note: Groups will be expanded to show owners in format: GroupName(owner1@email.com, owner2@email.com)")
+        print("=" * 60)
         
         # Process URLs with dynamic CSV updates
         results = process_sharepoint_sites(urls, output_csv)
@@ -609,6 +677,8 @@ def main():
         print("  - admin_emails: All admin emails (comma-separated)")
         print("  - admin_login_names: All admin login names (comma-separated)")
         print("  - admin_upns: All admin UPNs (comma-separated)")
+        print("  - groups_with_owners: Groups with owners in 'GroupName(owner1, owner2)' format")
+        print("  - all_admins_expanded: All admins expanded (users + group owners' emails)")
         
     except Exception as e:
         print(f"Script failed: {str(e)}")
