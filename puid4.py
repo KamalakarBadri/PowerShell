@@ -30,6 +30,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "repair_account": "edit@geekbyte.online",
     "new_id_site_url": "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
     "onedrive_host": "https://geekbyteonline-my.sharepoint.com",
+    "run_mode": "report_only",
     "report_root": "reports",
     "max_workers": 5,
     "sleep_after_remove_seconds": 2,
@@ -78,12 +79,20 @@ def setup_logger(log_file: Path) -> logging.Logger:
     return logger
 
 
+def normalize_run_mode(value: Optional[str]) -> str:
+    mode = (value or "report_only").strip().lower()
+    if mode not in {"report_only", "apply"}:
+        raise ValueError("run_mode must be either 'report_only' or 'apply'")
+    return mode
+
+
 @dataclass
 class RepairRecord:
     site_url: str
     site_created: str
     site_title: str
     site_id: str
+    run_mode: str = "report_only"
     owner_upn: str = ""
     current_user_id: Optional[str] = None
     current_nameid: Optional[str] = None
@@ -376,11 +385,12 @@ class Microsoft365RepairClient:
     def repair_onedrive_owner(self, site: Dict[str, Any], apply_changes: bool) -> RepairRecord:
         site_url = site["site_url"]
         record = RepairRecord(
-            owner_upn=site.get("owner_upn", ""),
             site_url=site_url,
             site_created=site["site_created"],
             site_title=site["site_title"],
             site_id=site["site_id"],
+            run_mode="apply" if apply_changes else "report_only",
+            owner_upn=site.get("owner_upn", ""),
         )
 
         try:
@@ -586,11 +596,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", help="Path to JSON config file.", default=None)
     parser.add_argument("--date", help="Report date in YYYY-MM-DD. Default is yesterday in UTC.", default=None)
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually remove and re-add owners for mismatched OneDrives. Without this flag the script only reports.",
-    )
     parser.add_argument("--max-workers", type=int, default=None, help="Parallel workers for processing sites.")
     return parser.parse_args()
 
@@ -598,6 +603,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
+    run_mode = normalize_run_mode(config.get("run_mode"))
+    apply_changes = run_mode == "apply"
 
     report_date = args.date or (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     start_utc = datetime.fromisoformat(f"{report_date}T00:00:00+00:00")
@@ -607,7 +614,7 @@ def main() -> int:
     logger = setup_logger(report_dir / "run.log")
 
     logger.info("Starting OneDrive PUID repair job for %s", report_date)
-    logger.info("Mode: %s", "apply" if args.apply else "report-only")
+    logger.info("Mode: %s", run_mode)
 
     client = Microsoft365RepairClient(config, logger)
 
@@ -618,6 +625,7 @@ def main() -> int:
             report_dir / "discovered_sites.csv",
             [
                 {
+                    "run_mode": run_mode,
                     "owner_upn": site["owner_upn"],
                     "site_url": site["site_url"],
                     "site_created": site["site_created"],
@@ -633,7 +641,7 @@ def main() -> int:
         records = process_sites(
             client,
             sites,
-            apply_changes=args.apply,
+            apply_changes=apply_changes,
             max_workers=args.max_workers or config.get("max_workers", 5),
         )
 
@@ -643,6 +651,7 @@ def main() -> int:
 
         puid_rows = [
             {
+                "run_mode": record.run_mode,
                 "owner_upn": record.owner_upn,
                 "owner_login_name": record.owner_login_name,
                 "owner_title": record.owner_title,
@@ -666,6 +675,7 @@ def main() -> int:
         logger.info("Completed processing %s site(s)", len(records))
 
         summary = summarize(records)
+        summary["run_mode"] = run_mode
         write_json(report_dir / "summary.json", summary)
         logger.info("Summary: %s", json.dumps(summary))
         logger.info("Reports written to %s", report_dir)
