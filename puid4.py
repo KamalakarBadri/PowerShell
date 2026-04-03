@@ -108,6 +108,9 @@ class RepairRecord:
     readded_user_id: Optional[str] = None
     verified_nameid: Optional[str] = None
     verified_match: Optional[bool] = None
+    repair_account_user_id: Optional[str] = None
+    repair_account_cleanup_status: Optional[str] = None
+    repair_account_cleanup_message: str = ""
     message: str = ""
 
 
@@ -166,8 +169,17 @@ class Microsoft365RepairClient:
             encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
             client_assertion = f"{jwt_unsigned}.{encoded_signature}"
 
+            token_url = f"https://login.microsoftonline.com/{self.config['tenant_id']}/oauth2/v2.0/token"
+            token_body = {
+                "client_id": self.config["app_id"],
+                "client_assertion": "<redacted>",
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "scope": scope,
+                "grant_type": "client_credentials",
+            }
+            self.log_request("POST", token_url, token_body, "auth-certificate")
             response = requests.post(
-                f"https://login.microsoftonline.com/{self.config['tenant_id']}/oauth2/v2.0/token",
+                token_url,
                 data={
                     "client_id": self.config["app_id"],
                     "client_assertion": client_assertion,
@@ -177,6 +189,7 @@ class Microsoft365RepairClient:
                 },
                 timeout=self.request_timeout,
             )
+            self.log_response(response, "auth-certificate")
             if response.status_code == 200:
                 return response.json()["access_token"]
             self.logger.warning("Certificate auth failed: %s", response.text)
@@ -187,8 +200,16 @@ class Microsoft365RepairClient:
 
     def get_token_with_secret(self, scope: str) -> Optional[str]:
         try:
+            token_url = f"https://login.microsoftonline.com/{self.config['tenant_id']}/oauth2/v2.0/token"
+            token_body = {
+                "client_id": self.config["app_id"],
+                "client_secret": "<redacted>",
+                "scope": scope,
+                "grant_type": "client_credentials",
+            }
+            self.log_request("POST", token_url, token_body, "auth-secret")
             response = requests.post(
-                f"https://login.microsoftonline.com/{self.config['tenant_id']}/oauth2/v2.0/token",
+                token_url,
                 data={
                     "client_id": self.config["app_id"],
                     "client_secret": self.config["client_secret"],
@@ -197,6 +218,7 @@ class Microsoft365RepairClient:
                 },
                 timeout=self.request_timeout,
             )
+            self.log_response(response, "auth-secret")
             if response.status_code == 200:
                 return response.json()["access_token"]
             self.logger.warning("Client secret auth failed: %s", response.text)
@@ -212,46 +234,74 @@ class Microsoft365RepairClient:
             headers["Content-Type"] = "application/json;odata=verbose"
         return headers
 
+    def log_request(self, method: str, url: str, payload: Optional[Any] = None, context: Optional[str] = None) -> None:
+        prefix = f"[{context}] " if context else ""
+        self.logger.info("%sHTTP %s %s", prefix, method.upper(), url)
+        if payload is not None:
+            try:
+                rendered = json.dumps(payload, ensure_ascii=True)
+            except TypeError:
+                rendered = str(payload)
+            self.logger.info("%sRequest Body: %s", prefix, rendered)
+
+    def log_response(self, response: requests.Response, context: Optional[str] = None) -> None:
+        prefix = f"[{context}] " if context else ""
+        self.logger.info("%sResponse Status: %s", prefix, response.status_code)
+
     def get_request_digest(self, site_url: str, token: str) -> str:
+        url = f"{site_url.rstrip('/')}/_api/contextinfo"
+        self.log_request("POST", url, context=site_url)
         response = requests.post(
-            f"{site_url.rstrip('/')}/_api/contextinfo",
+            url,
             headers=self.sp_headers(token),
             timeout=self.request_timeout,
         )
+        self.log_response(response, site_url)
         response.raise_for_status()
         return response.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
 
     def ensure_user(self, site_url: str, token: str, request_digest: str, user_upn: str) -> Dict[str, Any]:
+        url = f"{site_url.rstrip('/')}/_api/web/ensureuser"
+        body = {"logonName": user_upn}
+        self.log_request("POST", url, body, site_url)
         response = requests.post(
-            f"{site_url.rstrip('/')}/_api/web/ensureuser",
+            url,
             headers={**self.sp_headers(token), "X-RequestDigest": request_digest},
-            json={"logonName": user_upn},
+            json=body,
             timeout=self.request_timeout,
         )
+        self.log_response(response, site_url)
         response.raise_for_status()
         return response.json()["d"]
 
     def set_site_admin(self, site_url: str, token: str, request_digest: str, user_id: str, is_admin: bool) -> None:
+        url = f"{site_url.rstrip('/')}/_api/web/getuserbyid({user_id})"
+        body = {"__metadata": {"type": "SP.User"}, "IsSiteAdmin": is_admin}
+        self.log_request("POST", url, body, site_url)
         response = requests.post(
-            f"{site_url.rstrip('/')}/_api/web/getuserbyid({user_id})",
+            url,
             headers={
                 **self.sp_headers(token),
                 "X-RequestDigest": request_digest,
                 "X-HTTP-Method": "MERGE",
                 "IF-MATCH": "*",
             },
-            json={"__metadata": {"type": "SP.User"}, "IsSiteAdmin": is_admin},
+            json=body,
             timeout=self.request_timeout,
         )
+        self.log_response(response, site_url)
         if response.status_code not in (200, 204):
             raise RuntimeError(f"Failed to set site admin for user {user_id}: {response.text}")
 
     def remove_user_by_id(self, site_url: str, token: str, request_digest: str, user_id: str) -> None:
+        url = f"{site_url.rstrip('/')}/_api/web/siteusers/removebyid({user_id})"
+        self.log_request("POST", url, {"user_id": user_id}, site_url)
         response = requests.post(
-            f"{site_url.rstrip('/')}/_api/web/siteusers/removebyid({user_id})",
+            url,
             headers={**self.sp_headers(token), "X-RequestDigest": request_digest},
             timeout=self.request_timeout,
         )
+        self.log_response(response, site_url)
         if response.status_code not in (200, 204):
             raise RuntimeError(f"Failed to remove user {user_id}: {response.text}")
 
@@ -260,11 +310,14 @@ class Microsoft365RepairClient:
 
     def get_site_owner_info(self, site_url: str) -> Dict[str, Optional[str]]:
         token = self.get_token("sharepoint")
+        url = f"{site_url.rstrip('/')}/_api/site/owner"
+        self.log_request("GET", url, context=site_url)
         response = requests.get(
-            f"{site_url.rstrip('/')}/_api/site/owner",
+            url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json;odata=verbose"},
             timeout=self.request_timeout,
         )
+        self.log_response(response, site_url)
         response.raise_for_status()
 
         owner = response.json().get("d", {})
@@ -346,11 +399,13 @@ class Microsoft365RepairClient:
         url = "https://graph.microsoft.com/v1.0/sites?$select=id,name,webUrl,createdDateTime&$top=999"
 
         while url:
+            self.log_request("GET", url, context="graph-sites")
             response = requests.get(
                 url,
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=self.request_timeout,
             )
+            self.log_response(response, "graph-sites")
             response.raise_for_status()
             payload = response.json()
 
@@ -449,11 +504,15 @@ class Microsoft365RepairClient:
 
             repair_user = self.ensure_user(site_url, token, digest, self.config["repair_account"])
             repair_user_id = str(repair_user.get("Id"))
+            record.repair_account_user_id = repair_user_id
             self.set_site_admin(site_url, token, digest, repair_user_id, True)
             self.log_site_step(site_url, f"Repair account ensured and elevated: {self.config['repair_account']}")
 
             if not record.current_user_id:
                 raise RuntimeError("Owner user ID missing from _api/site/owner response.")
+
+            self.set_site_admin(site_url, token, digest, record.current_user_id, False)
+            self.log_site_step(site_url, f"Owner site collection admin set to false: {record.owner_upn}")
 
             self.remove_user_by_id(site_url, token, digest, record.current_user_id)
             self.log_site_step(site_url, f"Owner removed from OneDrive: {record.owner_upn}")
@@ -466,6 +525,20 @@ class Microsoft365RepairClient:
             if self.config.get("readded_user_site_admin", True):
                 self.set_site_admin(site_url, token, digest, record.readded_user_id, True)
                 self.log_site_step(site_url, f"Owner granted site admin after re-add: {record.owner_upn}")
+
+            try:
+                self.set_site_admin(site_url, token, digest, repair_user_id, False)
+                self.log_site_step(site_url, f"Repair account site collection admin set to false: {self.config['repair_account']}")
+                self.remove_user_by_id(site_url, token, digest, repair_user_id)
+                record.repair_account_cleanup_status = "removed"
+                self.log_site_step(site_url, f"Repair account removed from OneDrive: {self.config['repair_account']}")
+            except Exception as cleanup_exc:
+                record.repair_account_cleanup_status = "error"
+                record.repair_account_cleanup_message = str(cleanup_exc)
+                self.log_site_step(
+                    site_url,
+                    f"Repair account cleanup failed: {record.repair_account_cleanup_message}",
+                )
 
             verified_user = self.get_site_owner_info(site_url)
             record.verified_nameid = verified_user.get("current_nameid") if verified_user else None
@@ -666,6 +739,9 @@ def main() -> int:
                 "nameid_match": record.nameid_match,
                 "verified_nameid": record.verified_nameid,
                 "verified_match": record.verified_match,
+                "repair_account_user_id": record.repair_account_user_id,
+                "repair_account_cleanup_status": record.repair_account_cleanup_status,
+                "repair_account_cleanup_message": record.repair_account_cleanup_message,
                 "action_status": record.action_status,
             }
             for record in records
