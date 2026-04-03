@@ -80,13 +80,15 @@ def setup_logger(log_file: Path) -> logging.Logger:
 
 @dataclass
 class RepairRecord:
-    owner_upn: str
     site_url: str
     site_created: str
     site_title: str
     site_id: str
+    owner_upn: str = ""
     current_user_id: Optional[str] = None
     current_nameid: Optional[str] = None
+    owner_login_name: Optional[str] = None
+    owner_title: Optional[str] = None
     reference_nameid: Optional[str] = None
     reference_user_id: Optional[str] = None
     reference_cleanup_status: Optional[str] = None
@@ -244,6 +246,33 @@ class Microsoft365RepairClient:
         if response.status_code not in (200, 204):
             raise RuntimeError(f"Failed to remove user {user_id}: {response.text}")
 
+    def log_site_step(self, site_url: str, message: str) -> None:
+        self.logger.info("[%s] %s", site_url, message)
+
+    def get_site_owner_info(self, site_url: str) -> Dict[str, Optional[str]]:
+        token = self.get_token("sharepoint")
+        response = requests.get(
+            f"{site_url.rstrip('/')}/_api/site/owner",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json;odata=verbose"},
+            timeout=self.request_timeout,
+        )
+        response.raise_for_status()
+
+        owner = response.json().get("d", {})
+        owner_upn = owner.get("UserPrincipalName") or owner.get("Email")
+        owner_nameid = (owner.get("UserId") or {}).get("NameId")
+
+        return {
+            "user_id": str(owner.get("Id")) if owner.get("Id") is not None else None,
+            "owner_upn": owner_upn.lower() if owner_upn else None,
+            "current_nameid": owner_nameid,
+            "login_name": owner.get("LoginName"),
+            "title": owner.get("Title"),
+            "email": owner.get("Email"),
+            "user_principal_name": owner.get("UserPrincipalName"),
+            "is_site_admin": owner.get("IsSiteAdmin", False),
+        }
+
     def get_new_site_nameid(self, target_upn: str) -> Optional[str]:
         token = self.get_token("sharepoint")
         digest = self.get_request_digest(self.config["new_id_site_url"], token)
@@ -329,14 +358,9 @@ class Microsoft365RepairClient:
                 if not created or not (start_utc <= created < end_utc):
                     continue
 
-                owner = extract_owner_upn({}, site_url)
-                if not owner:
-                    self.logger.warning("Could not determine OneDrive owner for %s", site_url)
-                    continue
-
                 sites.append(
                     {
-                        "owner_upn": owner,
+                        "owner_upn": "",
                         "site_url": site_url.rstrip("/"),
                         "site_created": created.isoformat(),
                         "site_title": item.get("name") or "",
@@ -350,10 +374,9 @@ class Microsoft365RepairClient:
         return sorted(sites, key=lambda item: item["site_created"], reverse=True)
 
     def repair_onedrive_owner(self, site: Dict[str, Any], apply_changes: bool) -> RepairRecord:
-        owner_upn = site["owner_upn"]
         site_url = site["site_url"]
         record = RepairRecord(
-            owner_upn=owner_upn,
+            owner_upn=site.get("owner_upn", ""),
             site_url=site_url,
             site_created=site["site_created"],
             site_title=site["site_title"],
@@ -361,19 +384,35 @@ class Microsoft365RepairClient:
         )
 
         try:
-            current_user = self.find_user_on_site(owner_upn, site_url)
-            if not current_user:
+            self.log_site_step(site_url, "Starting processing")
+            owner_info = self.get_site_owner_info(site_url)
+            owner_upn = owner_info.get("owner_upn")
+            if not owner_upn:
                 record.action_status = "not_found"
-                record.message = "Owner account not found in OneDrive site users."
+                record.message = "Could not resolve owner UPN from _api/site/owner."
+                self.log_site_step(site_url, record.message)
                 return record
 
-            record.current_user_id = str(current_user.get("user_id"))
-            record.current_nameid = current_user.get("current_nameid")
+            record.owner_upn = owner_upn
+            record.current_user_id = owner_info.get("user_id")
+            record.current_nameid = owner_info.get("current_nameid")
+            record.owner_login_name = owner_info.get("login_name")
+            record.owner_title = owner_info.get("title")
+
+            self.log_site_step(site_url, f"Owner resolved: {record.owner_upn}")
+            self.log_site_step(site_url, f"Current NameId: {record.current_nameid or 'N/A'}")
+
             reference_result = self.get_reference_site_nameid_and_cleanup(owner_upn)
             record.reference_nameid = reference_result.get("nameid")
             record.reference_user_id = reference_result.get("reference_user_id")
             record.reference_cleanup_status = reference_result.get("cleanup_status")
             record.reference_cleanup_message = reference_result.get("cleanup_message") or ""
+            self.log_site_step(site_url, f"Reference NameId: {record.reference_nameid or 'N/A'}")
+            self.log_site_step(
+                site_url,
+                f"Reference cleanup: {record.reference_cleanup_status}"
+                + (f" ({record.reference_cleanup_message})" if record.reference_cleanup_message else ""),
+            )
             record.nameid_match = (
                 bool(record.current_nameid)
                 and bool(record.reference_nameid)
@@ -384,12 +423,15 @@ class Microsoft365RepairClient:
                 record.action = "none"
                 record.action_status = "already_match"
                 record.message = "Owner NameId already matches reference site."
+                self.log_site_step(site_url, "Status: ALREADY MATCHED")
                 return record
 
             record.action = "remove_readd"
+            self.log_site_step(site_url, "Mismatch detected")
             if not apply_changes:
                 record.action_status = "report_only"
                 record.message = "Mismatch found. Repair skipped because report-only mode is enabled."
+                self.log_site_step(site_url, "Status: REPORT ONLY")
                 return record
 
             token = self.get_token("sharepoint")
@@ -398,17 +440,24 @@ class Microsoft365RepairClient:
             repair_user = self.ensure_user(site_url, token, digest, self.config["repair_account"])
             repair_user_id = str(repair_user.get("Id"))
             self.set_site_admin(site_url, token, digest, repair_user_id, True)
+            self.log_site_step(site_url, f"Repair account ensured and elevated: {self.config['repair_account']}")
 
-            self.remove_user_by_id(site_url, token, digest, str(current_user["user_id"]))
+            if not record.current_user_id:
+                raise RuntimeError("Owner user ID missing from _api/site/owner response.")
+
+            self.remove_user_by_id(site_url, token, digest, record.current_user_id)
+            self.log_site_step(site_url, f"Owner removed from OneDrive: {record.owner_upn}")
             time.sleep(self.config.get("sleep_after_remove_seconds", 2))
 
             readded_user = self.ensure_user(site_url, token, digest, owner_upn)
             record.readded_user_id = str(readded_user.get("Id"))
+            self.log_site_step(site_url, f"Owner re-added to OneDrive: {record.owner_upn}")
 
             if self.config.get("readded_user_site_admin", True):
                 self.set_site_admin(site_url, token, digest, record.readded_user_id, True)
+                self.log_site_step(site_url, f"Owner granted site admin after re-add: {record.owner_upn}")
 
-            verified_user = self.find_user_on_site(owner_upn, site_url)
+            verified_user = self.get_site_owner_info(site_url)
             record.verified_nameid = verified_user.get("current_nameid") if verified_user else None
             record.verified_match = record.verified_nameid == record.reference_nameid if record.reference_nameid else False
             record.action_status = "resolved" if record.verified_match else "readd_complete_unverified"
@@ -417,11 +466,13 @@ class Microsoft365RepairClient:
                 if record.verified_match
                 else "User was re-added, but post-check did not confirm the expected NameId."
             )
+            self.log_site_step(site_url, f"Verified NameId: {record.verified_nameid or 'N/A'}")
+            self.log_site_step(site_url, f"Status: {record.action_status.upper()}")
             return record
         except Exception as exc:
             record.action_status = "error"
             record.message = str(exc)
-            self.logger.exception("Repair failed for %s", owner_upn)
+            self.logger.exception("[%s] Repair failed", site_url)
             return record
 
 
@@ -439,32 +490,6 @@ def parse_datetime(value: str) -> Optional[datetime]:
             return parsed.replace(tzinfo=timezone.utc)
         except ValueError:
             return None
-
-
-def extract_owner_upn(values: Dict[str, Any], site_url: str) -> Optional[str]:
-    owner_candidates = [values.get("SiteOwner"), values.get("OwnerOWSUSER")]
-    for candidate in owner_candidates:
-        if not candidate:
-            continue
-        if "|" in candidate:
-            candidate = candidate.split("|")[-1]
-        if ";" in candidate:
-            candidate = candidate.split(";")[0]
-        candidate = candidate.strip()
-        if "@" in candidate:
-            return candidate.lower()
-
-    try:
-        personal_segment = site_url.split("/personal/", 1)[1].strip("/")
-        if personal_segment:
-            parts = personal_segment.split("_")
-            if len(parts) >= 2:
-                user = parts[0]
-                domain = ".".join(parts[1:])
-                return f"{user}@{domain}".lower()
-    except Exception:
-        return None
-    return None
 
 
 def is_personal_site(site: Dict[str, Any], onedrive_host: str) -> bool:
@@ -619,6 +644,8 @@ def main() -> int:
         puid_rows = [
             {
                 "owner_upn": record.owner_upn,
+                "owner_login_name": record.owner_login_name,
+                "owner_title": record.owner_title,
                 "site_url": record.site_url,
                 "site_created": record.site_created,
                 "current_user_id": record.current_user_id,
@@ -635,6 +662,8 @@ def main() -> int:
             for record in records
         ]
         write_csv(report_dir / "puid_comparison.csv", puid_rows)
+
+        logger.info("Completed processing %s site(s)", len(records))
 
         summary = summarize(records)
         write_json(report_dir / "summary.json", summary)
