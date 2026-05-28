@@ -7,7 +7,6 @@ import csv
 from colorama import init, Fore, Style
 from dateutil.relativedelta import relativedelta
 from collections import OrderedDict
-import pandas as pd
 import glob
 import math
 import logging
@@ -43,16 +42,11 @@ CSV_REPORT_MODE = "RAW"
 SITES = [
     "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
     "https://geekbyteonline.sharepoint.com/sites/Geekbyteteam"
-    # "https://geekbyteonline.sharepoint.com/sites/Radiation-Imaging",
-    # "https://geekbyteonline.sharepoint.com/sites/geetkteam",
-    # "https://geekbyteonline.sharepoint.com/sites/New365Site5"
 ]
-
-SITE_NAMES = [site.split('/')[-1] for site in SITES]  # For CSV file naming
 
 # Constants
 MAX_RETRIES = 10
-RETRY_DELAY_SECONDS = 10 # Default wait time for rate limits
+RETRY_DELAY_SECONDS = 10
 MAX_SEARCH_STATUS_POLLS = 180
 
 class AuditLogCollector:
@@ -139,26 +133,22 @@ class AuditLogCollector:
         self.END_DATE = self.end_date.isoformat().replace('+00:00', 'Z')
 
         # Get month and year for file properties
-        self.REPORT_MONTH = self.start_date.strftime("%B")  # Full month name e.g. "May"
-        self.REPORT_YEAR = self.start_date.strftime("%Y")   # e.g. "2025"
+        self.REPORT_MONTH = self.start_date.strftime("%B")
+        self.REPORT_YEAR = self.start_date.strftime("%Y")
         
         self.log(f"Date range set to: {self.START_DATE} to {self.END_DATE}", Fore.CYAN)
         self.log(f"Report Month/Year: {self.REPORT_MONTH} {self.REPORT_YEAR}", Fore.CYAN)
     
     def log(self, message, color=Fore.WHITE, level=logging.INFO):
         """Log message to both console (with color) and log file"""
-        # Get local time with timezone
         local_time = datetime.now().astimezone()
         console_message = f"{color}[{local_time.strftime('%Y-%m-%d %H:%M:%S')}] {message}{Style.RESET_ALL}"
         print(console_message)
-        
-        # Log to file without color codes
         self.logger.log(level, message)
     
     def display_token_info(self):
         if self.access_token:
             if DEBUG_MODE:
-                # SECURITY WARNING: Only for debugging
                 self.log("=== SECURITY WARNING: FULL TOKEN DISPLAYED ===", Fore.RED)
                 self.log(f"FULL TOKEN: {self.access_token}", Fore.RED)
                 self.log("=== NEVER SHARE THIS TOKEN OR COMMIT TO VCS ===", Fore.RED)
@@ -202,7 +192,6 @@ class AuditLogCollector:
         retry_count = 0
         while retry_count < max_retries:
             try:
-                # Set default headers if not provided
                 if headers is None:
                     headers = {
                         "Authorization": f"Bearer {self.access_token}",
@@ -226,7 +215,6 @@ class AuditLogCollector:
                         retry_count += 1
                         time.sleep(RETRY_DELAY_SECONDS)
                         continue
-                    # Retry with new token
                     headers["Authorization"] = f"Bearer {self.access_token}"
                     response = requests.request(
                         method,
@@ -237,7 +225,6 @@ class AuditLogCollector:
                         data=data
                     )
                 
-                # Handle rate limiting (429) and server errors (5xx)
                 if response.status_code == 429 or response.status_code >= 500:
                     retry_after = int(response.headers.get('Retry-After', RETRY_DELAY_SECONDS))
                     self.log(f"Rate limited or server error (HTTP {response.status_code}), waiting {retry_after} seconds...", Fore.YELLOW)
@@ -262,7 +249,6 @@ class AuditLogCollector:
                 
             except requests.exceptions.RequestException as e:
                 self.log(f"Request failed: {str(e)} - retrying... (attempt {retry_count + 1}/{max_retries})", Fore.YELLOW)
-                
                 retry_count += 1
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
@@ -270,9 +256,8 @@ class AuditLogCollector:
         self.log(f"Max retries ({max_retries}) exceeded for this request", Fore.RED, logging.ERROR)
         return None
     
-
     def check_existing_search(self, site):
-        """Check if a search already exists with the same parameters (all operations)"""
+        """Check if a search already exists for the site with the same date range"""
         response = self.make_api_request(
             "GET",
             "https://graph.microsoft.com/beta/security/auditLog/queries"
@@ -283,7 +268,6 @@ class AuditLogCollector:
             
         searches = response.json().get('value', [])
         
-        # Check each search for matching criteria (without operation filter)
         for search in searches:
             if (search.get('filterStartDateTime') == self.START_DATE and
                 search.get('filterEndDateTime') == self.END_DATE and
@@ -295,19 +279,16 @@ class AuditLogCollector:
         return None
 
     def new_audit_search(self, site):
-        """Create a new audit log search for all operations"""
-        # First check if a matching search already exists
+        """Create a new audit log search for the site (all operations)"""
         existing_search_id = self.check_existing_search(site)
         if existing_search_id:
             return existing_search_id
         
-        # If no existing search found, create a new one (no operation filter)
         search_params = {
-            "displayName": f"Audit_{site.split('/')[-1]}_AllOps_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}",
+            "displayName": f"Audit_{site.split('/')[-1]}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}",
             "filterStartDateTime": self.START_DATE,
             "filterEndDateTime": self.END_DATE,
             "objectIdFilters": [f"{site}/*"]
-            # No operationFilters parameter - this collects all operations
         }
 
         response = self.make_api_request(
@@ -320,7 +301,7 @@ class AuditLogCollector:
             return None
             
         search_data = response.json()
-        self.log(f"Search created for {site} (all operations)", Fore.GREEN)
+        self.log(f"Search created for {site}", Fore.GREEN)
         return search_data.get("id")
 
     def verify_all_searches_created(self):
@@ -329,11 +310,9 @@ class AuditLogCollector:
         all_searches_created = True
         
         for site in SITES:
-            key = f"{site}_all"
-            if key not in self.existing_searches:
+            if site not in self.existing_searches:
                 self.log(f"Missing search for {site}", Fore.YELLOW)
                 all_searches_created = False
-                # Attempt to create the missing search
                 search_id = None
                 attempts = 0
                 while not search_id and attempts < MAX_RETRIES:
@@ -343,7 +322,7 @@ class AuditLogCollector:
                         attempts += 1
                 
                 if search_id:
-                    self.existing_searches[key] = {
+                    self.existing_searches[site] = {
                         "SearchId": search_id,
                         "CreatedTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                     }
@@ -395,7 +374,7 @@ class AuditLogCollector:
             if "@odata.nextLink" in data:
                 self.log(f"Retrieved {len(all_records)} records so far...", Fore.YELLOW)
                 url = data["@odata.nextLink"]
-                time.sleep(0.5)  # Small delay between pages
+                time.sleep(0.5)
             else:
                 url = None
 
@@ -409,10 +388,8 @@ class AuditLogCollector:
             except json.JSONDecodeError:
                 return OrderedDict()
         
-        # Remove all @odata.type fields
         audit_data = {k: v for k, v in audit_data.items() if not k.endswith('@odata.type')}
         
-        # Handle nested AppAccessContext
         app_access_context = OrderedDict()
         if "AppAccessContext" in audit_data and isinstance(audit_data["AppAccessContext"], dict):
             app_access_context = OrderedDict(
@@ -421,14 +398,11 @@ class AuditLogCollector:
             )
             del audit_data["AppAccessContext"]
         
-        # Create new ordered dictionary with AppAccessContext first
         formatted_data = OrderedDict()
         
-        # Add AppAccessContext first if it exists
         if app_access_context:
             formatted_data["AppAccessContext"] = app_access_context
         
-        # Standard field order for remaining fields
         standard_fields = [
             "CreationTime", "Id", "Operation", "OrganizationId", "RecordType",
             "UserKey", "UserType", "Version", "Workload", "ClientIP", "UserId",
@@ -440,12 +414,10 @@ class AuditLogCollector:
             "SourceFileExtension", "ApplicationDisplayName", "ObjectId"
         ]
         
-        # Add standard fields in order
         for field in standard_fields:
             if field in audit_data:
                 formatted_data[field] = audit_data[field]
         
-        # Add any remaining fields not in our standard list
         for field, value in audit_data.items():
             if field not in formatted_data:
                 formatted_data[field] = value
@@ -458,7 +430,7 @@ class AuditLogCollector:
         start_day = self.START_DATE.split('T')[0].replace('-', '')
         end_day = self.END_DATE.split('T')[0].replace('-', '')
         current_time = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
-        filename = os.path.join(self.output_dir, f"{site_name}_{start_day}_{end_day}_AllOperations_{current_time}.csv")
+        filename = os.path.join(self.output_dir, f"{site_name}_{start_day}_{end_day}_{current_time}.csv")
 
         try:
             mode = CSV_REPORT_MODE.strip().upper()
@@ -469,10 +441,7 @@ class AuditLogCollector:
                     writer.writeheader()
                     writer.writerow({"Message": "No records found"})
 
-                self.log(
-                    f"No records found for {site}. Created placeholder file {filename}",
-                    Fore.YELLOW
-                )
+                self.log(f"No records found for {site}. Created placeholder file {filename}", Fore.YELLOW)
                 return 0
 
             normalized_records = []
@@ -508,9 +477,7 @@ class AuditLogCollector:
             elif mode == "ALL_FIELDS":
                 fieldnames = all_audit_fields
             else:
-                raise ValueError(
-                    f"Invalid CSV_REPORT_MODE '{CSV_REPORT_MODE}'. Use RAW, REQUIRED_FIELDS, or ALL_FIELDS."
-                )
+                raise ValueError(f"Invalid CSV_REPORT_MODE '{CSV_REPORT_MODE}'. Use RAW, REQUIRED_FIELDS, or ALL_FIELDS.")
 
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -613,11 +580,7 @@ class AuditLogCollector:
             None
         )
         if not matching_drive:
-            self.log(
-                f"Library '{DOCUMENT_LIBRARY_NAME}' not found for {site_url}",
-                Fore.RED,
-                logging.ERROR
-            )
+            self.log(f"Library '{DOCUMENT_LIBRARY_NAME}' not found for {site_url}", Fore.RED, logging.ERROR)
             return None
 
         library_info = {
@@ -626,16 +589,13 @@ class AuditLogCollector:
             "drive_name": matching_drive["name"]
         }
         self.site_library_cache[site_url] = library_info
-        self.log(
-            f"Resolved {site_url} -> {DOCUMENT_LIBRARY_NAME} ({matching_drive['id']})",
-            Fore.CYAN
-        )
+        self.log(f"Resolved {site_url} -> {DOCUMENT_LIBRARY_NAME} ({matching_drive['id']})", Fore.CYAN)
         return library_info
 
     def upload_csv_files(self):
         """Upload generated CSV files to SharePoint"""
-        # Find all CSV files in the output directory (excluding summary)
-        csv_files = glob.glob(os.path.join(self.output_dir, "*_AllOperations_*.csv"))
+        csv_files = glob.glob(os.path.join(self.output_dir, "*.csv"))
+        csv_files = [f for f in csv_files if not os.path.basename(f).startswith("AuditSummary")]
         
         if not csv_files:
             self.log("No CSV files to upload", Fore.YELLOW)
@@ -644,11 +604,8 @@ class AuditLogCollector:
         self.log("Starting CSV file upload to SharePoint...", Fore.CYAN)
         
         for csv_file in csv_files:
-            # Extract site name from filename
             filename = os.path.basename(csv_file)
             site_name = filename.split('_')[0]
-            
-            # Find matching site URL
             site_url = next((site for site in SITES if site.endswith(f"/{site_name}")), None)
             
             if not site_url:
@@ -656,10 +613,7 @@ class AuditLogCollector:
                 continue
                 
             try:
-                self.log(
-                    f"Uploading {filename} to '{DOCUMENT_LIBRARY_NAME}' in {site_url}...",
-                    Fore.YELLOW
-                )
+                self.log(f"Uploading {filename} to '{DOCUMENT_LIBRARY_NAME}' in {site_url}...", Fore.YELLOW)
                 result = self.upload_file_to_sharepoint(csv_file, site_url)
                 
                 if result:
@@ -683,31 +637,13 @@ class AuditLogCollector:
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
         
-        # Simple upload for files < 4MB
-        if file_size <= 4194304:  # 4MB
-            result = self.simple_upload(
-                file_path,
-                library_info["site_id"],
-                library_info["drive_id"],
-                folder_path
-            )
+        if file_size <= 4194304:
+            result = self.simple_upload(file_path, library_info["site_id"], library_info["drive_id"], folder_path)
         else:
-            # Upload session for large files
-            result = self.upload_large_file(
-                file_path,
-                library_info["site_id"],
-                library_info["drive_id"],
-                folder_path
-            )
+            result = self.upload_large_file(file_path, library_info["site_id"], library_info["drive_id"], folder_path)
         
-        # Update file properties after upload if successful
         if result and 'id' in result:
-            self.update_file_properties(
-                library_info["site_id"],
-                library_info["drive_id"],
-                result['id'],
-                file_name
-            )
+            self.update_file_properties(library_info["site_id"], library_info["drive_id"], result['id'], file_name)
         return result
 
     def simple_upload(self, file_path, site_id, drive_id, folder_path):
@@ -722,7 +658,6 @@ class AuditLogCollector:
         with open(file_path, 'rb') as file:
             file_content = file.read()
         
-        # Use make_api_request with custom headers for binary upload
         response = self.make_api_request(
             "PUT",
             upload_url,
@@ -747,7 +682,6 @@ class AuditLogCollector:
         file_name = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
         
-        # 1. Create upload session
         if folder_path:
             create_session_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{folder_path}/{file_name}:/createUploadSession"
         else:
@@ -760,19 +694,13 @@ class AuditLogCollector:
             }
         }
         
-        # Create upload session using make_api_request
-        response = self.make_api_request(
-            "POST",
-            create_session_url,
-            json_data=session_body
-        )
+        response = self.make_api_request("POST", create_session_url, json_data=session_body)
         
         if not response:
             raise Exception("Failed to create upload session")
             
         upload_url = response.json()['uploadUrl']
         
-        # 2. Upload file in chunks
         chunk_size = CHUNK_SIZE
         total_chunks = math.ceil(file_size / chunk_size)
         
@@ -791,13 +719,7 @@ class AuditLogCollector:
                 file.seek(start)
                 chunk_data = file.read(chunk_size_actual)
                 
-                # Use make_api_request for each chunk
-                response = self.make_api_request(
-                    "PUT",
-                    upload_url,
-                    data=chunk_data,
-                    headers=headers
-                )
+                response = self.make_api_request("PUT", upload_url, data=chunk_data, headers=headers)
                 
                 if not response:
                     raise Exception(f"Upload failed at chunk {chunk_num+1}/{total_chunks}")
@@ -806,34 +728,25 @@ class AuditLogCollector:
                     raise Exception(f"Upload failed at chunk {chunk_num+1}/{total_chunks}: {response.text}")
                 
                 self.log(f"Uploaded chunk {chunk_num+1}/{total_chunks} ({end/file_size:.1%})", Fore.YELLOW)
-                
         
         return response.json()
 
     def update_file_properties(self, site_id, drive_id, file_item_id, file_name):
         """Update file properties (metadata) in SharePoint using make_api_request"""
-        # Get the list item associated with the file
         list_item_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{file_item_id}/listItem"
         fields_url = f"{list_item_url}/fields"
         
-        # Update only month and year metadata
         update_payload = {
             "Month": self.REPORT_MONTH,
             "Year": self.REPORT_YEAR
         }
         
-        # Make the PATCH request using make_api_request
-        update_response = self.make_api_request(
-            "PATCH",
-            fields_url,
-            json_data=update_payload
-        )
+        update_response = self.make_api_request("PATCH", fields_url, json_data=update_payload)
         
         if not update_response:
             self.log("\nFailed to update file properties", Fore.RED)
             return None
             
-        # Verify the update
         verify_response = self.make_api_request("GET", fields_url)
         if not verify_response:
             self.log("\nFailed to verify property updates", Fore.YELLOW)
@@ -883,36 +796,25 @@ class AuditLogCollector:
 
     def process_pending_searches(self):
         """Process all searches with verification step"""
-        # First verify and create any missing searches
         if not self.verify_all_searches_created():
             self.log("Cannot proceed with processing due to missing searches", Fore.RED)
             return
 
-        total_searches = len(SITES)  # Now only one search per site
-        processed_searches = 0
+        total_searches = len(SITES)
         terminal_success_statuses = {"succeeded", "completed", "partiallysucceeded", "noresults", "nodata"}
         terminal_failure_statuses = {"failed", "cancelled", "canceled", "timeout"}
 
-        # Then process all searches (existing and new)
         while len(self.completed_searches) < total_searches:
             self.log(f"Processing searches ({len(self.completed_searches)}/{total_searches} completed)...", Fore.YELLOW)
             
-            for key, search_data in self.existing_searches.items():
-                if key in self.completed_searches:
-                    processed_searches += 1
+            for site, search_data in self.existing_searches.items():
+                if site in self.completed_searches:
                     continue
                     
                 status = self.get_search_status(search_data["SearchId"])
-                self.search_poll_counts[key] = self.search_poll_counts.get(key, 0) + 1
+                self.search_poll_counts[site] = self.search_poll_counts.get(site, 0) + 1
 
                 if status in terminal_success_statuses:
-                    site_name = key.replace("_all", "")  # Extract site name from key
-                    site = next((s for s in SITES if s.endswith(f"/{site_name}")), None)
-                    
-                    if not site:
-                        self.log(f"Could not find site URL for key {key}", Fore.RED)
-                        continue
-                    
                     self.log(f"Retrieving records for {site}", Fore.CYAN)
                     records = self.get_audit_records(search_data["SearchId"])
                     
@@ -921,81 +823,65 @@ class AuditLogCollector:
                         self.log(f"No records returned for {site}. Marking search as completed.", Fore.YELLOW)
 
                     self.summary_data.append({
-                        "Site": site_name,
+                        "Site": site.split('/')[-1],
                         "RecordCount": record_count
                     })
                     
-                    self.completed_searches[key] = {
+                    self.completed_searches[site] = {
                         "CompletedTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                         "RecordCount": record_count
                     }
                     self.save_state("completed_searches.json", self.completed_searches)
-                    processed_searches += 1
                     
                 elif status in terminal_failure_statuses:
-                    self.completed_searches[key] = {
+                    self.completed_searches[site] = {
                         "CompletedTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                         "RecordCount": 0,
                         "Status": status
                     }
                     self.save_state("completed_searches.json", self.completed_searches)
-                    processed_searches += 1
-                elif self.search_poll_counts[key] >= MAX_SEARCH_STATUS_POLLS:
-                    self.log(
-                        f"Search {search_data['SearchId']} exceeded max polling attempts with status '{status or 'unknown'}'. Marking as timeout.",
-                        Fore.YELLOW
-                    )
-                    self.completed_searches[key] = {
+                elif self.search_poll_counts[site] >= MAX_SEARCH_STATUS_POLLS:
+                    self.log(f"Search {search_data['SearchId']} exceeded max polling attempts with status '{status or 'unknown'}'. Marking as timeout.", Fore.YELLOW)
+                    self.completed_searches[site] = {
                         "CompletedTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                         "RecordCount": 0,
                         "Status": "timeout"
                     }
                     self.save_state("completed_searches.json", self.completed_searches)
-                    processed_searches += 1
             
             if len(self.completed_searches) < total_searches:
-                time.sleep(RETRY_DELAY_SECONDS)  # Reduced wait time between checks
+                time.sleep(RETRY_DELAY_SECONDS)
 
-        self.log(f"Completed processing all {processed_searches} searches", Fore.GREEN)
+        self.log(f"Completed processing all {total_searches} searches", Fore.GREEN)
 
     def run(self):
         try:
-            # Record process start time
             self.process_start_time = datetime.now().astimezone()
             
             self.log("Starting audit log collection process...", Fore.CYAN)
             self.log(f"Date range: {self.START_DATE} to {self.END_DATE}", Fore.CYAN)
             self.log(f"Report Month/Year: {self.REPORT_MONTH} {self.REPORT_YEAR}", Fore.CYAN)
             
-            # Authentication
             self.log("Authenticating...", Fore.YELLOW)
             if not self.get_access_token():
                 self.log("Failed to authenticate, exiting...", Fore.RED)
                 return
             
-            # Load existing state
             self.existing_searches = self.load_state("search_ids.json")
             self.completed_searches = self.load_state("completed_searches.json")
             self.log(f"Loaded {len(self.existing_searches)} existing searches and {len(self.completed_searches)} completed searches", Fore.YELLOW)
             
-            # Process all searches
             self.process_pending_searches()
-            
-            # Generate summary
             self.generate_summary()
             
-            # Authentication for SharePoint upload
             self.log("Authenticating for SharePoint upload...", Fore.YELLOW)
             if not self.get_access_token():
                 self.log("Failed to authenticate, skipping upload...", Fore.RED)
             else:
-                # Upload CSV files to SharePoint
                 self.upload_csv_files()
             
-            # Archive search IDs
             if len(self.completed_searches) == len(SITES):
                 if self.archive_search_ids():
-                    # Only remove if archiving was successful
                     completed_file = os.path.join(self.output_dir, "completed_searches.json")
                     if os.path.exists(completed_file):
                         try:
@@ -1003,7 +889,6 @@ class AuditLogCollector:
                         except Exception as e:
                             self.log(f"Failed to remove completed_searches.json: {e}", Fore.YELLOW)
             
-            # Record process end time and update SharePoint list
             self.process_end_time = datetime.now().astimezone()
             self.log("All operations completed successfully!", Fore.GREEN)
 
