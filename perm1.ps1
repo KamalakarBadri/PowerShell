@@ -23,12 +23,29 @@ $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Ap
 $masterTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $masterCsvFile = "Master_PermissionsReport_$masterTimestamp.csv"
 
+# Function to escape CSV fields properly with newlines
+function Escape-CSVField {
+    param($Field)
+    
+    if ($Field -eq $null -or $Field -eq "") {
+        return ""
+    }
+    
+    $fieldStr = $Field.ToString()
+    
+    # Always wrap in double quotes and escape existing double quotes
+    # This ensures newlines are preserved inside the cell
+    $fieldStr = $fieldStr -replace '"', '""'
+    return '"' + $fieldStr + '"'
+}
+
 # Write CSV header initially
 $csvHeader = "SiteName,SiteUrl,LibraryName,ItemID,ItemType,Name,Location,Size,ReadUsers_WithLogin,EditUsers_WithLogin,FullControlUsers_WithLogin,SharingLinks,UniquePerms,LastModified,ProcessedAt`n"
 [System.IO.File]::WriteAllText($masterCsvFile, $csvHeader)
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
 Write-Host "DYNAMIC CSV REPORT - Updates in real-time as items are processed" -ForegroundColor Cyan
+Write-Host "Each user appears on a new line within the cell" -ForegroundColor Yellow
 Write-Host "Output File: $masterCsvFile" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Cyan
 
@@ -54,30 +71,30 @@ function Get-UserDetails {
     }
 }
 
-# Function to append a single row to CSV immediately
+# Function to append a single row to CSV immediately with proper escaping
 function Append-ToCSV {
     param($ReportEntry)
     
-    $row = @(
-        $ReportEntry.SiteName,
-        $ReportEntry.SiteUrl,
-        $ReportEntry.LibraryName,
-        $ReportEntry.ItemID,
-        $ReportEntry.ItemType,
-        $ReportEntry.Name,
-        $ReportEntry.Location,
-        $ReportEntry.Size,
-        $ReportEntry.ReadUsers_WithLogin,
-        $ReportEntry.EditUsers_WithLogin,
-        $ReportEntry.FullControlUsers_WithLogin,
-        $ReportEntry.SharingLinks,
-        $ReportEntry.UniquePerms,
-        $ReportEntry.LastModified,
-        (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-    ) -join ","
+    # Escape each field (newlines will be preserved inside quotes)
+    $fields = @(
+        (Escape-CSVField $ReportEntry.SiteName),
+        (Escape-CSVField $ReportEntry.SiteUrl),
+        (Escape-CSVField $ReportEntry.LibraryName),
+        (Escape-CSVField $ReportEntry.ItemID),
+        (Escape-CSVField $ReportEntry.ItemType),
+        (Escape-CSVField $ReportEntry.Name),
+        (Escape-CSVField $ReportEntry.Location),
+        (Escape-CSVField $ReportEntry.Size),
+        (Escape-CSVField $ReportEntry.ReadUsers_WithLogin),
+        (Escape-CSVField $ReportEntry.EditUsers_WithLogin),
+        (Escape-CSVField $ReportEntry.FullControlUsers_WithLogin),
+        (Escape-CSVField $ReportEntry.SharingLinks),
+        (Escape-CSVField $ReportEntry.UniquePerms),
+        (Escape-CSVField $ReportEntry.LastModified),
+        (Escape-CSVField (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+    )
     
-    # Escape quotes for CSV
-    $row = $row -replace '"', '""'
+    $row = $fields -join ","
     
     # Add the row to CSV file
     Add-Content -Path $masterCsvFile -Value $row -Encoding UTF8
@@ -261,7 +278,12 @@ foreach ($siteUrl in $SiteUrls) {
                             }
                         }
 
-                        # Create report entry
+                        # Create report entry with newlines instead of pipe separators
+                        $readUsersText = ($readUsers | Sort-Object -Unique) -join "`n"
+                        $editUsersText = ($editUsers | Sort-Object -Unique) -join "`n"
+                        $fullControlUsersText = ($fullControlUsers | Sort-Object -Unique) -join "`n"
+                        $sharingLinksText = if ($sharingLinks.Count -gt 0) { ($sharingLinks | Sort-Object -Unique) -join "`n" } else { "None" }
+                        
                         $reportEntry = [PSCustomObject]@{
                             SiteName = $siteUrl.Split("/")[-1]
                             SiteUrl = $siteUrl
@@ -271,10 +293,10 @@ foreach ($siteUrl in $SiteUrls) {
                             Name = $itemName
                             Location = $itemLocation
                             Size = if ($itemSize) { "$([math]::Round($itemSize/1KB, 2)) KB" } else { "" }
-                            ReadUsers_WithLogin = ($readUsers | Sort-Object -Unique) -join "; "
-                            EditUsers_WithLogin = ($editUsers | Sort-Object -Unique) -join "; "
-                            FullControlUsers_WithLogin = ($fullControlUsers | Sort-Object -Unique) -join "; "
-                            SharingLinks = if ($sharingLinks.Count -gt 0) { ($sharingLinks | Sort-Object -Unique) -join "; " } else { "None" }
+                            ReadUsers_WithLogin = $readUsersText
+                            EditUsers_WithLogin = $editUsersText
+                            FullControlUsers_WithLogin = $fullControlUsersText
+                            SharingLinks = $sharingLinksText
                             UniquePerms = if ($hasUniquePerms) { "Yes" } else { "No (inherited)" }
                             LastModified = if ($item.Modified) { $item.Modified } else { "" }
                         }
@@ -284,16 +306,23 @@ foreach ($siteUrl in $SiteUrls) {
                         $itemsWithPermissions++
                         
                         # Show real-time progress
-                        Write-Host "  ✅ [$($processedItems)] Added to CSV: $itemType - $itemName (Permissions: $hasUniquePerms)" -ForegroundColor Green
+                        $userCount = $readUsers.Count + $editUsers.Count + $fullControlUsers.Count
+                        if ($hasUniquePerms) {
+                            Write-Host "  ✅ [$($processedItems)] Added to CSV: $itemType - $itemName ($userCount users with unique permissions)" -ForegroundColor Green
+                        } else {
+                            Write-Host "  📝 [$($processedItems)] Added to CSV: $itemType - $itemName (inherited permissions)" -ForegroundColor DarkGray
+                        }
                         
-                        # Display current CSV file size every 10 items
-                        if ($itemsWithPermissions % 10 -eq 0) {
-                            $fileInfo = Get-Item $masterCsvFile
-                            Write-Host "  📊 CSV Status: $($itemsWithPermissions) rows written | File size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor Cyan
+                        # Display current CSV file size every 20 items
+                        if ($itemsWithPermissions % 20 -eq 0) {
+                            $fileInfo = Get-Item $masterCsvFile -ErrorAction SilentlyContinue
+                            if ($fileInfo) {
+                                Write-Host "  📊 CSV Status: $($itemsWithPermissions) rows written | File size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor Cyan
+                            }
                         }
 
                     } catch {
-                        Write-Host "Error processing item $($item.Id): $_" -ForegroundColor Red
+                        Write-Host "  ❌ Error processing item $($item.Id): $_" -ForegroundColor Red
                     }
                 }
             } catch {
@@ -306,7 +335,10 @@ foreach ($siteUrl in $SiteUrls) {
     Write-Host "`n📁 Site Summary for $($siteUrl.Split("/")[-1]):" -ForegroundColor Yellow
     Write-Host "   Processed: $processedItems items" -ForegroundColor White
     Write-Host "   Written to CSV: $itemsWithPermissions items" -ForegroundColor White
-    Write-Host "   CSV File Size: $([math]::Round((Get-Item $masterCsvFile).Length/1KB, 2)) KB" -ForegroundColor White
+    $fileInfo = Get-Item $masterCsvFile -ErrorAction SilentlyContinue
+    if ($fileInfo) {
+        Write-Host "   CSV File Size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor White
+    }
 
     Disconnect-PnPOnline
     Write-Host "Disconnected from $siteUrl" -ForegroundColor DarkGray
@@ -316,8 +348,13 @@ Write-Host "`n==================================================================
 Write-Host "✅ DYNAMIC CSV REPORT COMPLETED" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Green
 Write-Host "Final Report: $masterCsvFile" -ForegroundColor Green
-Write-Host "Total items written: $((Get-Content $masterCsvFile | Measure-Object -Line).Lines - 1)" -ForegroundColor White
-Write-Host "File size: $([math]::Round((Get-Item $masterCsvFile).Length/1KB, 2)) KB" -ForegroundColor White
+$finalFileInfo = Get-Item $masterCsvFile
+$totalRows = (Get-Content $masterCsvFile | Measure-Object -Line).Lines - 1
+Write-Host "Total items written: $totalRows" -ForegroundColor White
+Write-Host "File size: $([math]::Round($finalFileInfo.Length/1KB, 2)) KB" -ForegroundColor White
+Write-Host "====================================================================" -ForegroundColor Green
+Write-Host "NOTE: When opening in Excel, each user will appear on a new line within the same cell" -ForegroundColor Yellow
+Write-Host "      Enable 'Wrap Text' in Excel to see the line breaks properly" -ForegroundColor Yellow
 Write-Host "====================================================================" -ForegroundColor Green
 
 # Optional: Open the CSV file in Excel automatically
