@@ -161,22 +161,44 @@ foreach ($siteUrl in $SiteUrls) {
                             }
                         }
 
-                        # Process sharing links
-                        if ($permsInfo.permissionsInformation.links) {
+                        # Process sharing links - FIXED: Only add if actual sharing links exist
+                        if ($permsInfo.permissionsInformation.links -and $permsInfo.permissionsInformation.links.Count -gt 0) {
                             foreach ($link in $permsInfo.permissionsInformation.links) {
-                                $linkUrl = $link.linkDetails.Url
-                                $linkType = if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) { "Edit" } else { "Read" }
-                                $sharingLinks += "$linkUrl ($linkType access)"
+                                # Skip if it's a default "Read Access" link without proper sharing link properties
+                                $isValidSharingLink = $false
                                 
-                                if ($link.linkMembers) {
-                                    foreach ($member in $link.linkMembers) {
-                                        $memberUpn = $member.userPrincipalName ?? $member.email
-                                        $memberName = $member.displayName ?? $memberUpn
-                                        
-                                        if ($linkType -eq "Edit") {
-                                            $editUsers += "$memberName (via sharing link : $linkUrl)"
-                                        } else {
-                                            $readUsers += "$memberName (via sharing link : $linkUrl)"
+                                # Check if this is a real sharing link (has sharing link properties)
+                                if ($link.linkDetails -and $link.linkDetails.Url) {
+                                    # Check if it's an actual sharing link (contains 'guestinvite' or 'sharing' or has unique ID)
+                                    $linkUrl = $link.linkDetails.Url
+                                    if ($linkUrl -match "guestinvite|sharing|/SharedWith/|sharedlink") {
+                                        $isValidSharingLink = $true
+                                    }
+                                    # Also check if it has sharing token or link ID
+                                    elseif ($link.linkDetails.SharingToken -or $link.linkDetails.LinkId) {
+                                        $isValidSharingLink = $true
+                                    }
+                                    # If we have link members, it's definitely a valid sharing link
+                                    elseif ($link.linkMembers -and $link.linkMembers.Count -gt 0) {
+                                        $isValidSharingLink = $true
+                                    }
+                                }
+                                
+                                if ($isValidSharingLink) {
+                                    $linkUrl = $link.linkDetails.Url
+                                    $linkType = if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) { "Edit" } else { "Read" }
+                                    $sharingLinks += "$linkUrl ($linkType access)"
+                                    
+                                    if ($link.linkMembers) {
+                                        foreach ($member in $link.linkMembers) {
+                                            $memberUpn = $member.userPrincipalName ?? $member.email
+                                            $memberName = $member.displayName ?? $memberUpn
+                                            
+                                            if ($linkType -eq "Edit") {
+                                                $editUsers += "$memberName (via sharing link : $linkUrl)"
+                                            } else {
+                                                $readUsers += "$memberName (via sharing link : $linkUrl)"
+                                            }
                                         }
                                     }
                                 }
