@@ -23,39 +23,17 @@ $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Ap
 $masterTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $masterCsvFile = "SharePoint_Permissions_Report_$masterTimestamp.csv"
 
-# Simple function to escape CSV fields
-function Write-CSVRow {
-    param($Values)
-    
-    $escapedValues = @()
-    foreach ($value in $Values) {
-        if ($value -eq $null) { 
-            $escapedValues += ""
-            continue
-        }
-        
-        $strValue = $value.ToString()
-        
-        # If contains comma, newline, or double quote, wrap in quotes and escape quotes
-        if ($strValue -match '["\n\r,]') {
-            $strValue = $strValue -replace '"', '""'
-            $escapedValues += "`"$strValue`""
-        }
-        else {
-            $escapedValues += $strValue
-        }
-    }
-    
-    return $escapedValues -join ","
-}
+# Define headers
+$headers = "SiteName","SiteUrl","LibraryName","ItemID","ItemType","Name","Location","SizeKB","ReadUsers","EditUsers","FullControlUsers","SharingLinks","UniquePerms","LastModified","ProcessedAt"
 
-# Write header
-$headers = "SiteName,SiteUrl,LibraryName,ItemID,ItemType,Name,Location,SizeKB,ReadUsers,EditUsers,FullControlUsers,SharingLinks,UniquePerms,LastModified,ProcessedAt"
-[System.IO.File]::WriteAllText($masterCsvFile, $headers + "`n")
+# Write headers as first line
+$headerLine = $headers -join ","
+[System.IO.File]::WriteAllText($masterCsvFile, $headerLine + "`n")
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
 Write-Host "SHAREPOINT PERMISSIONS REPORT" -ForegroundColor Cyan
 Write-Host "Output File: $masterCsvFile" -ForegroundColor Green
+Write-Host "Headers: $headerLine" -ForegroundColor Yellow
 Write-Host "====================================================================" -ForegroundColor Cyan
 
 # Loop through each SharePoint site
@@ -85,6 +63,7 @@ foreach ($siteUrl in $SiteUrls) {
     }
 
     $itemsWritten = 0
+    $allItems = @()
 
     foreach ($list in $lists.value) {
         if ($list.BaseTemplate -ne 101) { 
@@ -124,7 +103,7 @@ foreach ($siteUrl in $SiteUrls) {
                             $itemType = "File"
                             $itemName = $item.File.Name
                             $itemLocation = $item.File.ServerRelativeUrl
-                            $itemSize = [math]::Round($item.File.Length/1KB, 2)
+                            $itemSize = $item.File.Length
                         } 
                         elseif ($item.FileSystemObjectType -eq 1 -and $item.Folder) {
                             $itemType = "Folder"
@@ -155,7 +134,7 @@ foreach ($siteUrl in $SiteUrls) {
                         $fullControlUsers = @()
                         $sharingLinks = @()
 
-                        # Get permissions
+                        # Get permissions info
                         try {
                             $permsInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get -ErrorAction Stop
                             
@@ -168,16 +147,12 @@ foreach ($siteUrl in $SiteUrls) {
                                         # User
                                         $userLogin = if ($principal.userPrincipalName) { $principal.userPrincipalName } else { $principal.email }
                                         $userName = if ($principal.name) { $principal.name } else { $userLogin }
-                                        $userText = "$userName [$userLogin]"
-                                        
-                                        if (-not $hasUniquePerms) {
-                                            $userText = "$userText [INHERITED]"
-                                        }
+                                        $userEntry = "$userName [$userLogin]"
                                         
                                         switch ($role) {
-                                            1 { $readUsers += $userText }
-                                            2 { $editUsers += $userText }
-                                            3 { $fullControlUsers += $userText }
+                                            1 { $readUsers += $userEntry }
+                                            2 { $editUsers += $userEntry }
+                                            3 { $fullControlUsers += $userEntry }
                                         }
                                     }
                                     elseif ($principal.principalType -in @(4,8)) {
@@ -190,29 +165,22 @@ foreach ($siteUrl in $SiteUrls) {
                                                 if ($member.PrincipalType -eq 1) {
                                                     $memberLogin = if ($member.UserPrincipalName) { $member.UserPrincipalName } else { $member.Email }
                                                     $memberName = if ($member.Title) { $member.Title } else { $memberLogin }
-                                                    $memberText = "$memberName [$memberLogin] (via $groupName)"
-                                                    
-                                                    if (-not $hasUniquePerms) {
-                                                        $memberText = "$memberText [INHERITED]"
-                                                    }
+                                                    $memberEntry = "$memberName [$memberLogin] (via $groupName)"
                                                     
                                                     switch ($role) {
-                                                        1 { $readUsers += $memberText }
-                                                        2 { $editUsers += $memberText }
-                                                        3 { $fullControlUsers += $memberText }
+                                                        1 { $readUsers += $memberEntry }
+                                                        2 { $editUsers += $memberEntry }
+                                                        3 { $fullControlUsers += $memberEntry }
                                                     }
                                                 }
                                             }
                                         }
                                         catch {
-                                            $groupText = "$groupName [GROUP MEMBERS NOT ACCESSIBLE]"
-                                            if (-not $hasUniquePerms) {
-                                                $groupText = "$groupText [INHERITED]"
-                                            }
+                                            $groupEntry = "$groupName [Group Members Not Accessible]"
                                             switch ($role) {
-                                                1 { $readUsers += $groupText }
-                                                2 { $editUsers += $groupText }
-                                                3 { $fullControlUsers += $groupText }
+                                                1 { $readUsers += $groupEntry }
+                                                2 { $editUsers += $groupEntry }
+                                                3 { $fullControlUsers += $groupEntry }
                                             }
                                         }
                                     }
@@ -224,13 +192,7 @@ foreach ($siteUrl in $SiteUrls) {
                                 foreach ($link in $permsInfo.permissionsInformation.links) {
                                     $linkUrl = $link.linkDetails.Url
                                     $linkType = if ($link.linkDetails.IsEditLink) { "Edit" } else { "Read" }
-                                    $linkText = "$linkUrl ($linkType access)"
-                                    
-                                    if ($link.linkDetails.ExpirationDate) {
-                                        $linkText = "$linkText - Expires: $($link.linkDetails.ExpirationDate)"
-                                    }
-                                    
-                                    $sharingLinks += $linkText
+                                    $sharingLinks += "$linkUrl ($linkType access)"
                                 }
                             }
                         }
@@ -238,45 +200,38 @@ foreach ($siteUrl in $SiteUrls) {
                             # No permissions found
                         }
 
-                        # Default values if no data
+                        # If no data, add default
                         if ($readUsers.Count -eq 0 -and $editUsers.Count -eq 0 -and $fullControlUsers.Count -eq 0) {
                             $readUsers = @("No permissions found")
                         }
                         
                         if ($sharingLinks.Count -eq 0) {
-                            $sharingLinks = @("No sharing links")
+                            $sharingLinks = @("None")
                         }
 
-                        # Join with semicolon and space (not newline) to avoid CSV complexity
-                        $readText = $readUsers -join "; "
-                        $editText = $editUsers -join "; "
-                        $fullText = $fullControlUsers -join "; "
-                        $linksText = $sharingLinks -join "; "
-
-                        # Prepare row data
-                        $rowValues = @(
-                            $siteUrl.Split("/")[-1],
-                            $siteUrl,
-                            $list.Title,
-                            $item.Id,
-                            $itemType,
-                            $itemName,
-                            $itemLocation,
-                            $itemSize,
-                            $readText,
-                            $editText,
-                            $fullText,
-                            $linksText,
-                            $(if ($hasUniquePerms) { "Yes" } else { "No (Inherited)" }),
-                            $(if ($item.Modified) { $item.Modified } else { "" }),
-                            (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                        )
-
-                        # Write to CSV
-                        $csvRow = Write-CSVRow -Values $rowValues
-                        Add-Content -Path $masterCsvFile -Value $csvRow -Encoding UTF8
+                        # Create custom object
+                        $reportObject = [PSCustomObject]@{
+                            SiteName = $siteUrl.Split("/")[-1]
+                            SiteUrl = $siteUrl
+                            LibraryName = $list.Title
+                            ItemID = $item.Id
+                            ItemType = $itemType
+                            Name = $itemName
+                            Location = $itemLocation
+                            SizeKB = if ($itemSize) { [math]::Round($itemSize/1KB, 2) } else { "" }
+                            ReadUsers = ($readUsers | Sort-Object -Unique) -join " | "
+                            EditUsers = ($editUsers | Sort-Object -Unique) -join " | "
+                            FullControlUsers = ($fullControlUsers | Sort-Object -Unique) -join " | "
+                            SharingLinks = ($sharingLinks | Sort-Object -Unique) -join " | "
+                            UniquePerms = if ($hasUniquePerms) { "Yes" } else { "No (Inherited)" }
+                            LastModified = if ($item.Modified) { $item.Modified } else { "" }
+                            ProcessedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        }
+                        
+                        # Add to collection
+                        $allItems += $reportObject
                         $itemsWritten++
-
+                        
                         Write-Host "      ✅ Added: $itemType - $itemName" -ForegroundColor Green
 
                     } catch {
@@ -288,9 +243,16 @@ foreach ($siteUrl in $SiteUrls) {
                 $nextPageUrl = $null
             }
         } while ($nextPageUrl)
+        
+        # Write items for this library to CSV
+        if ($allItems.Count -gt 0) {
+            $allItems | Export-Csv -Path $masterCsvFile -Append -NoTypeInformation -Encoding UTF8
+            Write-Host "  📊 Written $($allItems.Count) items from $($list.Title) to CSV" -ForegroundColor Cyan
+            $allItems = @() # Clear for next library
+        }
     }
 
-    Write-Host "`n📁 Site Summary: $($itemsWritten) items written to CSV" -ForegroundColor Yellow
+    Write-Host "`n📁 Site Summary: $itemsWritten total items written" -ForegroundColor Yellow
     Disconnect-PnPOnline
 }
 
@@ -299,13 +261,17 @@ Write-Host "✅ REPORT COMPLETED" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Green
 Write-Host "File: $masterCsvFile" -ForegroundColor Green
 
+# Verify the file has headers
+$firstLine = Get-Content $masterCsvFile -First 1
+Write-Host "First line (headers): $firstLine" -ForegroundColor Yellow
+
 $fileInfo = Get-Item $masterCsvFile
-$lines = Get-Content $masterCsvFile
-Write-Host "Total rows: $($lines.Count)" -ForegroundColor White
+$lineCount = (Get-Content $masterCsvFile).Count
+Write-Host "Total lines: $lineCount" -ForegroundColor White
 Write-Host "File size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor White
 Write-Host "====================================================================" -ForegroundColor Green
 
-# Show first few lines to verify
-Write-Host "`nFirst 3 lines of CSV for verification:" -ForegroundColor Yellow
-Get-Content $masterCsvFile -TotalCount 3 | ForEach-Object { Write-Host $_ -ForegroundColor Cyan }
+# Show sample of the report
+Write-Host "`nSample of the report (first 5 data rows):" -ForegroundColor Yellow
+Get-Content $masterCsvFile | Select-Object -First 6 | ForEach-Object { Write-Host $_ -ForegroundColor Cyan }
 Write-Host "====================================================================" -ForegroundColor Green
