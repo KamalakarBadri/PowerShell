@@ -45,7 +45,8 @@ $csvHeader = "SiteName,SiteUrl,LibraryName,ItemID,ItemType,Name,Location,Size,Re
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
 Write-Host "DYNAMIC CSV REPORT - Updates in real-time as items are processed" -ForegroundColor Cyan
-Write-Host "Each user appears on a new line within the cell" -ForegroundColor Yellow
+Write-Host "Processing ALL items (both inherited and unique permissions)" -ForegroundColor Yellow
+Write-Host "Including Sharing Links" -ForegroundColor Yellow
 Write-Host "Output File: $masterCsvFile" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Cyan
 
@@ -68,6 +69,200 @@ function Get-UserDetails {
             DisplayName = "Unknown"
             Email = ""
         }
+    }
+}
+
+# Function to get sharing links for an item
+function Get-SharingLinks {
+    param($ListId, $ItemId, $SiteUrl)
+    
+    $sharingLinks = @()
+    
+    try {
+        # Method 1: Try to get sharing information
+        $sharingUrl = "$SiteUrl/_api/web/lists(guid'$ListId')/items($ItemId)/GetSharingInformation"
+        $sharingInfo = Invoke-PnPSPRestMethod -Url $sharingUrl -Method Get -ErrorAction Stop
+        
+        if ($sharingInfo.HasSharingLinks -and $sharingInfo.SharingLinks) {
+            foreach ($link in $sharingInfo.SharingLinks) {
+                $linkInfo = "$($link.LinkUrl) [$($link.ShareType) access"
+                if ($link.ExpirationDate) {
+                    $linkInfo += " - Expires: $($link.ExpirationDate)"
+                }
+                if ($link.PasswordProtected) {
+                    $linkInfo += " - Password Protected"
+                }
+                $linkInfo += "]"
+                $sharingLinks += $linkInfo
+            }
+        }
+        
+        # Method 2: Try to get role assignments that might be sharing links
+        $roleAssignmentsUrl = "$SiteUrl/_api/web/lists(guid'$ListId')/items($ItemId)/roleassignments"
+        $roleAssignments = Invoke-PnPSPRestMethod -Url $roleAssignmentsUrl -Method Get -ErrorAction SilentlyContinue
+        
+        if ($roleAssignments -and $roleAssignments.value) {
+            foreach ($ra in $roleAssignments.value) {
+                if ($ra.Member.PrincipalType -eq 4 -and $ra.Member.Title -like "*SharingLink*") {
+                    $sharingLinks += "Sharing Link: $($ra.Member.Title)"
+                }
+            }
+        }
+    }
+    catch {
+        # No sharing links found or error
+    }
+    
+    return $sharingLinks
+}
+
+# Function to get permissions for an item (both direct and inherited)
+function Get-ItemPermissions {
+    param($ListId, $ItemId, $SiteUrl)
+    
+    $readUsers = @()
+    $editUsers = @()
+    $fullControlUsers = @()
+    
+    try {
+        # First, check if item has unique permissions
+        $uniquePermsCheck = Invoke-PnPSPRestMethod -Url "$SiteUrl/_api/web/lists(guid'$ListId')/items($ItemId)/HasUniqueRoleAssignments" -Method Get -ErrorAction Stop
+        $hasUniquePerms = $uniquePermsCheck.value
+        
+        if ($hasUniquePerms) {
+            # Get role assignments for this specific item
+            $roleAssignmentsUrl = "$SiteUrl/_api/web/lists(guid'$ListId')/items($ItemId)/roleassignments?`$expand=Member,RoleDefinitionBindings"
+            $roleAssignments = Invoke-PnPSPRestMethod -Url $roleAssignmentsUrl -Method Get -ErrorAction Stop
+            
+            foreach ($ra in $roleAssignments.value) {
+                $member = $ra.Member
+                $roleBindings = $ra.RoleDefinitionBindings
+                
+                # Determine permission level
+                $permissionLevel = ""
+                foreach ($role in $roleBindings) {
+                    if ($role.Name -eq "Read" -or $role.Name -eq "Restricted Read") {
+                        $permissionLevel = "Read"
+                    }
+                    elseif ($role.Name -eq "Contribute" -or $role.Name -eq "Edit") {
+                        $permissionLevel = "Edit"
+                    }
+                    elseif ($role.Name -eq "Full Control" -or $role.Name -eq "Owner") {
+                        $permissionLevel = "FullControl"
+                    }
+                }
+                
+                if ($member.PrincipalType -eq 1) {
+                    # User
+                    $userDetails = Get-UserDetails -UserId $member.Id -SiteUrl $SiteUrl
+                    $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)]"
+                    
+                    switch ($permissionLevel) {
+                        "Read" { $readUsers += $userEntry }
+                        "Edit" { $editUsers += $userEntry }
+                        "FullControl" { $fullControlUsers += $userEntry }
+                    }
+                }
+                elseif ($member.PrincipalType -eq 4 -or $member.PrincipalType -eq 8) {
+                    # SharePoint Group
+                    $groupName = $member.Title
+                    $groupMembersUrl = "$SiteUrl/_api/web/SiteGroups/GetById($($member.Id))/Users"
+                    try {
+                        $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
+                        foreach ($groupMember in $members.value) {
+                            $userDetails = Get-UserDetails -UserId $groupMember.Id -SiteUrl $SiteUrl
+                            $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)] (via $groupName)"
+                            
+                            switch ($permissionLevel) {
+                                "Read" { $readUsers += $userEntry }
+                                "Edit" { $editUsers += $userEntry }
+                                "FullControl" { $fullControlUsers += $userEntry }
+                            }
+                        }
+                    }
+                    catch {
+                        $groupEntry = "$groupName [Group - members not accessible]"
+                        switch ($permissionLevel) {
+                            "Read" { $readUsers += $groupEntry }
+                            "Edit" { $editUsers += $groupEntry }
+                            "FullControl" { $fullControlUsers += $groupEntry }
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            # Item inherits permissions - get from list/parent
+            $listRoleAssignmentsUrl = "$SiteUrl/_api/web/lists(guid'$ListId')/roleassignments?`$expand=Member,RoleDefinitionBindings"
+            $listRoleAssignments = Invoke-PnPSPRestMethod -Url $listRoleAssignmentsUrl -Method Get -ErrorAction Stop
+            
+            foreach ($ra in $listRoleAssignments.value) {
+                $member = $ra.Member
+                $roleBindings = $ra.RoleDefinitionBindings
+                
+                # Determine permission level
+                $permissionLevel = ""
+                foreach ($role in $roleBindings) {
+                    if ($role.Name -eq "Read" -or $role.Name -eq "Restricted Read") {
+                        $permissionLevel = "Read"
+                    }
+                    elseif ($role.Name -eq "Contribute" -or $role.Name -eq "Edit") {
+                        $permissionLevel = "Edit"
+                    }
+                    elseif ($role.Name -eq "Full Control" -or $role.Name -eq "Owner") {
+                        $permissionLevel = "FullControl"
+                    }
+                }
+                
+                if ($member.PrincipalType -eq 1) {
+                    # User
+                    $userDetails = Get-UserDetails -UserId $member.Id -SiteUrl $SiteUrl
+                    $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)] (inherited from library)"
+                    
+                    switch ($permissionLevel) {
+                        "Read" { $readUsers += $userEntry }
+                        "Edit" { $editUsers += $userEntry }
+                        "FullControl" { $fullControlUsers += $userEntry }
+                    }
+                }
+                elseif ($member.PrincipalType -eq 4 -or $member.PrincipalType -eq 8) {
+                    # SharePoint Group
+                    $groupName = $member.Title
+                    $groupMembersUrl = "$SiteUrl/_api/web/SiteGroups/GetById($($member.Id))/Users"
+                    try {
+                        $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
+                        foreach ($groupMember in $members.value) {
+                            $userDetails = Get-UserDetails -UserId $groupMember.Id -SiteUrl $SiteUrl
+                            $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)] (via $groupName - inherited from library)"
+                            
+                            switch ($permissionLevel) {
+                                "Read" { $readUsers += $userEntry }
+                                "Edit" { $editUsers += $userEntry }
+                                "FullControl" { $fullControlUsers += $userEntry }
+                            }
+                        }
+                    }
+                    catch {
+                        $groupEntry = "$groupName [Group - members not accessible] (inherited from library)"
+                        switch ($permissionLevel) {
+                            "Read" { $readUsers += $groupEntry }
+                            "Edit" { $editUsers += $groupEntry }
+                            "FullControl" { $fullControlUsers += $groupEntry }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "      Error getting permissions: $_" -ForegroundColor Red
+    }
+    
+    return @{
+        ReadUsers = $readUsers | Sort-Object -Unique
+        EditUsers = $editUsers | Sort-Object -Unique
+        FullControlUsers = $fullControlUsers | Sort-Object -Unique
+        HasUniquePerms = $hasUniquePerms
     }
 }
 
@@ -178,111 +373,21 @@ foreach ($siteUrl in $SiteUrls) {
                         } 
                         else {
                             $itemType = "ListItem"
-                            $itemName = $item.Title
+                            $itemName = if ($item.Title) { $item.Title } else { "Item_$($item.Id)" }
                             $itemLocation = $null
                         }
-
-                        # Check if item has unique permissions
-                        try {
-                            $uniquePerms = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments" -Method Get -ErrorAction Stop
-                            $hasUniquePerms = $uniquePerms.value
-                        }
-                        catch {
-                            $hasUniquePerms = $false
-                        }
-
-                        # Initialize permission collections
-                        $readUsers = @()
-                        $editUsers = @()
-                        $fullControlUsers = @()
-                        $sharingLinks = @()
-
-                        # Get permissions info
-                        if ($hasUniquePerms) {
-                            try {
-                                # Get role assignments for this item
-                                $roleAssignmentsUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/roleassignments?`$expand=Member,RoleDefinitionBindings"
-                                $roleAssignments = Invoke-PnPSPRestMethod -Url $roleAssignmentsUrl -Method Get -ErrorAction Stop
-                                
-                                foreach ($ra in $roleAssignments.value) {
-                                    $member = $ra.Member
-                                    $roleBindings = $ra.RoleDefinitionBindings
-                                    
-                                    $permissionLevel = ""
-                                    foreach ($role in $roleBindings) {
-                                        if ($role.Name -eq "Read" -or $role.Name -eq "Restricted Read") {
-                                            $permissionLevel = "Read"
-                                        }
-                                        elseif ($role.Name -eq "Contribute" -or $role.Name -eq "Edit") {
-                                            $permissionLevel = "Edit"
-                                        }
-                                        elseif ($role.Name -eq "Full Control" -or $role.Name -eq "Owner") {
-                                            $permissionLevel = "FullControl"
-                                        }
-                                    }
-                                    
-                                    if ($member.PrincipalType -eq 1) {
-                                        $userDetails = Get-UserDetails -UserId $member.Id -SiteUrl $siteUrl
-                                        $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)]"
-                                        
-                                        switch ($permissionLevel) {
-                                            "Read" { $readUsers += $userEntry }
-                                            "Edit" { $editUsers += $userEntry }
-                                            "FullControl" { $fullControlUsers += $userEntry }
-                                        }
-                                    }
-                                    elseif ($member.PrincipalType -eq 4 -or $member.PrincipalType -eq 8) {
-                                        $groupName = $member.Title
-                                        $groupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($member.Id))/Users"
-                                        try {
-                                            $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
-                                            foreach ($groupMember in $members.value) {
-                                                $userDetails = Get-UserDetails -UserId $groupMember.Id -SiteUrl $siteUrl
-                                                $userEntry = "$($userDetails.DisplayName) [$($userDetails.LoginName)] (via $groupName)"
-                                                
-                                                switch ($permissionLevel) {
-                                                    "Read" { $readUsers += $userEntry }
-                                                    "Edit" { $editUsers += $userEntry }
-                                                    "FullControl" { $fullControlUsers += $userEntry }
-                                                }
-                                            }
-                                        }
-                                        catch {
-                                            $groupEntry = "$groupName [Group - members not accessible]"
-                                            switch ($permissionLevel) {
-                                                "Read" { $readUsers += $groupEntry }
-                                                "Edit" { $editUsers += $groupEntry }
-                                                "FullControl" { $fullControlUsers += $groupEntry }
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                # Check for sharing links
-                                try {
-                                    $sharingUrl = "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation"
-                                    $sharingInfo = Invoke-PnPSPRestMethod -Url $sharingUrl -Method Get -ErrorAction Stop
-                                    
-                                    if ($sharingInfo.HasSharingLinks) {
-                                        foreach ($link in $sharingInfo.SharingLinks) {
-                                            $sharingLinks += "$($link.LinkUrl) ($($link.ShareType) access)"
-                                        }
-                                    }
-                                }
-                                catch {
-                                    # No sharing links
-                                }
-                            }
-                            catch {
-                                Write-Host "    Error getting role assignments: $_" -ForegroundColor Red
-                            }
-                        }
-
-                        # Create report entry with newlines instead of pipe separators
-                        $readUsersText = ($readUsers | Sort-Object -Unique) -join "`n"
-                        $editUsersText = ($editUsers | Sort-Object -Unique) -join "`n"
-                        $fullControlUsersText = ($fullControlUsers | Sort-Object -Unique) -join "`n"
-                        $sharingLinksText = if ($sharingLinks.Count -gt 0) { ($sharingLinks | Sort-Object -Unique) -join "`n" } else { "None" }
+                        
+                        # Get permissions for this item (handles both inherited and unique)
+                        $permissions = Get-ItemPermissions -ListId $list.Id -ItemId $item.Id -SiteUrl $siteUrl
+                        
+                        # Get sharing links for this item
+                        $sharingLinks = Get-SharingLinks -ListId $list.Id -ItemId $item.Id -SiteUrl $siteUrl
+                        $sharingLinksText = if ($sharingLinks.Count -gt 0) { $sharingLinks -join "`n" } else { "None" }
+                        
+                        # Create report entry with newlines
+                        $readUsersText = if ($permissions.ReadUsers.Count -gt 0) { $permissions.ReadUsers -join "`n" } else { "No direct read access" }
+                        $editUsersText = if ($permissions.EditUsers.Count -gt 0) { $permissions.EditUsers -join "`n" } else { "No direct edit access" }
+                        $fullControlUsersText = if ($permissions.FullControlUsers.Count -gt 0) { $permissions.FullControlUsers -join "`n" } else { "No full control access" }
                         
                         $reportEntry = [PSCustomObject]@{
                             SiteName = $siteUrl.Split("/")[-1]
@@ -297,7 +402,7 @@ foreach ($siteUrl in $SiteUrls) {
                             EditUsers_WithLogin = $editUsersText
                             FullControlUsers_WithLogin = $fullControlUsersText
                             SharingLinks = $sharingLinksText
-                            UniquePerms = if ($hasUniquePerms) { "Yes" } else { "No (inherited)" }
+                            UniquePerms = if ($permissions.HasUniquePerms) { "Yes" } else { "No (inherited from library)" }
                             LastModified = if ($item.Modified) { $item.Modified } else { "" }
                         }
                         
@@ -306,12 +411,11 @@ foreach ($siteUrl in $SiteUrls) {
                         $itemsWithPermissions++
                         
                         # Show real-time progress
-                        $userCount = $readUsers.Count + $editUsers.Count + $fullControlUsers.Count
-                        if ($hasUniquePerms) {
-                            Write-Host "  ✅ [$($processedItems)] Added to CSV: $itemType - $itemName ($userCount users with unique permissions)" -ForegroundColor Green
-                        } else {
-                            Write-Host "  📝 [$($processedItems)] Added to CSV: $itemType - $itemName (inherited permissions)" -ForegroundColor DarkGray
-                        }
+                        $totalUsers = $permissions.ReadUsers.Count + $permissions.EditUsers.Count + $permissions.FullControlUsers.Count
+                        $permType = if ($permissions.HasUniquePerms) { "UNIQUE" } else { "INHERITED" }
+                        $sharingCount = $sharingLinks.Count
+                        
+                        Write-Host "  📝 [$($processedItems)] $permType - $itemType : $itemName (Users: $totalUsers, Sharing Links: $sharingCount)" -ForegroundColor $(if ($permissions.HasUniquePerms) { "Green" } else { "DarkGray" })
                         
                         # Display current CSV file size every 20 items
                         if ($itemsWithPermissions % 20 -eq 0) {
@@ -333,8 +437,8 @@ foreach ($siteUrl in $SiteUrls) {
     }
 
     Write-Host "`n📁 Site Summary for $($siteUrl.Split("/")[-1]):" -ForegroundColor Yellow
-    Write-Host "   Processed: $processedItems items" -ForegroundColor White
-    Write-Host "   Written to CSV: $itemsWithPermissions items" -ForegroundColor White
+    Write-Host "   Total items processed: $processedItems" -ForegroundColor White
+    Write-Host "   Items written to CSV: $itemsWithPermissions" -ForegroundColor White
     $fileInfo = Get-Item $masterCsvFile -ErrorAction SilentlyContinue
     if ($fileInfo) {
         Write-Host "   CSV File Size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor White
@@ -353,8 +457,12 @@ $totalRows = (Get-Content $masterCsvFile | Measure-Object -Line).Lines - 1
 Write-Host "Total items written: $totalRows" -ForegroundColor White
 Write-Host "File size: $([math]::Round($finalFileInfo.Length/1KB, 2)) KB" -ForegroundColor White
 Write-Host "====================================================================" -ForegroundColor Green
-Write-Host "NOTE: When opening in Excel, each user will appear on a new line within the same cell" -ForegroundColor Yellow
-Write-Host "      Enable 'Wrap Text' in Excel to see the line breaks properly" -ForegroundColor Yellow
+Write-Host "✅ INCLUDED FOR EACH ITEM:" -ForegroundColor Yellow
+Write-Host "   • ALL items (both inherited and unique permissions)" -ForegroundColor White
+Write-Host "   • Sharing links with expiration and password details" -ForegroundColor White
+Write-Host "   • User login names with display names" -ForegroundColor White
+Write-Host "   • Group memberships expanded to individual users" -ForegroundColor White
+Write-Host "   • Each user on new line within cell (enable Wrap Text in Excel)" -ForegroundColor White
 Write-Host "====================================================================" -ForegroundColor Green
 
 # Optional: Open the CSV file in Excel automatically
