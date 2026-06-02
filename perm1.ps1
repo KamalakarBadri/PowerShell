@@ -123,38 +123,48 @@ foreach ($siteUrl in $SiteUrls) {
                                 $role = $principalElement.role
 
                                 if ($principal.principalType -eq 1) {
-                                    $principalUpn = $principal.userPrincipalName ?? $principal.email
-                                    $principalName = $principal.name ?? $principalUpn
+                                    # User - get both display name and login name
+                                    $principalLogin = $principal.userPrincipalName ?? $principal.email ?? $principal.loginName
+                                    $principalDisplayName = $principal.name ?? $principal.title ?? $principalLogin
+                                    
+                                    # Format as "Display Name (Login Name)"
+                                    $principalFormatted = "$principalDisplayName ($principalLogin)"
                                     
                                     switch ($role) {
-                                        1 { $readUsers += $principalName }
-                                        2 { $editUsers += $principalName }
-                                        3 { $fullControlUsers += $principalName }
+                                        1 { $readUsers += $principalFormatted }
+                                        2 { $editUsers += $principalFormatted }
+                                        3 { $fullControlUsers += $principalFormatted }
                                     }
                                 }
                                 elseif ($principal.principalType -in @(4,8)) {
+                                    # Group - get ALL members with their login names
                                     $groupName = $principal.name
                                     $groupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($principal.id))/Users"
                                     try {
                                         $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
                                         foreach ($member in $members.value) {
                                             if ($member.PrincipalType -eq 1) {
-                                                $memberUpn = $member.UserPrincipalName ?? $member.Email
-                                                $memberName = $member.Title ?? $memberUpn
+                                                $memberLogin = $member.UserPrincipalName ?? $member.Email ?? $member.LoginName
+                                                $memberDisplayName = $member.Title ?? $memberLogin
+                                                
+                                                # Format as "Display Name (Login Name) via GroupName"
+                                                $memberFormatted = "$memberDisplayName ($memberLogin) via $groupName"
                                                 
                                                 switch ($role) {
-                                                    1 { $readUsers += "$memberName (via $groupName)" }
-                                                    2 { $editUsers += "$memberName (via $groupName)" }
-                                                    3 { $fullControlUsers += "$memberName (via $groupName)" }
+                                                    1 { $readUsers += $memberFormatted }
+                                                    2 { $editUsers += $memberFormatted }
+                                                    3 { $fullControlUsers += $memberFormatted }
                                                 }
                                             }
                                         }
                                     }
                                     catch {
+                                        # If we can't get members, just add the group name
+                                        $groupFormatted = "$groupName [members not accessible]"
                                         switch ($role) {
-                                            1 { $readUsers += "$groupName [members not accessible]" }
-                                            2 { $editUsers += "$groupName [members not accessible]" }
-                                            3 { $fullControlUsers += "$groupName [members not accessible]" }
+                                            1 { $readUsers += $groupFormatted }
+                                            2 { $editUsers += $groupFormatted }
+                                            3 { $fullControlUsers += $groupFormatted }
                                         }
                                     }
                                 }
@@ -191,13 +201,16 @@ foreach ($siteUrl in $SiteUrls) {
                                     
                                     if ($link.linkMembers) {
                                         foreach ($member in $link.linkMembers) {
-                                            $memberUpn = $member.userPrincipalName ?? $member.email
-                                            $memberName = $member.displayName ?? $memberUpn
+                                            $memberLogin = $member.userPrincipalName ?? $member.email ?? $member.loginName
+                                            $memberDisplayName = $member.displayName ?? $member.name ?? $memberLogin
+                                            
+                                            # Format as "Display Name (Login Name) via sharing link"
+                                            $memberFormatted = "$memberDisplayName ($memberLogin) via sharing link: $linkUrl"
                                             
                                             if ($linkType -eq "Edit") {
-                                                $editUsers += "$memberName (via sharing link : $linkUrl)"
+                                                $editUsers += $memberFormatted
                                             } else {
-                                                $readUsers += "$memberName (via sharing link : $linkUrl)"
+                                                $readUsers += $memberFormatted
                                             }
                                         }
                                     }
