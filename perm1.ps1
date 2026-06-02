@@ -124,8 +124,14 @@ foreach ($siteUrl in $SiteUrls) {
 
                                 if ($principal.principalType -eq 1) {
                                     # User - get both display name and login name
-                                    $principalLogin = $principal.userPrincipalName ?? $principal.email ?? $principal.loginName
-                                    $principalDisplayName = $principal.name ?? $principal.title ?? $principalLogin
+                                    $principalLogin = $principal.userPrincipalName
+                                    if (-not $principalLogin) { $principalLogin = $principal.email }
+                                    if (-not $principalLogin) { $principalLogin = $principal.loginName }
+                                    if (-not $principalLogin) { $principalLogin = $principal.name }
+                                    
+                                    $principalDisplayName = $principal.title
+                                    if (-not $principalDisplayName) { $principalDisplayName = $principal.name }
+                                    if (-not $principalDisplayName) { $principalDisplayName = $principalLogin }
                                     
                                     # Format as "Display Name (Login Name)"
                                     $principalFormatted = "$principalDisplayName ($principalLogin)"
@@ -144,8 +150,14 @@ foreach ($siteUrl in $SiteUrls) {
                                         $members = Invoke-PnPSPRestMethod -Url $groupMembersUrl -Method Get -ErrorAction Stop
                                         foreach ($member in $members.value) {
                                             if ($member.PrincipalType -eq 1) {
-                                                $memberLogin = $member.UserPrincipalName ?? $member.Email ?? $member.LoginName
-                                                $memberDisplayName = $member.Title ?? $memberLogin
+                                                $memberLogin = $member.UserPrincipalName
+                                                if (-not $memberLogin) { $memberLogin = $member.Email }
+                                                if (-not $memberLogin) { $memberLogin = $member.LoginName }
+                                                if (-not $memberLogin) { $memberLogin = $member.Title }
+                                                
+                                                $memberDisplayName = $member.Title
+                                                if (-not $memberDisplayName) { $memberDisplayName = $member.LoginName }
+                                                if (-not $memberDisplayName) { $memberDisplayName = $memberLogin }
                                                 
                                                 # Format as "Display Name (Login Name) via GroupName"
                                                 $memberFormatted = "$memberDisplayName ($memberLogin) via $groupName"
@@ -171,24 +183,20 @@ foreach ($siteUrl in $SiteUrls) {
                             }
                         }
 
-                        # Process sharing links - FIXED: Only add if actual sharing links exist
+                        # Process sharing links
                         if ($permsInfo.permissionsInformation.links -and $permsInfo.permissionsInformation.links.Count -gt 0) {
                             foreach ($link in $permsInfo.permissionsInformation.links) {
                                 # Skip if it's a default "Read Access" link without proper sharing link properties
                                 $isValidSharingLink = $false
                                 
-                                # Check if this is a real sharing link (has sharing link properties)
                                 if ($link.linkDetails -and $link.linkDetails.Url) {
-                                    # Check if it's an actual sharing link (contains 'guestinvite' or 'sharing' or has unique ID)
                                     $linkUrl = $link.linkDetails.Url
                                     if ($linkUrl -match "guestinvite|sharing|/SharedWith/|sharedlink") {
                                         $isValidSharingLink = $true
                                     }
-                                    # Also check if it has sharing token or link ID
                                     elseif ($link.linkDetails.SharingToken -or $link.linkDetails.LinkId) {
                                         $isValidSharingLink = $true
                                     }
-                                    # If we have link members, it's definitely a valid sharing link
                                     elseif ($link.linkMembers -and $link.linkMembers.Count -gt 0) {
                                         $isValidSharingLink = $true
                                     }
@@ -201,11 +209,16 @@ foreach ($siteUrl in $SiteUrls) {
                                     
                                     if ($link.linkMembers) {
                                         foreach ($member in $link.linkMembers) {
-                                            $memberLogin = $member.userPrincipalName ?? $member.email ?? $member.loginName
-                                            $memberDisplayName = $member.displayName ?? $member.name ?? $memberLogin
+                                            $memberLogin = $member.userPrincipalName
+                                            if (-not $memberLogin) { $memberLogin = $member.email }
+                                            if (-not $memberLogin) { $memberLogin = $member.loginName }
+                                            
+                                            $memberDisplayName = $member.displayName
+                                            if (-not $memberDisplayName) { $memberDisplayName = $member.name }
+                                            if (-not $memberDisplayName) { $memberDisplayName = $memberLogin }
                                             
                                             # Format as "Display Name (Login Name) via sharing link"
-                                            $memberFormatted = "$memberDisplayName ($memberLogin) via sharing link: $linkUrl"
+                                            $memberFormatted = "$memberDisplayName ($memberLogin) via sharing link"
                                             
                                             if ($linkType -eq "Edit") {
                                                 $editUsers += $memberFormatted
@@ -236,12 +249,10 @@ foreach ($siteUrl in $SiteUrls) {
                             LastModified     = if ($item.Modified) { $item.Modified } else { "" }
                         }
                         
-                        # Write to CSV dynamically (append mode)
+                        # Write to CSV dynamically
                         if ($processedItems -eq 1 -and $itemsWithPermissions -eq 1) {
-                            # First item - create file with header
                             $reportEntry | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
                         } else {
-                            # Subsequent items - append to existing file
                             $reportEntry | Export-Csv -Path $csvFile -Append -NoTypeInformation -Encoding UTF8
                         }
                         
