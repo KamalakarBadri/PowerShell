@@ -19,15 +19,12 @@ $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Ap
     "Theme Gallery", "TaxonomyHiddenList", "User Information List", "Web Part Gallery", "wfpub", "wfsvc", 
     "Workflow History", "Workflow Tasks", "Pages")
 
-# Create timestamp and master CSV file
+# Create timestamp and CSV file
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$masterFile = "PermissionsReport_$timestamp.csv"
-
-# Write header to CSV
-"SiteName,LibraryName,ItemID,ItemType,Name,Location,Size,ReadUsers,EditUsers,FullControlUsers,SharingLinks,UniquePerms,LastModified" | Out-File -FilePath $masterFile -Encoding UTF8
+$csvFile = "PermissionsReport_$timestamp.csv"
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
-Write-Host "REPORT SAVED TO: $masterFile (updates in real-time)" -ForegroundColor Cyan
+Write-Host "REPORT SAVED TO: $csvFile (updates in real-time)" -ForegroundColor Cyan
 Write-Host "====================================================================" -ForegroundColor Cyan
 
 foreach ($siteUrl in $SiteUrls) {
@@ -177,18 +174,18 @@ foreach ($siteUrl in $SiteUrls) {
                                         $memberName = $member.displayName ?? $memberUpn
                                         
                                         if ($linkType -eq "Edit") {
-                                            $editUsers += "$memberName (via sharing link)"
+                                            $editUsers += "$memberName (via sharing link : $linkUrl)"
                                         } else {
-                                            $readUsers += "$memberName (via sharing link)"
+                                            $readUsers += "$memberName (via sharing link : $linkUrl)"
                                         }
                                     }
                                 }
                             }
                         }
 
-                        # Create CSV row and append immediately
+                        # Create report entry
                         $itemsWithPermissions++
-                        $csvRow = [PSCustomObject]@{
+                        $reportEntry = [PSCustomObject]@{
                             SiteName         = $siteUrl.Split("/")[-1]
                             LibraryName      = $list.Title
                             ItemID           = $item.Id
@@ -204,8 +201,14 @@ foreach ($siteUrl in $SiteUrls) {
                             LastModified     = if ($item.Modified) { $item.Modified } else { "" }
                         }
                         
-                        # Write to CSV immediately (append)
-                        $csvRow | Export-Csv -Path $masterFile -Append -NoTypeInformation -Encoding UTF8
+                        # Write to CSV dynamically (append mode)
+                        if ($processedItems -eq 1 -and $itemsWithPermissions -eq 1) {
+                            # First item - create file with header
+                            $reportEntry | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+                        } else {
+                            # Subsequent items - append to existing file
+                            $reportEntry | Export-Csv -Path $csvFile -Append -NoTypeInformation -Encoding UTF8
+                        }
                         
                         Write-Host "  Found permissions for $itemType: $itemName" -ForegroundColor Green
                     } 
@@ -224,11 +227,11 @@ foreach ($siteUrl in $SiteUrls) {
     Write-Host "`nSITE SUMMARY:" -ForegroundColor Cyan
     Write-Host "Total items processed: $processedItems" -ForegroundColor White
     Write-Host "Items with permissions recorded: $itemsWithPermissions" -ForegroundColor White
-    Write-Host "Report updated in: $masterFile" -ForegroundColor Green
+    Write-Host "Report updated in: $csvFile" -ForegroundColor Green
 
     Disconnect-PnPOnline
 }
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
-Write-Host "SCRIPT COMPLETED - Report saved to: $masterFile" -ForegroundColor Green
+Write-Host "SCRIPT COMPLETED - Report saved to: $csvFile" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Cyan
