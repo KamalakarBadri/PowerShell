@@ -1,4 +1,13 @@
+$TenantId = "0e439a1f-a497-462b-9e6b-4e582e203607"
+$ClientId = "73efa35d-6188-42d4-b258-838a977eb149"
+$ThumbPrint = "B799789F78628CAE56B4D0F380FD551EB754E0DB"
 
+# Array of site URLs to process
+$SiteUrls = @(
+    "https://geekbyteonline.sharepoint.com/sites/New365",
+    "https://geekbyteonline.sharepoint.com/sites/AnotherSite",
+    "https://geekbyteonline.sharepoint.com/sites/ThirdSite"
+)
 
 $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Apps in Testing", "Cache Profiles", 
     "Composed Looks", "Content and Structure Reports", "Content type publishing error log", "Converted Forms",
@@ -10,53 +19,42 @@ $ExcludedLists = @("Access Requests", "App Packages", "appdata", "appfiles", "Ap
     "Theme Gallery", "TaxonomyHiddenList", "User Information List", "Web Part Gallery", "wfpub", "wfsvc", 
     "Workflow History", "Workflow Tasks", "Pages")
 
-# Function to properly escape CSV fields
-function ConvertTo-CSVCell {
-    param([string]$Value)
-    
-    if ($Value -eq $null -or $Value -eq "") {
-        return ""
-    }
-    
-    # Check if value contains comma, double quote, or newline
-    if ($Value -match '[,"\n\r]') {
-        # Escape double quotes by doubling them
-        $Value = $Value -replace '"', '""'
-        # Wrap in double quotes
-        return "`"$Value`""
-    }
-    
-    return $Value
-}
-
 # Create a master CSV file with timestamp
 $masterTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $masterCsvFile = "SharePoint_Permissions_Report_$masterTimestamp.csv"
 
-# Write CSV headers
-$headers = @(
-    "SiteName",
-    "SiteUrl",
-    "LibraryName",
-    "ItemID",
-    "ItemType",
-    "Name",
-    "Location",
-    "SizeKB",
-    "ReadUsers_WithLogin",
-    "EditUsers_WithLogin",
-    "FullControlUsers_WithLogin",
-    "SharingLinks",
-    "UniquePerms",
-    "LastModified",
-    "ProcessedAt"
-)
+# Simple function to escape CSV fields
+function Write-CSVRow {
+    param($Values)
+    
+    $escapedValues = @()
+    foreach ($value in $Values) {
+        if ($value -eq $null) { 
+            $escapedValues += ""
+            continue
+        }
+        
+        $strValue = $value.ToString()
+        
+        # If contains comma, newline, or double quote, wrap in quotes and escape quotes
+        if ($strValue -match '["\n\r,]') {
+            $strValue = $strValue -replace '"', '""'
+            $escapedValues += "`"$strValue`""
+        }
+        else {
+            $escapedValues += $strValue
+        }
+    }
+    
+    return $escapedValues -join ","
+}
 
-$headerLine = ($headers | ForEach-Object { ConvertTo-CSVCell $_ }) -join ","
-[System.IO.File]::WriteAllText($masterCsvFile, $headerLine + "`n")
+# Write header
+$headers = "SiteName,SiteUrl,LibraryName,ItemID,ItemType,Name,Location,SizeKB,ReadUsers,EditUsers,FullControlUsers,SharingLinks,UniquePerms,LastModified,ProcessedAt"
+[System.IO.File]::WriteAllText($masterCsvFile, $headers + "`n")
 
 Write-Host "`n====================================================================" -ForegroundColor Cyan
-Write-Host "SHAREPOINT PERMISSIONS REPORT - Processing ALL items" -ForegroundColor Cyan
+Write-Host "SHAREPOINT PERMISSIONS REPORT" -ForegroundColor Cyan
 Write-Host "Output File: $masterCsvFile" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Cyan
 
@@ -86,16 +84,14 @@ foreach ($siteUrl in $SiteUrls) {
         continue
     }
 
-    $processedItems = 0
     $itemsWritten = 0
 
     foreach ($list in $lists.value) {
         if ($list.BaseTemplate -ne 101) { 
-            Write-Host "Skipping non-document library: $($list.Title) (BaseTemplate: $($list.BaseTemplate))" -ForegroundColor Gray
+            Write-Host "Skipping non-document library: $($list.Title)" -ForegroundColor Gray
             continue 
         }
 
-        # Check if the list is in the exclusion list
         if ($ExcludedLists -contains $list.Title) {
             Write-Host "Skipping excluded list: $($list.Title)" -ForegroundColor Gray
             continue
@@ -117,81 +113,75 @@ foreach ($siteUrl in $SiteUrls) {
                 Write-Host "  Found $($listItems.Count) items on this page" -ForegroundColor DarkGray
 
                 foreach ($item in $listItems) {
-                    $processedItems++
-                    
                     try {
-                        # Get item details and determine type
-                        $fileSystemObjectType = $item.FileSystemObjectType
-                        $itemName = $null
-                        $itemLocation = $null
-                        $itemSize = $null
+                        # Get item details
+                        $itemName = ""
+                        $itemLocation = ""
+                        $itemSize = ""
+                        $itemType = ""
                         
-                        if ($fileSystemObjectType -eq 0 -and $item.File) {
+                        if ($item.FileSystemObjectType -eq 0 -and $item.File) {
                             $itemType = "File"
                             $itemName = $item.File.Name
                             $itemLocation = $item.File.ServerRelativeUrl
-                            $itemSize = $item.File.Length
-                            Write-Host "    Processing file: $itemName" -ForegroundColor DarkGray
+                            $itemSize = [math]::Round($item.File.Length/1KB, 2)
                         } 
-                        elseif ($fileSystemObjectType -eq 1 -and $item.Folder) {
+                        elseif ($item.FileSystemObjectType -eq 1 -and $item.Folder) {
                             $itemType = "Folder"
                             $itemName = $item.Folder.Name
                             $itemLocation = $item.Folder.ServerRelativeUrl
-                            Write-Host "    Processing folder: $itemName" -ForegroundColor DarkGray
+                            $itemSize = ""
                         } 
                         else {
                             $itemType = "ListItem"
                             $itemName = if ($item.Title) { $item.Title } else { "Item_$($item.Id)" }
-                            $itemLocation = $null
-                            Write-Host "    Processing list item: $itemName" -ForegroundColor DarkGray
+                            $itemLocation = ""
+                            $itemSize = ""
                         }
 
-                        # Check if item has unique permissions
+                        # Check unique permissions
+                        $hasUniquePerms = $false
                         try {
                             $uniquePerms = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/HasUniqueRoleAssignments" -Method Get -ErrorAction Stop
                             $hasUniquePerms = $uniquePerms.value
                         }
                         catch {
-                            Write-Host "    Error checking unique permissions for item $($item.Id): $_" -ForegroundColor Red
                             $hasUniquePerms = $false
                         }
 
-                        # Initialize permission collections
+                        # Initialize arrays
                         $readUsers = @()
                         $editUsers = @()
                         $fullControlUsers = @()
                         $sharingLinks = @()
 
-                        # Get permissions info
+                        # Get permissions
                         try {
                             $permsInfo = Invoke-PnPSPRestMethod -Url "$siteUrl/_api/web/lists(guid'$($list.Id)')/items($($item.Id))/GetSharingInformation?`$expand=permissionsInformation" -Method Get -ErrorAction Stop
                             
-                            # Process direct permissions and group memberships
                             if ($permsInfo.permissionsInformation.principals) {
                                 foreach ($principalElement in $permsInfo.permissionsInformation.principals) {
                                     $principal = $principalElement.principal
                                     $role = $principalElement.role
 
                                     if ($principal.principalType -eq 1) {
-                                        # User - get login name
+                                        # User
                                         $userLogin = if ($principal.userPrincipalName) { $principal.userPrincipalName } else { $principal.email }
                                         $userName = if ($principal.name) { $principal.name } else { $userLogin }
-                                        $userEntry = "$userName [$userLogin]"
+                                        $userText = "$userName [$userLogin]"
                                         
-                                        if ($hasUniquePerms) {
-                                            $userEntry += " (UNIQUE)"
-                                        } else {
-                                            $userEntry += " (INHERITED)"
+                                        if (-not $hasUniquePerms) {
+                                            $userText = "$userText [INHERITED]"
                                         }
                                         
                                         switch ($role) {
-                                            1 { $readUsers += $userEntry }
-                                            2 { $editUsers += $userEntry }
-                                            3 { $fullControlUsers += $userEntry }
+                                            1 { $readUsers += $userText }
+                                            2 { $editUsers += $userText }
+                                            3 { $fullControlUsers += $userText }
                                         }
                                     }
                                     elseif ($principal.principalType -in @(4,8)) {
-                                        # Group - get members
+                                        # Group
                                         $groupName = $principal.name
                                         $groupMembersUrl = "$siteUrl/_api/web/SiteGroups/GetById($($principal.id))/Users"
                                         try {
@@ -200,122 +190,97 @@ foreach ($siteUrl in $SiteUrls) {
                                                 if ($member.PrincipalType -eq 1) {
                                                     $memberLogin = if ($member.UserPrincipalName) { $member.UserPrincipalName } else { $member.Email }
                                                     $memberName = if ($member.Title) { $member.Title } else { $memberLogin }
-                                                    $memberEntry = "$memberName [$memberLogin] (via $groupName)"
+                                                    $memberText = "$memberName [$memberLogin] (via $groupName)"
                                                     
-                                                    if ($hasUniquePerms) {
-                                                        $memberEntry += " (UNIQUE)"
-                                                    } else {
-                                                        $memberEntry += " (INHERITED)"
+                                                    if (-not $hasUniquePerms) {
+                                                        $memberText = "$memberText [INHERITED]"
                                                     }
                                                     
                                                     switch ($role) {
-                                                        1 { $readUsers += $memberEntry }
-                                                        2 { $editUsers += $memberEntry }
-                                                        3 { $fullControlUsers += $memberEntry }
+                                                        1 { $readUsers += $memberText }
+                                                        2 { $editUsers += $memberText }
+                                                        3 { $fullControlUsers += $memberText }
                                                     }
                                                 }
                                             }
                                         }
                                         catch {
-                                            Write-Host "    Error getting members for group $groupName : $_" -ForegroundColor Yellow
-                                            $groupEntry = "$groupName [Group Members Not Accessible]"
-                                            
-                                            if ($hasUniquePerms) {
-                                                $groupEntry += " (UNIQUE)"
-                                            } else {
-                                                $groupEntry += " (INHERITED)"
+                                            $groupText = "$groupName [GROUP MEMBERS NOT ACCESSIBLE]"
+                                            if (-not $hasUniquePerms) {
+                                                $groupText = "$groupText [INHERITED]"
                                             }
-                                            
                                             switch ($role) {
-                                                1 { $readUsers += $groupEntry }
-                                                2 { $editUsers += $groupEntry }
-                                                3 { $fullControlUsers += $groupEntry }
+                                                1 { $readUsers += $groupText }
+                                                2 { $editUsers += $groupText }
+                                                3 { $fullControlUsers += $groupText }
                                             }
                                         }
                                     }
                                 }
                             }
 
-                            # Process sharing links
+                            # Get sharing links
                             if ($permsInfo.permissionsInformation.links) {
                                 foreach ($link in $permsInfo.permissionsInformation.links) {
                                     $linkUrl = $link.linkDetails.Url
-                                    $linkType = if ($link.linkDetails.IsEditLink -or $link.linkDetails.IsReviewLink) { "Edit" } else { "Read" }
-                                    $linkInfo = "$linkUrl ($linkType access)"
+                                    $linkType = if ($link.linkDetails.IsEditLink) { "Edit" } else { "Read" }
+                                    $linkText = "$linkUrl ($linkType access)"
                                     
                                     if ($link.linkDetails.ExpirationDate) {
-                                        $linkInfo += " - Expires: $($link.linkDetails.ExpirationDate)"
-                                    }
-                                    if ($link.linkDetails.PasswordProtected) {
-                                        $linkInfo += " - Password Protected"
+                                        $linkText = "$linkText - Expires: $($link.linkDetails.ExpirationDate)"
                                     }
                                     
-                                    $sharingLinks += $linkInfo
-                                    
-                                    if ($link.linkMembers) {
-                                        foreach ($member in $link.linkMembers) {
-                                            $memberLogin = if ($member.userPrincipalName) { $member.userPrincipalName } else { $member.email }
-                                            $memberName = if ($member.displayName) { $member.displayName } else { $memberLogin }
-                                            $memberEntry = "$memberName [$memberLogin] (via sharing link)"
-                                            
-                                            if ($linkType -eq "Edit") {
-                                                $editUsers += $memberEntry
-                                            } else {
-                                                $readUsers += $memberEntry
-                                            }
-                                        }
-                                    }
+                                    $sharingLinks += $linkText
                                 }
                             }
                         }
                         catch {
-                            Write-Host "    Error getting permissions info for item $($item.Id): $_" -ForegroundColor Red
+                            # No permissions found
                         }
 
-                        # If no users found, add default message
+                        # Default values if no data
                         if ($readUsers.Count -eq 0 -and $editUsers.Count -eq 0 -and $fullControlUsers.Count -eq 0) {
                             $readUsers = @("No permissions found")
                         }
                         
-                        # If no sharing links, add "None"
                         if ($sharingLinks.Count -eq 0) {
-                            $sharingLinks = @("None")
+                            $sharingLinks = @("No sharing links")
                         }
 
-                        # Prepare CSV row
-                        $rowData = @(
+                        # Join with semicolon and space (not newline) to avoid CSV complexity
+                        $readText = $readUsers -join "; "
+                        $editText = $editUsers -join "; "
+                        $fullText = $fullControlUsers -join "; "
+                        $linksText = $sharingLinks -join "; "
+
+                        # Prepare row data
+                        $rowValues = @(
                             $siteUrl.Split("/")[-1],
                             $siteUrl,
                             $list.Title,
-                            $item.Id.ToString(),
+                            $item.Id,
                             $itemType,
                             $itemName,
                             $itemLocation,
-                            $(if ($itemSize) { [math]::Round($itemSize/1KB, 2).ToString() } else { "" }),
-                            ($readUsers | Sort-Object -Unique) -join "`n",
-                            ($editUsers | Sort-Object -Unique) -join "`n",
-                            ($fullControlUsers | Sort-Object -Unique) -join "`n",
-                            ($sharingLinks | Sort-Object -Unique) -join "`n",
-                            $(if ($hasUniquePerms) { "Yes - Unique" } else { "No - Inherited" }),
+                            $itemSize,
+                            $readText,
+                            $editText,
+                            $fullText,
+                            $linksText,
+                            $(if ($hasUniquePerms) { "Yes" } else { "No (Inherited)" }),
                             $(if ($item.Modified) { $item.Modified } else { "" }),
                             (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                         )
-                        
-                        # Escape each field and join with commas
-                        $csvLine = ($rowData | ForEach-Object { ConvertTo-CSVCell $_ }) -join ","
-                        
-                        # Append to CSV file immediately (dynamic update)
-                        Add-Content -Path $masterCsvFile -Value $csvLine -Encoding UTF8
+
+                        # Write to CSV
+                        $csvRow = Write-CSVRow -Values $rowValues
+                        Add-Content -Path $masterCsvFile -Value $csvRow -Encoding UTF8
                         $itemsWritten++
-                        
-                        # Show progress
-                        $totalUsers = $readUsers.Count + $editUsers.Count + $fullControlUsers.Count
-                        $permType = if ($hasUniquePerms) { "UNIQUE" } else { "INHERITED" }
-                        
-                        Write-Host "      ✅ [$itemsWritten] $permType - $itemType : $itemName (Users: $totalUsers, Links: $($sharingLinks.Count))" -ForegroundColor $(if ($hasUniquePerms) { "Green" } else { "DarkGray" })
+
+                        Write-Host "      ✅ Added: $itemType - $itemName" -ForegroundColor Green
 
                     } catch {
-                        Write-Host "    ❌ Error processing item $($item.Id): $_" -ForegroundColor Red
+                        Write-Host "      ❌ Error: $_" -ForegroundColor Red
                     }
                 }
             } catch {
@@ -325,39 +290,22 @@ foreach ($siteUrl in $SiteUrls) {
         } while ($nextPageUrl)
     }
 
-    Write-Host "`n📁 Site Summary for $($siteUrl.Split("/")[-1]):" -ForegroundColor Yellow
-    Write-Host "   Items processed: $processedItems" -ForegroundColor White
-    Write-Host "   Items written to CSV: $itemsWritten" -ForegroundColor White
-    
-    $fileInfo = Get-Item $masterCsvFile -ErrorAction SilentlyContinue
-    if ($fileInfo) {
-        Write-Host "   Total CSV size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor White
-    }
-
+    Write-Host "`n📁 Site Summary: $($itemsWritten) items written to CSV" -ForegroundColor Yellow
     Disconnect-PnPOnline
-    Write-Host "Disconnected from $siteUrl" -ForegroundColor DarkGray
 }
 
 Write-Host "`n====================================================================" -ForegroundColor Green
-Write-Host "✅ REPORT GENERATION COMPLETED" -ForegroundColor Green
+Write-Host "✅ REPORT COMPLETED" -ForegroundColor Green
 Write-Host "====================================================================" -ForegroundColor Green
-Write-Host "Final Report: $masterCsvFile" -ForegroundColor Green
+Write-Host "File: $masterCsvFile" -ForegroundColor Green
 
-$finalFileInfo = Get-Item $masterCsvFile
-$totalRows = (Get-Content $masterCsvFile | Measure-Object -Line).Lines - 1
-Write-Host "Total rows (including header): $($totalRows + 1)" -ForegroundColor White
-Write-Host "Data rows: $totalRows" -ForegroundColor White
-Write-Host "File size: $([math]::Round($finalFileInfo.Length/1KB, 2)) KB" -ForegroundColor White
-Write-Host "====================================================================" -ForegroundColor Green
-Write-Host "✅ FEATURES INCLUDED:" -ForegroundColor Yellow
-Write-Host "   • ALL items processed (both inherited and unique permissions)" -ForegroundColor White
-Write-Host "   • User login names with display names" -ForegroundColor White
-Write-Host "   • Group members expanded to individual users" -ForegroundColor White
-Write-Host "   • Sharing links with expiration and password details" -ForegroundColor White
-Write-Host "   • Proper CSV escaping (commas inside quotes)" -ForegroundColor White
-Write-Host "   • Dynamic real-time updates to CSV file" -ForegroundColor White
-Write-Host "   • Each user on new line within cell (enable Wrap Text in Excel)" -ForegroundColor White
+$fileInfo = Get-Item $masterCsvFile
+$lines = Get-Content $masterCsvFile
+Write-Host "Total rows: $($lines.Count)" -ForegroundColor White
+Write-Host "File size: $([math]::Round($fileInfo.Length/1KB, 2)) KB" -ForegroundColor White
 Write-Host "====================================================================" -ForegroundColor Green
 
-# Optional: Open the CSV file
-# Invoke-Item $masterCsvFile
+# Show first few lines to verify
+Write-Host "`nFirst 3 lines of CSV for verification:" -ForegroundColor Yellow
+Get-Content $masterCsvFile -TotalCount 3 | ForEach-Object { Write-Host $_ -ForegroundColor Cyan }
+Write-Host "====================================================================" -ForegroundColor Green
