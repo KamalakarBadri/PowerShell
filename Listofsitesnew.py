@@ -477,4 +477,177 @@ def generate_summary_report(all_sites_data):
     print(f"  Total Storage Used: {total_storage_used:.2f} GB")
     print(f"  Total Storage Quota: {total_storage_quota:.2f} GB")
     if total_storage_quota > 0:
-        print(f"  Overall Usage: {(total_storage_used / total
+        print(f"  Overall Usage: {(total_storage_used / total_storage_quota) * 100:.1f}%")
+    
+    # Sites near quota limit (>80% usage)
+    high_usage_sites = [site for site in all_sites if site.get('storage_percentage', 0) > 80]
+    if high_usage_sites:
+        print(f"\nSites with >80% Storage Usage: {len(high_usage_sites)}")
+        for site in high_usage_sites[:5]:  # Show top 5
+            print(f"  - {site.get('title', site.get('name'))}: {site.get('storage_percentage', 0):.1f}% used")
+    
+    # Recently modified sites (last 30 days)
+    try:
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        recently_modified = []
+        
+        for site in all_sites:
+            last_modified = site.get('last_modified')
+            if last_modified and last_modified != 'Unknown' and last_modified != 'Error':
+                try:
+                    # Parse ISO date format
+                    modified_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                    if modified_dt.replace(tzinfo=None) > thirty_days_ago:
+                        recently_modified.append(site)
+                except:
+                    pass
+        
+        print(f"\nRecently Modified Sites (Last 30 days): {len(recently_modified)}")
+        
+    except Exception as e:
+        print(f"\nCould not calculate recent modifications: {str(e)}")
+    
+    # Template breakdown
+    template_breakdown = {}
+    for site in all_sites:
+        template_name = site.get('template', 'Unknown')
+        if template_name not in template_breakdown:
+            template_breakdown[template_name] = {'total': 0, 'sharepoint': 0, 'personal': 0, 'storage': 0}
+        template_breakdown[template_name]['total'] += 1
+        template_breakdown[template_name]['storage'] += site.get('storage_used_gb', 0)
+        if site.get('isPersonalSite', False):
+            template_breakdown[template_name]['personal'] += 1
+        else:
+            template_breakdown[template_name]['sharepoint'] += 1
+    
+    print(f"\nTemplate Distribution:")
+    for template, counts in sorted(template_breakdown.items()):
+        print(f"  {template}: {counts['total']} sites, {counts['storage']:.2f} GB ({counts['sharepoint']} SharePoint, {counts['personal']} Personal)")
+
+def generate_report_filename(tenant_name, report_type, extension="csv"):
+    """Generate filename with tenant name and current timestamp"""
+    # Extract tenant name without domain if needed
+    tenant_clean = tenant_name.split('.')[0] if '.' in tenant_name else tenant_name
+    
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create filename
+    filename = f"{tenant_clean}_{report_type}_{timestamp}.{extension}"
+    
+    return filename
+
+def main():
+    # Load configuration from JSON file
+    config = load_config("config.json")
+    
+    # Set up configuration from config
+    tenant_name = config.get('tenant')
+    app_id = config.get('app_id')
+    certificate_path = config.get('cert_path')
+    private_key_path = config.get('key_path')
+    sharepoint_url = config.get('sharepoint_url') or f"https://{tenant_name.split('.')[0]}.sharepoint.com"
+    output_prefix = config.get('output_prefix')
+    page_size = config.get('page_size')
+    preview_count = config.get('preview_count')
+    
+    # Define scopes
+    scope_graph = "https://graph.microsoft.com/.default"
+    scope_sharepoint = f"{sharepoint_url}/.default"
+    
+    print(f"Configuration loaded from config.json:")
+    print(f"  Tenant: {tenant_name}")
+    print(f"  App ID: {app_id}")
+    print(f"  Certificate: {certificate_path}")
+    print(f"  Private Key: {private_key_path}")
+    print(f"  SharePoint URL: {sharepoint_url}")
+    print(f"  Output Prefix: {output_prefix}")
+    print(f"  Page Size: {page_size}")
+    print(f"  Preview Count: {preview_count}")
+    
+    try:
+        # Load certificate and private key
+        certificate, private_key = load_certificate_and_key(certificate_path, private_key_path)
+        print("Certificate and private key loaded successfully")
+        
+        # Get Graph token
+        graph_jwt = get_jwt_token(certificate, private_key, tenant_name, app_id, scope_graph)
+        print("Generated Graph JWT")
+        graph_token = get_access_token(graph_jwt, tenant_name, app_id, scope_graph)
+        print("Graph access token retrieved successfully")
+        
+        # Get SharePoint token
+        sharepoint_jwt = get_jwt_token(certificate, private_key, tenant_name, app_id, scope_sharepoint)
+        print("Generated SharePoint JWT")
+        sharepoint_token = get_access_token(sharepoint_jwt, tenant_name, app_id, scope_sharepoint)
+        print("SharePoint access token retrieved successfully")
+        
+        # Save tokens to file with timestamp
+        tokens_filename = generate_report_filename(tenant_name, "tokens", "json")
+        tokens = {
+            "graph_token": graph_token,
+            "sharepoint_token": sharepoint_token,
+            "timestamp": datetime.now().isoformat(),
+            "tenant": tenant_name
+        }
+        
+        with open(tokens_filename, "w") as f:
+            json.dump(tokens, f, indent=2)
+        
+        print(f"Tokens saved to {tokens_filename}")
+        
+        # Now get all SharePoint sites and personal sites using SharePoint REST API
+        print("\n" + "="*50)
+        print("RETRIEVING SHAREPOINT SITES AND PERSONAL SITES")
+        print("="*50)
+        
+        all_sites_data = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tenant": tenant_name,
+            'all_sites': [],
+            'sharepoint_sites': [],
+            'personal_sites': []
+        }
+        
+        # Use the pagination method to get all sites
+        sites_result = get_all_sites_with_pagination(sharepoint_token, sharepoint_url, page_size)
+        all_sites_data["all_sites"] = sites_result["all_sites"]
+        all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
+        all_sites_data["personal_sites"] = sites_result["personal_sites"]
+        
+        # Generate filenames with tenant name and timestamp
+        report_csv = generate_report_filename(tenant_name, "complete_report", "csv")
+        sharepoint_csv = generate_report_filename(tenant_name, "sharepoint_only", "csv")
+        personal_csv = generate_report_filename(tenant_name, "personal_only", "csv")
+        backup_json = generate_report_filename(tenant_name, "backup", "json")
+        
+        # Save all data to files
+        save_sites_to_file(all_sites_data, backup_json)  # JSON backup
+        save_sites_to_csv(all_sites_data, report_csv)   # Main CSV report
+        
+        # Also create separate CSV files for SharePoint and Personal sites
+        save_filtered_csv(all_sites_data, False, sharepoint_csv)
+        save_filtered_csv(all_sites_data, True, personal_csv)
+        
+        # Print CSV preview
+        print_csv_preview(all_sites_data, preview_count)
+        
+        # Generate detailed summary
+        generate_summary_report(all_sites_data)
+        
+        print(f"\n✅ Script completed successfully!")
+        print(f"📁 Output files created:")
+        print(f"   - {report_csv} (Complete report with all sites)")
+        print(f"   - {sharepoint_csv} (SharePoint sites only)")
+        print(f"   - {personal_csv} (Personal/OneDrive sites only)")
+        print(f"   - {backup_json} (JSON backup)")
+        print(f"   - {tokens_filename} (Access tokens)")
+        
+        return all_sites_data
+        
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        return None
+
+if __name__ == "__main__":
+    main()
