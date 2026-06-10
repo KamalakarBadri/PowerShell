@@ -12,6 +12,20 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
 
+# Enable debug logging
+DEBUG = True
+
+def debug_print(message, data=None):
+    """Print debug messages with timestamp"""
+    if DEBUG:
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[DEBUG {timestamp}] {message}")
+        if data:
+            if isinstance(data, dict) or isinstance(data, list):
+                print(json.dumps(data, indent=2, default=str)[:500])  # Limit output size
+            else:
+                print(f"  {str(data)[:500]}")
+
 def load_config(config_file="config.json"):
     """Load configuration from JSON file"""
     try:
@@ -24,6 +38,7 @@ def load_config(config_file="config.json"):
         config.setdefault('page_size', 100)
         config.setdefault('preview_count', 5)
         
+        debug_print(f"Configuration loaded: {json.dumps(config, indent=2)}")
         return config
     except FileNotFoundError:
         print(f"Error: Configuration file '{config_file}' not found.")
@@ -39,13 +54,15 @@ def load_config(config_file="config.json"):
 def load_certificate_and_key(certificate_path, private_key_path):
     """Load certificate and private key from PEM files"""
     try:
-        # Load certificate
+        debug_print(f"Loading certificate from: {certificate_path}")
         with open(certificate_path, "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
+        debug_print(f"Certificate loaded successfully. Subject: {certificate.subject}")
 
-        # Load private key
+        debug_print(f"Loading private key from: {private_key_path}")
         with open(private_key_path, "rb") as key_file:
             private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
+        debug_print(f"Private key loaded successfully")
 
         return certificate, private_key
 
@@ -56,6 +73,8 @@ def load_certificate_and_key(certificate_path, private_key_path):
 def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
     """Generate JWT token using certificate and private key"""
     try:
+        debug_print(f"Generating JWT token for tenant: {tenant_name}, scope: {scope}")
+        
         # Create JWT timestamp for expiration (5 minutes from now)
         now = int(time.time())
         expiration = now + 300  # 5 minutes
@@ -63,6 +82,7 @@ def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
         # Get certificate thumbprint (x5t)
         thumbprint = certificate.fingerprint(hashes.SHA1())
         x5t = base64.urlsafe_b64encode(thumbprint).decode('utf-8').replace('=', '')
+        debug_print(f"Certificate thumbprint (x5t): {x5t}")
         
         # Create JWT header
         jwt_header = {
@@ -80,6 +100,9 @@ def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
             "nbf": now,
             "sub": app_id
         }
+        
+        debug_print(f"JWT Header: {json.dumps(jwt_header)}")
+        debug_print(f"JWT Payload: {json.dumps(jwt_payload)}")
         
         # Encode header and payload
         encoded_header = base64.urlsafe_b64encode(
@@ -103,6 +126,7 @@ def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
         
         # Combine to create final JWT
         jwt = f"{jwt_unsigned}.{encoded_signature}"
+        debug_print(f"JWT token generated successfully (length: {len(jwt)})")
         
         return jwt
 
@@ -126,10 +150,18 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         "grant_type": "client_credentials"
     }
     
+    debug_print(f"Requesting access token from: {url}")
+    debug_print(f"Request data: scope={scope}, client_id={app_id}")
+    
     try:
         response = requests.post(url, headers=headers, data=data)
+        debug_print(f"Response status code: {response.status_code}")
+        
         response.raise_for_status()
-        return response.json()["access_token"]
+        token_data = response.json()
+        debug_print(f"Access token retrieved successfully. Token type: {token_data.get('token_type')}, Expires in: {token_data.get('expires_in')} seconds")
+        
+        return token_data["access_token"]
     except requests.exceptions.HTTPError as err:
         print(f"HTTP Error: {err}")
         print(f"Response: {response.text}")
@@ -138,18 +170,34 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         print(f"Error: {err}")
         raise
 
-def make_sharepoint_request(token, endpoint):
-    """Make a request to SharePoint REST API"""
+def make_sharepoint_request(token, endpoint, method="GET"):
+    """Make a request to SharePoint REST API with debug logging"""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
     
+    debug_print(f"\n{'='*60}")
+    debug_print(f"SharePoint Request: {method} {endpoint}")
+    debug_print(f"Headers: Authorization Bearer {token[:50]}...")
+    
     try:
-        response = requests.get(endpoint, headers=headers)
-        response.raise_for_status()
-        return response.json()
+        if method == "GET":
+            response = requests.get(endpoint, headers=headers)
+        else:
+            response = requests.post(endpoint, headers=headers)
+        
+        debug_print(f"Response Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            debug_print(f"Response Data Preview: {json.dumps(response_data, indent=2)[:500]}")
+            return response_data
+        else:
+            debug_print(f"Error Response: {response.text}")
+            response.raise_for_status()
+            
     except requests.exceptions.HTTPError as err:
         print(f"HTTP Error: {err}")
         print(f"Response: {response.text}")
@@ -159,7 +207,7 @@ def make_sharepoint_request(token, endpoint):
         raise
 
 def get_site_usage_and_last_modified(token, web_url):
-    """Get storage usage from _api/site/usage and last modified from _api/site"""
+    """Get storage usage from _api/site/usage and last modified from _api/web"""
     try:
         # Remove trailing slash if present
         web_url = web_url.rstrip('/')
@@ -172,40 +220,69 @@ def get_site_usage_and_last_modified(token, web_url):
             'error': None
         }
         
+        debug_print(f"\n--- Fetching details for site: {web_url} ---")
+        
         # Get storage usage from _api/site/usage
         try:
             usage_endpoint = f"{web_url}/_api/site/usage"
+            debug_print(f"Endpoint 1 (Storage): {usage_endpoint}")
             usage_data = make_sharepoint_request(token, usage_endpoint)
+            
+            debug_print(f"Raw _api/site/usage response:")
+            debug_print(None, usage_data)
             
             if 'Storage' in usage_data:
                 storage_bytes = int(usage_data['Storage'])
                 site_info['storage_used_bytes'] = storage_bytes
                 site_info['storage_used_gb'] = round(storage_bytes / (1024**3), 2)
+                debug_print(f"  Storage Used: {storage_bytes} bytes ({site_info['storage_used_gb']} GB)")
             
             if 'StoragePercentageUsed' in usage_data:
                 # Convert from decimal to percentage (e.g., 2.93e-06 = 0.000293%)
                 site_info['storage_percentage'] = float(usage_data['StoragePercentageUsed']) * 100
+                debug_print(f"  Storage Percentage: {usage_data['StoragePercentageUsed']} * 100 = {site_info['storage_percentage']:.6f}%")
                 
         except Exception as e:
             site_info['error'] = f"Usage API error: {str(e)}"
+            debug_print(f"ERROR in _api/site/usage: {str(e)}")
         
-        # Get last modified from _api/site
+        # Get last modified from _api/web (LastItemModifiedDate)
         try:
-            site_endpoint = f"{web_url}/_api/site"
-            site_data = make_sharepoint_request(token, site_endpoint)
+            web_endpoint = f"{web_url}/_api/web"
+            debug_print(f"Endpoint 2 (Last Modified): {web_endpoint}")
+            web_data = make_sharepoint_request(token, web_endpoint)
             
-            if 'LastModified' in site_data:
-                site_info['last_modified'] = site_data['LastModified']
+            debug_print(f"Raw _api/web response (selected fields):")
+            web_summary = {
+                'Title': web_data.get('Title'),
+                'LastItemModifiedDate': web_data.get('LastItemModifiedDate'),
+                'LastItemUserModifiedDate': web_data.get('LastItemUserModifiedDate'),
+                'Language': web_data.get('Language'),
+                'IsMultilingual': web_data.get('IsMultilingual')
+            }
+            debug_print(None, web_summary)
+            
+            # Use LastItemModifiedDate as the primary last modified timestamp
+            if 'LastItemModifiedDate' in web_data:
+                site_info['last_modified'] = web_data['LastItemModifiedDate']
+                debug_print(f"  Last Modified (LastItemModifiedDate): {site_info['last_modified']}")
+            elif 'LastItemUserModifiedDate' in web_data:
+                # Fallback to LastItemUserModifiedDate if LastItemModifiedDate not available
+                site_info['last_modified'] = web_data['LastItemUserModifiedDate']
+                debug_print(f"  Last Modified (LastItemUserModifiedDate): {site_info['last_modified']}")
             else:
                 site_info['last_modified'] = 'Unknown'
+                debug_print(f"  Last Modified: Not found in response")
                 
         except Exception as e:
-            site_info['error'] = f"Site API error: {str(e)}"
+            site_info['error'] = f"Web API error: {str(e)}"
             site_info['last_modified'] = 'Error'
+            debug_print(f"ERROR in _api/web: {str(e)}")
         
         return site_info
         
     except Exception as e:
+        debug_print(f"ERROR in get_site_usage_and_last_modified: {str(e)}")
         return {
             'storage_used_bytes': 0,
             'storage_used_gb': 0,
@@ -227,25 +304,40 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
     batch_count = 0
     total_sites_processed = 0
     
+    debug_print(f"Initial Graph API endpoint: {endpoint}")
+    
     while endpoint:
         batch_count += 1
         try:
             print(f"Processing batch {batch_count}...")
+            debug_print(f"Batch {batch_count} - Requesting: {endpoint}")
+            
             sites_data = make_sharepoint_request(token, endpoint)
+            
+            # Debug: Print pagination info
+            debug_print(f"Batch {batch_count} - Response contains '@odata.nextLink': {'@odata.nextLink' in sites_data}")
             
             current_batch = sites_data.get('value', [])
             
             if not current_batch:
+                debug_print(f"Batch {batch_count} - No sites found in response")
                 break
             
             print(f"  Found {len(current_batch)} sites in this batch")
+            debug_print(f"Batch {batch_count} - Retrieved {len(current_batch)} sites")
             
-            for site in current_batch:
+            for idx, site in enumerate(current_batch):
                 template_name = site.get('template', {}).get('name', 'Unknown')
                 web_url = site.get('webUrl')
+                site_title = site.get('title', site.get('name'))
+                
+                debug_print(f"\n--- Processing site {total_sites_processed + 1}: {site_title} ---")
+                debug_print(f"Site URL: {web_url}")
+                debug_print(f"Site Template: {template_name}")
+                debug_print(f"Is Personal Site: {site.get('isPersonalSite', False)}")
                 
                 # Get usage and last modified info for each site
-                print(f"    Fetching details for: {site.get('title', site.get('name'))}")
+                print(f"    Fetching details for: {site_title}")
                 site_details = get_site_usage_and_last_modified(token, web_url)
                 
                 # Add rate limiting to avoid throttling
@@ -254,7 +346,7 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
                 site_info = {
                     'id': site.get('id'),
                     'name': site.get('name'),
-                    'title': site.get('title'),
+                    'title': site_title,
                     'webUrl': web_url,
                     'createdDateTime': site.get('createdDateTime'),
                     'isPersonalSite': site.get('isPersonalSite', False),
@@ -272,26 +364,36 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
                 all_sites.append(site_info)
                 total_sites_processed += 1
                 
+                # Format last modified for display
+                last_mod_display = site_details['last_modified']
+                if last_mod_display and last_mod_display != 'Unknown' and last_mod_display != 'Error':
+                    last_mod_display = last_mod_display[:19]  # Trim to YYYY-MM-DDTHH:MM:SS
+                
                 # Separate personal sites from SharePoint sites
                 if site.get('isPersonalSite', False):
                     site_info['type'] = 'Personal Site'
                     personal_sites.append(site_info)
-                    print(f"    Personal Site: {site.get('title', site.get('name'))} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.4f}%)")
+                    print(f"    ✅ Personal Site: {site_title} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.6f}%) | Last Modified: {last_mod_display}")
                 else:
                     site_info['type'] = 'SharePoint Site'
                     sharepoint_sites.append(site_info)
-                    print(f"    SharePoint Site: {site.get('title', site.get('name'))} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.4f}%)")
+                    print(f"    ✅ SharePoint Site: {site_title} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.6f}%) | Last Modified: {last_mod_display}")
+                
+                debug_print(f"Site processing complete. Storage: {site_details['storage_used_gb']} GB, Last Modified: {site_details['last_modified']}")
             
             # Check for next link for pagination
             endpoint = None
             if '@odata.nextLink' in sites_data:
                 endpoint = sites_data['@odata.nextLink']
                 print(f"  Next page available")
+                debug_print(f"Next page URL: {endpoint}")
             else:
                 print("  No more pages available")
+                debug_print(f"Pagination complete. No more pages.")
                 
         except Exception as e:
             print(f"Error getting sites batch {batch_count}: {str(e)}")
+            debug_print(f"FATAL ERROR in batch {batch_count}: {str(e)}")
             break
     
     print(f"\nTotal sites retrieved: {len(all_sites)}")
@@ -308,6 +410,7 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
 def save_sites_to_file(all_sites_data, filename):
     """Save all sites data to a JSON file as backup"""
     try:
+        debug_print(f"Saving JSON backup to: {filename}")
         with open(filename, "w") as f:
             json.dump(all_sites_data, f, indent=2, default=str)
         print(f"JSON backup saved to {filename}")
@@ -329,6 +432,7 @@ def extract_site_id(full_site_id):
 def save_sites_to_csv(all_sites_data, filename):
     """Save sites data to CSV with storage and last modified columns"""
     try:
+        debug_print(f"Saving CSV report to: {filename}")
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Site Name', 'Creation Date', 'Last Modified', 'Is Personal Site', 
                          'Web URL', 'Site ID', 'Template', 'Storage Used (GB)', 
@@ -373,6 +477,7 @@ def save_sites_to_csv(all_sites_data, filename):
 def save_filtered_csv(all_sites_data, is_personal_filter, filename):
     """Save filtered CSV (either SharePoint sites or Personal sites only)"""
     try:
+        debug_print(f"Saving filtered CSV to: {filename} (is_personal={is_personal_filter})")
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Site Name', 'Creation Date', 'Last Modified', 'Is Personal Site', 
                          'Web URL', 'Site ID', 'Template', 'Storage Used (GB)', 
@@ -430,7 +535,7 @@ def print_csv_preview(all_sites_data, preview_count=5):
             
         site_name = site.get('title') or site.get('name', 'Unknown')
         creation_date = site.get('createdDateTime', '')[:10] if site.get('createdDateTime') else 'N/A'
-        last_modified = site.get('last_modified', '')[:10] if site.get('last_modified') and site.get('last_modified') != 'Unknown' else 'N/A'
+        last_modified = site.get('last_modified', '')[:19] if site.get('last_modified') and site.get('last_modified') != 'Unknown' and site.get('last_modified') != 'Error' else 'N/A'
         storage_gb = site.get('storage_used_gb', 0)
         usage_pct = site.get('storage_percentage', 0)
         web_url = site.get('webUrl', '')
@@ -438,7 +543,7 @@ def print_csv_preview(all_sites_data, preview_count=5):
         # Truncate long URLs for display
         display_url = web_url[:40] + "..." if len(web_url) > 40 else web_url
         
-        print(f"{site_name[:20]:<20} | {creation_date:<12} | {last_modified:<12} | {storage_gb:>10.2f} | {usage_pct:>10.6f} | {display_url}")
+        print(f"{site_name[:20]:<20} | {creation_date:<12} | {last_modified:<19} | {storage_gb:>10.2f} | {usage_pct:>10.6f} | {display_url}")
         count += 1
     
     total_sites = len(all_sites_data.get('all_sites', []))
@@ -491,6 +596,9 @@ def generate_summary_report(all_sites_data):
                     pass
         
         print(f"\nRecently Modified Sites (Last 30 days): {len(recently_modified)}")
+        if recently_modified and len(recently_modified) <= 10:
+            for site in recently_modified[:5]:
+                print(f"  - {site.get('title', site.get('name'))}: {site.get('last_modified')}")
         
     except Exception as e:
         print(f"\nCould not calculate recent modifications: {str(e)}")
@@ -552,6 +660,7 @@ def main():
     print(f"  Output Prefix: {output_prefix}")
     print(f"  Page Size: {page_size}")
     print(f"  Preview Count: {preview_count}")
+    print(f"  Debug Mode: {DEBUG}")
     
     try:
         # Load certificate and private key
@@ -630,6 +739,9 @@ def main():
         print(f"   - {personal_csv} (Personal/OneDrive sites only)")
         print(f"   - {backup_json} (JSON backup)")
         print(f"   - {tokens_filename} (Access tokens)")
+        
+        if DEBUG:
+            print(f"\n💡 Debug mode was enabled. Check console output for detailed endpoint and response logs.")
         
         return all_sites_data
         
