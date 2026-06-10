@@ -158,63 +158,58 @@ def make_sharepoint_request(token, endpoint):
         print(f"Error making SharePoint request: {err}")
         raise
 
-def get_site_storage_and_last_modified(token, web_url):
-    """Get storage usage and last modified time for a specific site using _api/site"""
+def get_site_usage_and_last_modified(token, web_url):
+    """Get storage usage from _api/site/usage and last modified from _api/site"""
     try:
         # Remove trailing slash if present
         web_url = web_url.rstrip('/')
         
-        storage_info = {
+        site_info = {
             'storage_used_bytes': 0,
             'storage_used_gb': 0,
             'storage_percentage': 0,
-            'storage_quota': 0,
-            'storage_quota_gb': 0,
             'last_modified': '',
             'error': None
         }
         
-        # Get site info including usage and last modified from _api/site
+        # Get storage usage from _api/site/usage
+        try:
+            usage_endpoint = f"{web_url}/_api/site/usage"
+            usage_data = make_sharepoint_request(token, usage_endpoint)
+            
+            if 'Storage' in usage_data:
+                storage_bytes = int(usage_data['Storage'])
+                site_info['storage_used_bytes'] = storage_bytes
+                site_info['storage_used_gb'] = round(storage_bytes / (1024**3), 2)
+            
+            if 'StoragePercentageUsed' in usage_data:
+                # Convert from decimal to percentage (e.g., 2.93e-06 = 0.000293%)
+                site_info['storage_percentage'] = float(usage_data['StoragePercentageUsed']) * 100
+                
+        except Exception as e:
+            site_info['error'] = f"Usage API error: {str(e)}"
+        
+        # Get last modified from _api/site
         try:
             site_endpoint = f"{web_url}/_api/site"
             site_data = make_sharepoint_request(token, site_endpoint)
             
-            # Get storage usage
-            if 'StorageUsage' in site_data:
-                storage_bytes = site_data['StorageUsage']
-                storage_info['storage_used_bytes'] = storage_bytes
-                storage_info['storage_used_gb'] = round(storage_bytes / (1024**3), 2)
-            
-            # Get storage quota (allocated)
-            if 'StorageQuota' in site_data:
-                quota_bytes = site_data['StorageQuota'] * 1024  # Convert MB to bytes
-                storage_info['storage_quota'] = quota_bytes
-                storage_info['storage_quota_gb'] = round(quota_bytes / (1024**3), 2)
-            
-            # Calculate percentage if both values exist
-            if storage_info['storage_used_bytes'] > 0 and storage_info['storage_quota'] > 0:
-                storage_info['storage_percentage'] = round(
-                    (storage_info['storage_used_bytes'] / storage_info['storage_quota']) * 100, 2
-                )
-            
-            # Get last modified time
             if 'LastModified' in site_data:
-                storage_info['last_modified'] = site_data['LastModified']
+                site_info['last_modified'] = site_data['LastModified']
             else:
-                storage_info['last_modified'] = 'Unknown'
+                site_info['last_modified'] = 'Unknown'
                 
         except Exception as e:
-            storage_info['error'] = f"Site API error: {str(e)}"
+            site_info['error'] = f"Site API error: {str(e)}"
+            site_info['last_modified'] = 'Error'
         
-        return storage_info
+        return site_info
         
     except Exception as e:
         return {
             'storage_used_bytes': 0,
             'storage_used_gb': 0,
             'storage_percentage': 0,
-            'storage_quota': 0,
-            'storage_quota_gb': 0,
             'last_modified': 'Error',
             'error': str(e)
         }
@@ -249,9 +244,9 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
                 template_name = site.get('template', {}).get('name', 'Unknown')
                 web_url = site.get('webUrl')
                 
-                # Get storage and last modified info for each site
+                # Get usage and last modified info for each site
                 print(f"    Fetching details for: {site.get('title', site.get('name'))}")
-                storage_info = get_site_storage_and_last_modified(token, web_url)
+                site_details = get_site_usage_and_last_modified(token, web_url)
                 
                 # Add rate limiting to avoid throttling
                 time.sleep(0.3)
@@ -267,13 +262,11 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
                     'siteCollection': site.get('siteCollection', {}),
                     'template': template_name,
                     'sensitivityLabel': site.get('sensitivityLabel', {}),
-                    'storage_used_bytes': storage_info['storage_used_bytes'],
-                    'storage_used_gb': storage_info['storage_used_gb'],
-                    'storage_percentage': storage_info['storage_percentage'],
-                    'storage_quota': storage_info['storage_quota'],
-                    'storage_quota_gb': storage_info['storage_quota_gb'],
-                    'last_modified': storage_info['last_modified'],
-                    'storage_error': storage_info.get('error')
+                    'storage_used_bytes': site_details['storage_used_bytes'],
+                    'storage_used_gb': site_details['storage_used_gb'],
+                    'storage_percentage': site_details['storage_percentage'],
+                    'last_modified': site_details['last_modified'],
+                    'storage_error': site_details.get('error')
                 }
                 
                 all_sites.append(site_info)
@@ -283,11 +276,11 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
                 if site.get('isPersonalSite', False):
                     site_info['type'] = 'Personal Site'
                     personal_sites.append(site_info)
-                    print(f"    Personal Site: {site.get('title', site.get('name'))} - Storage: {storage_info['storage_used_gb']} GB / {storage_info['storage_quota_gb']} GB")
+                    print(f"    Personal Site: {site.get('title', site.get('name'))} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.4f}%)")
                 else:
                     site_info['type'] = 'SharePoint Site'
                     sharepoint_sites.append(site_info)
-                    print(f"    SharePoint Site: {site.get('title', site.get('name'))} - Storage: {storage_info['storage_used_gb']} GB / {storage_info['storage_quota_gb']} GB")
+                    print(f"    SharePoint Site: {site.get('title', site.get('name'))} - Storage: {site_details['storage_used_gb']} GB ({site_details['storage_percentage']:.4f}%)")
             
             # Check for next link for pagination
             endpoint = None
@@ -304,7 +297,7 @@ def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
     print(f"\nTotal sites retrieved: {len(all_sites)}")
     print(f"SharePoint sites: {len(sharepoint_sites)}")
     print(f"Personal sites: {len(personal_sites)}")
-    print(f"Total sites processed with storage info: {total_sites_processed}")
+    print(f"Total sites processed: {total_sites_processed}")
     
     return {
         'all_sites': all_sites,
@@ -339,7 +332,7 @@ def save_sites_to_csv(all_sites_data, filename):
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Site Name', 'Creation Date', 'Last Modified', 'Is Personal Site', 
                          'Web URL', 'Site ID', 'Template', 'Storage Used (GB)', 
-                         'Storage Quota (GB)', 'Storage Used (%)', 'Storage Error']
+                         'Storage Used (%)', 'Storage Error']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -356,7 +349,6 @@ def save_sites_to_csv(all_sites_data, filename):
                 site_id = extract_site_id(site.get('id', ''))
                 template = site.get('template', 'Unknown')
                 storage_used_gb = site.get('storage_used_gb', 0)
-                storage_quota_gb = site.get('storage_quota_gb', 0)
                 storage_percentage = site.get('storage_percentage', 0)
                 storage_error = site.get('storage_error', '')
                 
@@ -369,8 +361,7 @@ def save_sites_to_csv(all_sites_data, filename):
                     'Site ID': site_id,
                     'Template': template,
                     'Storage Used (GB)': storage_used_gb,
-                    'Storage Quota (GB)': storage_quota_gb,
-                    'Storage Used (%)': storage_percentage,
+                    'Storage Used (%)': f"{storage_percentage:.6f}",
                     'Storage Error': storage_error
                 })
         
@@ -385,7 +376,7 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Site Name', 'Creation Date', 'Last Modified', 'Is Personal Site', 
                          'Web URL', 'Site ID', 'Template', 'Storage Used (GB)', 
-                         'Storage Quota (GB)', 'Storage Used (%)', 'Storage Error']
+                         'Storage Used (%)', 'Storage Error']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -403,7 +394,6 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
                     site_id = extract_site_id(site.get('id', ''))
                     template = site.get('template', 'Unknown')
                     storage_used_gb = site.get('storage_used_gb', 0)
-                    storage_quota_gb = site.get('storage_quota_gb', 0)
                     storage_percentage = site.get('storage_percentage', 0)
                     storage_error = site.get('storage_error', '')
                     
@@ -416,8 +406,7 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
                         'Site ID': site_id,
                         'Template': template,
                         'Storage Used (GB)': storage_used_gb,
-                        'Storage Quota (GB)': storage_quota_gb,
-                        'Storage Used (%)': storage_percentage,
+                        'Storage Used (%)': f"{storage_percentage:.6f}",
                         'Storage Error': storage_error
                     })
                     filtered_count += 1
@@ -431,7 +420,7 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
 def print_csv_preview(all_sites_data, preview_count=5):
     """Print a preview of the CSV data"""
     print(f"\n=== CSV Report Preview (First {preview_count} Sites) ===")
-    print("Site Name | Creation Date | Last Modified | Storage (GB) | Quota (GB) | Usage % | Web URL")
+    print("Site Name | Creation Date | Last Modified | Storage (GB) | Usage % | Web URL")
     print("-" * 120)
     
     count = 0
@@ -443,14 +432,13 @@ def print_csv_preview(all_sites_data, preview_count=5):
         creation_date = site.get('createdDateTime', '')[:10] if site.get('createdDateTime') else 'N/A'
         last_modified = site.get('last_modified', '')[:10] if site.get('last_modified') and site.get('last_modified') != 'Unknown' else 'N/A'
         storage_gb = site.get('storage_used_gb', 0)
-        quota_gb = site.get('storage_quota_gb', 0)
         usage_pct = site.get('storage_percentage', 0)
         web_url = site.get('webUrl', '')
         
         # Truncate long URLs for display
         display_url = web_url[:40] + "..." if len(web_url) > 40 else web_url
         
-        print(f"{site_name[:20]:<20} | {creation_date:<12} | {last_modified:<12} | {storage_gb:>10.2f} | {quota_gb:>10.2f} | {usage_pct:>6.1f}% | {display_url}")
+        print(f"{site_name[:20]:<20} | {creation_date:<12} | {last_modified:<12} | {storage_gb:>10.2f} | {usage_pct:>10.6f} | {display_url}")
         count += 1
     
     total_sites = len(all_sites_data.get('all_sites', []))
@@ -471,20 +459,20 @@ def generate_summary_report(all_sites_data):
     
     # Storage summary
     total_storage_used = sum(site.get('storage_used_gb', 0) for site in all_sites)
-    total_storage_quota = sum(site.get('storage_quota_gb', 0) for site in all_sites)
     
     print(f"\nStorage Summary:")
     print(f"  Total Storage Used: {total_storage_used:.2f} GB")
-    print(f"  Total Storage Quota: {total_storage_quota:.2f} GB")
-    if total_storage_quota > 0:
-        print(f"  Overall Usage: {(total_storage_used / total_storage_quota) * 100:.1f}%")
     
-    # Sites near quota limit (>80% usage)
-    high_usage_sites = [site for site in all_sites if site.get('storage_percentage', 0) > 80]
-    if high_usage_sites:
-        print(f"\nSites with >80% Storage Usage: {len(high_usage_sites)}")
-        for site in high_usage_sites[:5]:  # Show top 5
-            print(f"  - {site.get('title', site.get('name'))}: {site.get('storage_percentage', 0):.1f}% used")
+    # Sites with storage usage > 0
+    sites_with_storage = [site for site in all_sites if site.get('storage_used_gb', 0) > 0]
+    print(f"  Sites with storage used: {len(sites_with_storage)}")
+    
+    # Top 10 largest sites by storage
+    largest_sites = sorted(all_sites, key=lambda x: x.get('storage_used_gb', 0), reverse=True)[:10]
+    if largest_sites:
+        print(f"\nTop 10 Largest Sites by Storage Usage:")
+        for i, site in enumerate(largest_sites, 1):
+            print(f"  {i}. {site.get('title', site.get('name'))}: {site.get('storage_used_gb', 0):.2f} GB ({site.get('storage_percentage', 0):.6f}%)")
     
     # Recently modified sites (last 30 days)
     try:
