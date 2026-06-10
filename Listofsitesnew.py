@@ -11,6 +11,42 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
 
+class SharePointTokenManager:
+    """Manages SharePoint token with automatic renewal"""
+    
+    def __init__(self, certificate, private_key, tenant_name, app_id, sharepoint_url):
+        self.certificate = certificate
+        self.private_key = private_key
+        self.tenant_name = tenant_name
+        self.app_id = app_id
+        self.sharepoint_url = sharepoint_url
+        self.token = None
+        self.token_expiry_time = 0
+        self.refresh_buffer = 300  # Refresh 5 minutes before expiry
+    
+    def get_token(self):
+        """Get valid token, renew if expired or about to expire"""
+        current_time = time.time()
+        
+        # Check if token is None or will expire within buffer time
+        if not self.token or current_time >= (self.token_expiry_time - self.refresh_buffer):
+            self._renew_token()
+        
+        return self.token
+    
+    def _renew_token(self):
+        """Renew the access token"""
+        print(f"  [Token] Renewing access token...")
+        
+        scope = f"{self.sharepoint_url}/.default"
+        jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
+        self.token = get_access_token(jwt, self.tenant_name, self.app_id, scope)
+        
+        # Token expires in 3600 seconds (1 hour), set expiry 45 minutes from now
+        self.token_expiry_time = time.time() + 2700  # 45 minutes
+        
+        print(f"  [Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
+
 def load_config(config_file="config.json"):
     """Load configuration from JSON file"""
     try:
@@ -19,6 +55,7 @@ def load_config(config_file="config.json"):
         
         config.setdefault('sharepoint_url', None)
         config.setdefault('page_size', 100)
+        config.setdefault('max_retries', 3)
         
         return config
     except FileNotFoundError:
@@ -115,23 +152,41 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         print(f"Error getting access token: {err}")
         raise
 
-def make_sharepoint_request(token, endpoint):
-    """Make a request to SharePoint REST API"""
+def make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3):
+    """Make SharePoint request with automatic token renewal on 401 error"""
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {token_manager.get_token()}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
     
-    try:
-        response = requests.get(endpoint, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except Exception as err:
-        print(f"Error making SharePoint request: {err}")
-        raise
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(endpoint, headers=headers)
+            
+            # If unauthorized, renew token and retry
+            if response.status_code == 401:
+                print(f"  [Auth] Token expired, renewing... (Attempt {attempt + 1}/{max_retries})")
+                token_manager._renew_token()
+                headers["Authorization"] = f"Bearer {token_manager.get_token()}"
+                continue
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.HTTPError as err:
+            if response.status_code == 401 and attempt < max_retries - 1:
+                continue
+            print(f"HTTP Error: {err}")
+            print(f"Response: {response.text}")
+            raise
+        except Exception as err:
+            print(f"Error making SharePoint request: {err}")
+            raise
+    
+    raise Exception(f"Failed after {max_retries} attempts")
 
-def get_site_details(token, web_url):
+def get_site_details(token_manager, web_url):
     """Get storage usage, quota, and last modified for a site"""
     try:
         web_url = web_url.rstrip('/')
@@ -148,7 +203,7 @@ def get_site_details(token, web_url):
         # Get storage usage from _api/site/usage
         try:
             usage_endpoint = f"{web_url}/_api/site/usage"
-            usage_data = make_sharepoint_request(token, usage_endpoint)
+            usage_data = make_sharepoint_request_with_retry(token_manager, usage_endpoint)
             
             if 'Storage' in usage_data:
                 storage_bytes = int(usage_data['Storage'])
@@ -170,7 +225,7 @@ def get_site_details(token, web_url):
         # Get last modified from _api/web
         try:
             web_endpoint = f"{web_url}/_api/web"
-            web_data = make_sharepoint_request(token, web_endpoint)
+            web_data = make_sharepoint_request_with_retry(token_manager, web_endpoint)
             
             if 'LastItemModifiedDate' in web_data:
                 site_info['last_modified'] = web_data['LastItemModifiedDate']
@@ -195,20 +250,21 @@ def get_site_details(token, web_url):
             'last_modified': 'Error'
         }
 
-def get_all_sites(token, sharepoint_url, page_size=100):
-    """Get all sites with pagination"""
+def get_all_sites(token_manager, sharepoint_url, page_size=100):
+    """Get all sites with pagination and automatic token renewal"""
     print(f"\n=== Retrieving SharePoint Sites ===")
     
     all_sites = []
     
     endpoint = f"{sharepoint_url}/_api/v2.0/sites?$top={page_size}"
     batch_count = 0
+    total_sites_processed = 0
     
     while endpoint:
         batch_count += 1
         try:
             print(f"Processing batch {batch_count}...")
-            sites_data = make_sharepoint_request(token, endpoint)
+            sites_data = make_sharepoint_request_with_retry(token_manager, endpoint)
             
             current_batch = sites_data.get('value', [])
             
@@ -217,16 +273,15 @@ def get_all_sites(token, sharepoint_url, page_size=100):
             
             print(f"  Found {len(current_batch)} sites in this batch")
             
-            for site in current_batch:
+            for idx, site in enumerate(current_batch):
                 template_name = site.get('template', {}).get('name', 'Unknown')
                 web_url = site.get('webUrl')
                 site_title = site.get('title', site.get('name'))
                 
-                print(f"  Fetching details for: {site_title}")
-                site_details = get_site_details(token, web_url)
+                total_sites_processed += 1
+                print(f"  [{total_sites_processed}] Fetching details for: {site_title}")
                 
-                # Add rate limiting
-                time.sleep(0.3)
+                site_details = get_site_details(token_manager, web_url)
                 
                 site_info = {
                     'name': site_title,
@@ -244,6 +299,9 @@ def get_all_sites(token, sharepoint_url, page_size=100):
                 
                 site_type = "Personal" if site.get('isPersonalSite', False) else "SharePoint"
                 print(f"    {site_type}: {site_details['storage_used_gb']} GB used / {site_details['total_quota_gb']} GB quota ({site_details['storage_percentage']}%)")
+                
+                # Small delay between requests
+                time.sleep(0.2)
             
             # Check for next page
             endpoint = sites_data.get('@odata.nextLink')
@@ -303,24 +361,30 @@ def main():
     private_key_path = config.get('key_path')
     sharepoint_url = config.get('sharepoint_url') or f"https://{tenant_name.split('.')[0]}.sharepoint.com"
     page_size = config.get('page_size', 100)
+    max_retries = config.get('max_retries', 3)
     
     print(f"Configuration loaded:")
     print(f"  Tenant: {tenant_name}")
     print(f"  SharePoint URL: {sharepoint_url}")
+    print(f"  Page Size: {page_size}")
+    print(f"  Max Retries: {max_retries}")
     
     try:
         # Load certificate and key
         certificate, private_key = load_certificate_and_key(certificate_path, private_key_path)
         print("Certificate and private key loaded successfully")
         
-        # Get SharePoint token
-        sharepoint_scope = f"{sharepoint_url}/.default"
-        sharepoint_jwt = get_jwt_token(certificate, private_key, tenant_name, app_id, sharepoint_scope)
-        sharepoint_token = get_access_token(sharepoint_jwt, tenant_name, app_id, sharepoint_scope)
+        # Create token manager
+        token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_url)
+        
+        # Get initial token
+        initial_token = token_manager.get_token()
         print("SharePoint access token retrieved successfully")
+        print(f"  Token expires at: {datetime.fromtimestamp(token_manager.token_expiry_time).strftime('%H:%M:%S')}")
+        print(f"  Auto-renewal will happen if token expires during script execution")
         
         # Get all sites
-        all_sites = get_all_sites(sharepoint_token, sharepoint_url, page_size)
+        all_sites = get_all_sites(token_manager, sharepoint_url, page_size)
         
         # Generate filename and save to CSV
         filename = generate_filename(tenant_name)
