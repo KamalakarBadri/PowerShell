@@ -14,12 +14,12 @@ from cryptography.hazmat.backends import default_backend
 class SharePointTokenManager:
     """Manages SharePoint token with automatic renewal"""
     
-    def __init__(self, certificate, private_key, tenant_name, app_id, sharepoint_url):
+    def __init__(self, certificate, private_key, tenant_name, app_id, sharepoint_admin_url):
         self.certificate = certificate
         self.private_key = private_key
         self.tenant_name = tenant_name
         self.app_id = app_id
-        self.sharepoint_url = sharepoint_url
+        self.sharepoint_admin_url = sharepoint_admin_url
         self.token = None
         self.token_expiry_time = 0
         self.refresh_buffer = 300  # Refresh 5 minutes before expiry
@@ -28,7 +28,6 @@ class SharePointTokenManager:
         """Get valid token, renew if expired or about to expire"""
         current_time = time.time()
         
-        # Check if token is None or will expire within buffer time
         if not self.token or current_time >= (self.token_expiry_time - self.refresh_buffer):
             self._renew_token()
         
@@ -38,7 +37,7 @@ class SharePointTokenManager:
         """Renew the access token"""
         print(f"  [Token] Renewing access token...")
         
-        scope = f"{self.sharepoint_url}/.default"
+        scope = f"{self.sharepoint_admin_url}/.default"
         jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
         self.token = get_access_token(jwt, self.tenant_name, self.app_id, scope)
         
@@ -53,14 +52,25 @@ def load_config(config_file="config.json"):
         with open(config_file, 'r') as f:
             config = json.load(f)
         
-        config.setdefault('sharepoint_url', None)
         config.setdefault('page_size', 100)
         config.setdefault('max_retries', 3)
         
         return config
     except FileNotFoundError:
         print(f"Error: Configuration file '{config_file}' not found.")
-        print("Please create a config.json file with the required parameters.")
+        print("Please create a config.json file with the following structure:")
+        print("""
+{
+    "tenant": "yourtenant.onmicrosoft.com",
+    "app_id": "your-app-id",
+    "cert_path": "cert.pem",
+    "key_path": "key.pem",
+    "sharepoint_admin_url": "https://yourtenant-admin.sharepoint.com",
+    "list_id": "317f59e4-b925-4d1c-884c-c758bf067a6c",
+    "page_size": 100,
+    "max_retries": 3
+}
+        """)
         raise
     except json.JSONDecodeError:
         print(f"Error: Invalid JSON format in '{config_file}'.")
@@ -186,125 +196,71 @@ def make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
-def get_site_details(token_manager, web_url):
-    """Get storage usage, quota, and last modified for a site"""
-    try:
-        web_url = web_url.rstrip('/')
-        
-        site_info = {
-            'storage_used_bytes': 0,
-            'storage_used_gb': 0,
-            'total_quota_bytes': 0,
-            'total_quota_gb': 0,
-            'storage_percentage': 0,
-            'last_modified': ''
-        }
-        
-        # Get storage usage from _api/site/usage
-        try:
-            usage_endpoint = f"{web_url}/_api/site/usage"
-            usage_data = make_sharepoint_request_with_retry(token_manager, usage_endpoint)
-            
-            if 'Storage' in usage_data:
-                storage_bytes = int(usage_data['Storage'])
-                site_info['storage_used_bytes'] = storage_bytes
-                site_info['storage_used_gb'] = round(storage_bytes / (1024**3), 2)
-            
-            if 'StoragePercentageUsed' in usage_data:
-                storage_percentage_decimal = float(usage_data['StoragePercentageUsed'])
-                site_info['storage_percentage'] = round(storage_percentage_decimal * 100, 2)
-                
-                # Calculate total quota using formula: Total Quota = Storage / StoragePercentageUsed
-                if storage_percentage_decimal > 0 and storage_bytes > 0:
-                    total_quota_bytes = storage_bytes / storage_percentage_decimal
-                    site_info['total_quota_bytes'] = int(total_quota_bytes)
-                    site_info['total_quota_gb'] = round(total_quota_bytes / (1024**3), 2)
-        except Exception as e:
-            print(f"  Warning: Could not get storage usage for {web_url}: {str(e)}")
-        
-        # Get last modified from _api/web
-        try:
-            web_endpoint = f"{web_url}/_api/web"
-            web_data = make_sharepoint_request_with_retry(token_manager, web_endpoint)
-            
-            if 'LastItemModifiedDate' in web_data:
-                site_info['last_modified'] = web_data['LastItemModifiedDate']
-            elif 'LastItemUserModifiedDate' in web_data:
-                site_info['last_modified'] = web_data['LastItemUserModifiedDate']
-            else:
-                site_info['last_modified'] = 'Unknown'
-        except Exception as e:
-            print(f"  Warning: Could not get last modified for {web_url}: {str(e)}")
-            site_info['last_modified'] = 'Error'
-        
-        return site_info
-        
-    except Exception as e:
-        print(f"  Error getting site details: {str(e)}")
-        return {
-            'storage_used_bytes': 0,
-            'storage_used_gb': 0,
-            'total_quota_bytes': 0,
-            'total_quota_gb': 0,
-            'storage_percentage': 0,
-            'last_modified': 'Error'
-        }
-
-def get_all_sites(token_manager, sharepoint_url, page_size=100):
-    """Get all sites with pagination and automatic token renewal"""
-    print(f"\n=== Retrieving SharePoint Sites ===")
+def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=100):
+    """Get all sites from the Tenant Admin Aggregated Sites List"""
+    print(f"\n=== Retrieving SharePoint Sites from Admin List ===")
     
     all_sites = []
     
-    endpoint = f"{sharepoint_url}/_api/v2.0/sites?$top={page_size}"
+    # Base endpoint for the list items
+    base_endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items"
+    
+    # Initial request with top parameter
+    endpoint = f"{base_endpoint}?$top={page_size}"
     batch_count = 0
-    total_sites_processed = 0
+    total_sites = 0
     
     while endpoint:
         batch_count += 1
         try:
             print(f"Processing batch {batch_count}...")
-            sites_data = make_sharepoint_request_with_retry(token_manager, endpoint)
+            data = make_sharepoint_request_with_retry(token_manager, endpoint)
             
-            current_batch = sites_data.get('value', [])
+            current_batch = data.get('value', [])
             
             if not current_batch:
                 break
             
             print(f"  Found {len(current_batch)} sites in this batch")
             
-            for idx, site in enumerate(current_batch):
-                template_name = site.get('template', {}).get('name', 'Unknown')
-                web_url = site.get('webUrl')
-                site_title = site.get('title', site.get('name'))
+            for item in current_batch:
+                total_sites += 1
                 
-                total_sites_processed += 1
-                print(f"  [{total_sites_processed}] Fetching details for: {site_title}")
-                
-                site_details = get_site_details(token_manager, web_url)
-                
+                # Extract all relevant fields
                 site_info = {
-                    'name': site_title,
-                    'url': web_url,
-                    'created': site.get('createdDateTime', ''),
-                    'template': template_name,
-                    'is_personal': site.get('isPersonalSite', False),
-                    'storage_used_gb': site_details['storage_used_gb'],
-                    'total_quota_gb': site_details['total_quota_gb'],
-                    'storage_percentage': site_details['storage_percentage'],
-                    'last_modified': site_details['last_modified']
+                    'title': item.get('Title', ''),
+                    'site_url': item.get('SiteUrl', ''),
+                    'site_id': item.get('SiteId', ''),
+                    'template_name': item.get('TemplateName', ''),
+                    'storage_quota_bytes': item.get('StorageQuota', 0),
+                    'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
+                    'storage_used_bytes': item.get('StorageUsed', 0),
+                    'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
+                    'storage_used_percentage': float(item.get('StorageUsedPercentage', '0')) * 100 if item.get('StorageUsedPercentage') else 0,
+                    'created': item.get('Created', ''),
+                    'created_by': item.get('CreatedBy', ''),
+                    'created_by_email': item.get('CreatedByEmail', ''),
+                    'modified': item.get('Modified', ''),
+                    'last_activity': item.get('LastActivityOn', ''),
+                    'num_of_files': item.get('NumOfFiles', 0),
+                    'page_views': item.get('PageViews', 0),
+                    'pages_visited': item.get('PagesVisited', 0),
+                    'external_sharing': item.get('ExternalSharing', ''),
+                    'allow_guest_signin': item.get('AllowGuestUserSignIn', False),
+                    'group_id': item.get('GroupId', ''),
+                    'hub_site_id': item.get('HubSiteId', ''),
+                    'state': item.get('State', 0),
+                    'time_created': item.get('TimeCreated', ''),
+                    'archive_status': item.get('ArchiveStatus', '')
                 }
                 
                 all_sites.append(site_info)
                 
-                site_type = "Personal" if site.get('isPersonalSite', False) else "SharePoint"
-                print(f"    {site_type}: {site_details['storage_used_gb']} GB used / {site_details['total_quota_gb']} GB quota ({site_details['storage_percentage']}%)")
-                
-                # Small delay between requests
-                time.sleep(0.2)
+                # Print progress
+                print(f"  [{total_sites}] {site_info['title']} - {site_info['storage_used_gb']} GB / {site_info['storage_quota_gb']} GB ({site_info['storage_used_percentage']:.2f}%)")
             
-            # Check for next page
-            endpoint = sites_data.get('@odata.nextLink')
+            # Check for next link for pagination
+            endpoint = data.get('odata.nextLink')
             if endpoint:
                 print(f"  Next page available")
             else:
@@ -321,23 +277,42 @@ def save_to_csv(sites, filename):
     """Save sites data to CSV file"""
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Site Name', 'Site URL', 'Created Date', 'Template', 'Is Personal Site',
-                         'Storage Used (GB)', 'Total Quota (GB)', 'Storage Used (%)', 'Last Modified']
+            fieldnames = [
+                'Title', 'Site URL', 'Site ID', 'Template Name',
+                'Storage Used (GB)', 'Storage Quota (GB)', 'Storage Used (%)',
+                'Created', 'Created By', 'Created By Email', 'Modified', 'Last Activity',
+                'Number of Files', 'Page Views', 'Pages Visited',
+                'External Sharing', 'Allow Guest SignIn', 'Group ID', 'Hub Site ID',
+                'State', 'Time Created', 'Archive Status'
+            ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             writer.writeheader()
             
             for site in sites:
                 writer.writerow({
-                    'Site Name': site['name'],
-                    'Site URL': site['url'],
-                    'Created Date': site['created'],
-                    'Template': site['template'],
-                    'Is Personal Site': 'Yes' if site['is_personal'] else 'No',
+                    'Title': site['title'],
+                    'Site URL': site['site_url'],
+                    'Site ID': site['site_id'],
+                    'Template Name': site['template_name'],
                     'Storage Used (GB)': site['storage_used_gb'],
-                    'Total Quota (GB)': site['total_quota_gb'],
-                    'Storage Used (%)': site['storage_percentage'],
-                    'Last Modified': site['last_modified']
+                    'Storage Quota (GB)': site['storage_quota_gb'],
+                    'Storage Used (%)': round(site['storage_used_percentage'], 4),
+                    'Created': site['created'],
+                    'Created By': site['created_by'],
+                    'Created By Email': site['created_by_email'],
+                    'Modified': site['modified'],
+                    'Last Activity': site['last_activity'],
+                    'Number of Files': site['num_of_files'],
+                    'Page Views': site['page_views'],
+                    'Pages Visited': site['pages_visited'],
+                    'External Sharing': site['external_sharing'],
+                    'Allow Guest SignIn': 'Yes' if site['allow_guest_signin'] else 'No',
+                    'Group ID': site['group_id'],
+                    'Hub Site ID': site['hub_site_id'],
+                    'State': site['state'],
+                    'Time Created': site['time_created'],
+                    'Archive Status': site['archive_status']
                 })
         
         print(f"\n✅ CSV report saved to: {filename}")
@@ -359,15 +334,26 @@ def main():
     app_id = config.get('app_id')
     certificate_path = config.get('cert_path')
     private_key_path = config.get('key_path')
-    sharepoint_url = config.get('sharepoint_url') or f"https://{tenant_name.split('.')[0]}.sharepoint.com"
+    sharepoint_admin_url = config.get('sharepoint_admin_url')
+    list_id = config.get('list_id')
     page_size = config.get('page_size', 100)
     max_retries = config.get('max_retries', 3)
     
     print(f"Configuration loaded:")
     print(f"  Tenant: {tenant_name}")
-    print(f"  SharePoint URL: {sharepoint_url}")
+    print(f"  SharePoint Admin URL: {sharepoint_admin_url}")
+    print(f"  List ID: {list_id}")
     print(f"  Page Size: {page_size}")
     print(f"  Max Retries: {max_retries}")
+    
+    # Validate required fields
+    if not sharepoint_admin_url:
+        print("Error: sharepoint_admin_url is required in config.json")
+        return
+    if not list_id:
+        print("Error: list_id is required in config.json")
+        print("The list ID is: 317f59e4-b925-4d1c-884c-c758bf067a6c (Tenant Admin Aggregated Sites List)")
+        return
     
     try:
         # Load certificate and key
@@ -375,7 +361,7 @@ def main():
         print("Certificate and private key loaded successfully")
         
         # Create token manager
-        token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_url)
+        token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_admin_url)
         
         # Get initial token
         initial_token = token_manager.get_token()
@@ -383,23 +369,37 @@ def main():
         print(f"  Token expires at: {datetime.fromtimestamp(token_manager.token_expiry_time).strftime('%H:%M:%S')}")
         print(f"  Auto-renewal will happen if token expires during script execution")
         
-        # Get all sites
-        all_sites = get_all_sites(token_manager, sharepoint_url, page_size)
+        # Get all sites from the admin list
+        all_sites = get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size)
+        
+        if not all_sites:
+            print("No sites found!")
+            return
         
         # Generate filename and save to CSV
         filename = generate_filename(tenant_name)
         save_to_csv(all_sites, filename)
         
         # Print summary
-        sharepoint_count = len([s for s in all_sites if not s['is_personal']])
-        personal_count = len([s for s in all_sites if s['is_personal']])
         total_storage = sum(s['storage_used_gb'] for s in all_sites)
+        total_quota = sum(s['storage_quota_gb'] for s in all_sites)
+        total_files = sum(s['num_of_files'] for s in all_sites)
         
         print(f"\n=== SUMMARY ===")
         print(f"Total Sites: {len(all_sites)}")
-        print(f"  - SharePoint Sites: {sharepoint_count}")
-        print(f"  - Personal Sites: {personal_count}")
         print(f"Total Storage Used: {total_storage:.2f} GB")
+        print(f"Total Storage Quota: {total_quota:.2f} GB")
+        print(f"Total Files: {total_files}")
+        
+        if total_quota > 0:
+            print(f"Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
+        
+        # Show top 5 largest sites
+        largest_sites = sorted(all_sites, key=lambda x: x['storage_used_gb'], reverse=True)[:5]
+        if largest_sites:
+            print(f"\nTop 5 Largest Sites by Storage:")
+            for i, site in enumerate(largest_sites, 1):
+                print(f"  {i}. {site['title']}: {site['storage_used_gb']:.2f} GB")
         
         print(f"\n✅ Script completed successfully!")
         
