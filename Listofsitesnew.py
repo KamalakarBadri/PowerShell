@@ -54,6 +54,7 @@ def load_config(config_file="config.json"):
         
         config.setdefault('page_size', 100)
         config.setdefault('max_retries', 3)
+        config.setdefault('max_concurrent_requests', 10)  # New setting for concurrent requests
         
         return config
     except FileNotFoundError:
@@ -68,7 +69,8 @@ def load_config(config_file="config.json"):
     "sharepoint_admin_url": "https://yourtenant-admin.sharepoint.com",
     "list_id": "317f59e4-b925-4d1c-884c-c758bf067a6c",
     "page_size": 100,
-    "max_retries": 3
+    "max_retries": 3,
+    "max_concurrent_requests": 10
 }
         """)
         raise
@@ -196,8 +198,25 @@ def make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
-def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=100):
-    """Get all sites from the Tenant Admin Aggregated Sites List"""
+def get_site_metadata(token_manager, site_url):
+    """Get site metadata including LastItemModifiedDate and LastItemUserModifiedDate"""
+    try:
+        endpoint = f"{site_url.rstrip('/')}/_api/web"
+        data = make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=2)
+        
+        return {
+            'last_item_modified_date': data.get('LastItemModifiedDate', ''),
+            'last_item_user_modified_date': data.get('LastItemUserModifiedDate', '')
+        }
+    except Exception as e:
+        print(f"  ⚠️ Error getting metadata for {site_url}: {str(e)[:100]}")
+        return {
+            'last_item_modified_date': 'Error',
+            'last_item_user_modified_date': 'Error'
+        }
+
+def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=100, max_concurrent=10):
+    """Get all sites from the Tenant Admin Aggregated Sites List with additional metadata"""
     print(f"\n=== Retrieving SharePoint Sites from Admin List ===")
     
     all_sites = []
@@ -223,13 +242,26 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
             
             print(f"  Found {len(current_batch)} sites in this batch")
             
-            for item in current_batch:
+            # Process each site in the batch
+            for idx, item in enumerate(current_batch, 1):
                 total_sites += 1
                 
-                # Extract all relevant fields
+                # Extract basic site info
+                site_url = item.get('SiteUrl', '')
+                
+                print(f"  [{total_sites}] Fetching metadata for: {item.get('Title', 'Unknown')}")
+                
+                # Get additional metadata from the site
+                site_metadata = get_site_metadata(token_manager, site_url)
+                
                 site_info = {
+                    # New columns from list item
+                    'id': item.get('Id', ''),  # Added Id field
+                    'time_deleted': item.get('TimeDeleted', ''),  # Added TimeDeleted field
+                    
+                    # Existing fields
                     'title': item.get('Title', ''),
-                    'site_url': item.get('SiteUrl', ''),
+                    'site_url': site_url,
                     'site_id': item.get('SiteId', ''),
                     'template_name': item.get('TemplateName', ''),
                     'storage_quota_bytes': item.get('StorageQuota', 0),
@@ -251,13 +283,22 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                     'hub_site_id': item.get('HubSiteId', ''),
                     'state': item.get('State', 0),
                     'time_created': item.get('TimeCreated', ''),
-                    'archive_status': item.get('ArchiveStatus', '')
+                    'archive_status': item.get('ArchiveStatus', ''),
+                    
+                    # Fields from site metadata
+                    'last_item_modified_date': site_metadata.get('last_item_modified_date', ''),
+                    'last_item_user_modified_date': site_metadata.get('last_item_user_modified_date', '')
                 }
                 
                 all_sites.append(site_info)
                 
-                # Print progress
-                print(f"  [{total_sites}] {site_info['title']} - {site_info['storage_used_gb']} GB / {site_info['storage_quota_gb']} GB ({site_info['storage_used_percentage']:.2f}%)")
+                # Print progress with new fields
+                print(f"    ✓ ID: {site_info['id']}")
+                if site_info['time_deleted']:
+                    print(f"    ⚠️ Time Deleted: {site_info['time_deleted']}")
+                print(f"    ✓ Storage: {site_info['storage_used_gb']} GB / {site_info['storage_quota_gb']} GB")
+                if site_info['last_item_user_modified_date'] and site_info['last_item_user_modified_date'] != 'Error':
+                    print(f"    ✓ Last modified: {site_info['last_item_user_modified_date']}")
             
             # Check for next link for pagination
             endpoint = data.get('odata.nextLink')
@@ -271,6 +312,12 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
             break
     
     print(f"\nTotal sites retrieved: {len(all_sites)}")
+    
+    # Count deleted sites
+    deleted_sites = [s for s in all_sites if s.get('time_deleted')]
+    if deleted_sites:
+        print(f"\n⚠️ Found {len(deleted_sites)} sites with TimeDeleted value (soft-deleted sites)")
+    
     return all_sites
 
 def save_to_csv(sites, filename):
@@ -278,12 +325,17 @@ def save_to_csv(sites, filename):
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
+                # New columns
+                'ID', 'Time Deleted',
+                
+                # Existing columns
                 'Title', 'Site URL', 'Site ID', 'Template Name',
                 'Storage Used (GB)', 'Storage Quota (GB)', 'Storage Used (%)',
                 'Created', 'Created By', 'Created By Email', 'Modified', 'Last Activity',
                 'Number of Files', 'Page Views', 'Pages Visited',
                 'External Sharing', 'Allow Guest SignIn', 'Group ID', 'Hub Site ID',
-                'State', 'Time Created', 'Archive Status'
+                'State', 'Time Created', 'Archive Status',
+                'Last Item Modified Date', 'Last Item User Modified Date'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
@@ -291,6 +343,11 @@ def save_to_csv(sites, filename):
             
             for site in sites:
                 writer.writerow({
+                    # New columns
+                    'ID': site.get('id', ''),
+                    'Time Deleted': site.get('time_deleted', ''),
+                    
+                    # Existing columns
                     'Title': site['title'],
                     'Site URL': site['site_url'],
                     'Site ID': site['site_id'],
@@ -312,7 +369,9 @@ def save_to_csv(sites, filename):
                     'Hub Site ID': site['hub_site_id'],
                     'State': site['state'],
                     'Time Created': site['time_created'],
-                    'Archive Status': site['archive_status']
+                    'Archive Status': site['archive_status'],
+                    'Last Item Modified Date': site.get('last_item_modified_date', ''),
+                    'Last Item User Modified Date': site.get('last_item_user_modified_date', '')
                 })
         
         print(f"\n✅ CSV report saved to: {filename}")
@@ -369,7 +428,7 @@ def main():
         print(f"  Token expires at: {datetime.fromtimestamp(token_manager.token_expiry_time).strftime('%H:%M:%S')}")
         print(f"  Auto-renewal will happen if token expires during script execution")
         
-        # Get all sites from the admin list
+        # Get all sites from the admin list with additional metadata
         all_sites = get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size)
         
         if not all_sites:
@@ -385,11 +444,22 @@ def main():
         total_quota = sum(s['storage_quota_gb'] for s in all_sites)
         total_files = sum(s['num_of_files'] for s in all_sites)
         
+        # Count sites with recent activity
+        sites_with_recent_activity = sum(1 for s in all_sites 
+                                        if s.get('last_item_user_modified_date') and 
+                                        s.get('last_item_user_modified_date') != 'Error')
+        
+        # Count deleted sites
+        deleted_sites = [s for s in all_sites if s.get('time_deleted')]
+        
         print(f"\n=== SUMMARY ===")
         print(f"Total Sites: {len(all_sites)}")
+        print(f"  - Active sites: {len(all_sites) - len(deleted_sites)}")
+        print(f"  - Soft-deleted sites: {len(deleted_sites)}")
         print(f"Total Storage Used: {total_storage:.2f} GB")
         print(f"Total Storage Quota: {total_quota:.2f} GB")
         print(f"Total Files: {total_files}")
+        print(f"Sites with activity data: {sites_with_recent_activity}/{len(all_sites)}")
         
         if total_quota > 0:
             print(f"Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
@@ -400,6 +470,26 @@ def main():
             print(f"\nTop 5 Largest Sites by Storage:")
             for i, site in enumerate(largest_sites, 1):
                 print(f"  {i}. {site['title']}: {site['storage_used_gb']:.2f} GB")
+        
+        # Show recently modified sites
+        recently_modified = [s for s in all_sites 
+                            if s.get('last_item_user_modified_date') and 
+                            s.get('last_item_user_modified_date') != 'Error'][:5]
+        recently_modified.sort(key=lambda x: x.get('last_item_user_modified_date', ''), reverse=True)
+        
+        if recently_modified:
+            print(f"\nTop 5 Recently Modified Sites:")
+            for i, site in enumerate(recently_modified[:5], 1):
+                modified_date = site.get('last_item_user_modified_date', 'Unknown')
+                print(f"  {i}. {site['title']}: {modified_date}")
+        
+        # Show deleted sites if any
+        if deleted_sites:
+            print(f"\n⚠️ Soft-Deleted Sites (with TimeDeleted value):")
+            for site in deleted_sites[:5]:
+                print(f"  • {site['title']} - Deleted: {site.get('time_deleted', 'Unknown')}")
+            if len(deleted_sites) > 5:
+                print(f"  ... and {len(deleted_sites) - 5} more")
         
         print(f"\n✅ Script completed successfully!")
         
