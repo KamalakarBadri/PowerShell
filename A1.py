@@ -828,3 +828,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+{
+    "tenant": "yourtenant.onmicrosoft.com",
+    "app_id": "your-app-id",
+    "cert_path": "cert.pem",
+    "key_path": "key.pem",
+    "sharepoint_admin_url": "https://yourtenant-admin.sharepoint.com",
+    "list_id": "317f59e4-b925-4d1c-884c-c758bf067a6c",
+    "page_size": 100,
+    "max_retries": 3,
+    "max_workers": 20,
+    "fetch_metadata": true,
+    "include_personal_sites": true,
+    "include_group_sites": false,
+    "skip_deleted_metadata": true,
+    "check_owner_exists": true
+}
