@@ -25,8 +25,8 @@ class SharePointTokenManager:
         self.sharepoint_admin_url = sharepoint_admin_url
         self.token = None
         self.token_expiry_time = 0
-        self.refresh_buffer = 300  # Refresh 5 minutes before expiry
-        self.token_lock = Lock()  # Thread-safe token management
+        self.refresh_buffer = 300
+        self.token_lock = Lock()
     
     def get_token(self):
         """Get valid token, renew if expired or about to expire"""
@@ -46,8 +46,7 @@ class SharePointTokenManager:
         jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
         self.token = get_access_token(jwt, self.tenant_name, self.app_id, scope)
         
-        # Token expires in 3600 seconds (1 hour), set expiry 45 minutes from now
-        self.token_expiry_time = time.time() + 2700  # 45 minutes
+        self.token_expiry_time = time.time() + 2700
         
         print(f"  [Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
 
@@ -82,7 +81,6 @@ class GraphTokenManager:
         jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
         self.token = get_graph_access_token(jwt, self.tenant_name, self.app_id)
         
-        # Token expires in 3600 seconds (1 hour), set expiry 45 minutes from now
         self.token_expiry_time = time.time() + 2700
         
         print(f"  [Graph Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
@@ -100,7 +98,7 @@ def load_config(config_file="config.json"):
         config.setdefault('include_personal_sites', True)
         config.setdefault('include_group_sites', False)
         config.setdefault('skip_deleted_metadata', True)
-        config.setdefault('check_owner_exists', True)  # New setting for owner validation
+        config.setdefault('check_owner_exists', True)
         
         return config
     except FileNotFoundError:
@@ -282,7 +280,6 @@ def check_user_exists(graph_token_manager, user_email, max_retries=3):
         return False, "No email provided"
     
     try:
-        # URL encode the email
         encoded_email = requests.utils.quote(user_email)
         endpoint = f"https://graph.microsoft.com/v1.0/users/{encoded_email}"
         
@@ -303,7 +300,6 @@ def check_user_exists(graph_token_manager, user_email, max_retries=3):
                 
                 if response.status_code == 200:
                     user_data = response.json()
-                    # Check if user is enabled
                     is_enabled = user_data.get('accountEnabled', False)
                     return True, f"Enabled: {is_enabled}"
                 elif response.status_code == 404:
@@ -567,7 +563,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
         if errors > 0:
             print(f"  Errors: {errors} sites")
     
-    # Check owner exists for active sites only (deleted sites don't have valid owners)
+    # Check owner exists for active sites
     if check_owner and active_sites:
         print(f"\n=== Checking Owner Status for Active OneDrive Sites ===")
         print(f"Checking owner existence for {len(active_sites)} active OneDrive sites using Graph API...")
@@ -584,7 +580,6 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                 for site in active_sites if site.get('created_by_email')
             }
             
-            # Also handle sites without email
             for site in active_sites:
                 if not site.get('created_by_email'):
                     site['owner_exists'] = False
@@ -637,9 +632,7 @@ def save_to_csv(sites, filename):
                 'Title', 'Site URL', 'Site ID', 'Template Name',
                 'Storage Used (GB)', 'Storage Quota (GB)', 'Storage Used (%)',
                 'Created', 'Created By', 'Created By Email', 'Modified', 'Last Activity',
-                'Number of Files', 'Page Views', 'Pages Visited',
-                'External Sharing', 'Allow Guest SignIn', 'Group ID', 'Hub Site ID',
-                'State', 'Time Created', 'Archive Status',
+                'Number of Files', 'State', 'Time Created', 'Archive Status',
                 'Last Item Modified Date', 'Last Item User Modified Date'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -668,12 +661,6 @@ def save_to_csv(sites, filename):
                     'Modified': site['modified'],
                     'Last Activity': site['last_activity'],
                     'Number of Files': site['num_of_files'],
-                    'Page Views': site['page_views'],
-                    'Pages Visited': site['pages_visited'],
-                    'External Sharing': site['external_sharing'],
-                    'Allow Guest SignIn': 'Yes' if site['allow_guest_signin'] else 'No',
-                    'Group ID': site['group_id'],
-                    'Hub Site ID': site['hub_site_id'],
                     'State': site['state'],
                     'Time Created': site['time_created'],
                     'Archive Status': site['archive_status'],
@@ -735,24 +722,18 @@ def main():
         certificate, private_key = load_certificate_and_key(certificate_path, private_key_path)
         print("Certificate and private key loaded successfully")
         
-        # Create SharePoint token manager
         sharepoint_token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_admin_url)
-        
-        # Create Graph token manager
         graph_token_manager = GraphTokenManager(certificate, private_key, tenant_name, app_id)
         
-        # Get initial SharePoint token
         initial_token = sharepoint_token_manager.get_token()
         print("SharePoint access token retrieved successfully")
         print(f"  Token expires at: {datetime.fromtimestamp(sharepoint_token_manager.token_expiry_time).strftime('%H:%M:%S')}")
         
-        # Get initial Graph token if owner checking is enabled
         if check_owner:
             initial_graph_token = graph_token_manager.get_token()
             print("Graph access token retrieved successfully")
             print(f"  Token expires at: {datetime.fromtimestamp(graph_token_manager.token_expiry_time).strftime('%H:%M:%S')}")
         
-        # Get OneDrive sites with all features
         onedrive_sites = get_all_sites_from_list_optimized(
             sharepoint_token_manager,
             graph_token_manager,
@@ -768,7 +749,6 @@ def main():
             print("\nNo OneDrive sites found!")
             return
         
-        # Generate filename and save to CSV
         filename = generate_filename(tenant_name, "onedrive")
         save_to_csv(onedrive_sites, filename)
         
@@ -780,7 +760,6 @@ def main():
         total_quota = sum(s['storage_quota_gb'] for s in onedrive_sites)
         total_files = sum(s['num_of_files'] for s in onedrive_sites)
         
-        # Owner statistics
         orphaned_sites = [s for s in active_sites if not s.get('owner_exists', True)]
         
         print(f"\n{'='*50}")
@@ -804,7 +783,7 @@ def main():
             print(f"  Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
         print(f"  Total Files: {total_files:,}")
         
-        # Show top 5 largest OneDrive sites
+        # Top 5 largest sites
         largest_sites = sorted(onedrive_sites, key=lambda x: x['storage_used_gb'], reverse=True)[:5]
         if largest_sites:
             print(f"\nTop 5 Largest OneDrive Sites by Storage:")
@@ -813,7 +792,7 @@ def main():
                 owner_status = "[ORPHANED]" if not site.get('owner_exists', True) and not site.get('is_deleted') else ""
                 print(f"  {i}. {status} {site['title']}: {site['storage_used_gb']:.2f} GB {owner_status}")
         
-        # Show orphaned sites if any
+        # Orphaned sites
         if check_owner and orphaned_sites:
             print(f"\nOrphaned OneDrive Sites (Owner Not Found):")
             for site in orphaned_sites[:5]:
@@ -821,12 +800,11 @@ def main():
             if len(orphaned_sites) > 5:
                 print(f"  ... and {len(orphaned_sites) - 5} more")
             
-            # Show storage used by orphaned sites
             orphaned_storage = sum(s['storage_used_gb'] for s in orphaned_sites)
             if orphaned_storage > 0:
                 print(f"  Storage used by orphaned sites: {orphaned_storage:.2f} GB")
         
-        # Show deleted sites if any
+        # Deleted sites
         if deleted_sites:
             print(f"\nSoft-Deleted OneDrive Sites ({len(deleted_sites)} total):")
             for site in deleted_sites[:5]:
