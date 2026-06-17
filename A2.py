@@ -208,15 +208,31 @@ def get_site_url():
 # UTILITY FUNCTIONS
 # ============================================================
 
+def safe_int_conversion(value):
+    """Safely convert a value to integer, handling strings and None values"""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        # Remove any non-numeric characters (like commas, spaces)
+        cleaned = re.sub(r'[^\d.]', '', value)
+        try:
+            return int(float(cleaned)) if cleaned else 0
+        except ValueError:
+            return 0
+    return 0
+
 def bytes_to_mb(bytes_value):
     """Convert bytes to MB with 2 decimal places"""
-    if bytes_value is None or bytes_value == 0:
+    bytes_value = safe_int_conversion(bytes_value)
+    if bytes_value == 0:
         return 0.00
     return round(bytes_value / (1024 * 1024), 2)
 
 def format_datetime(datetime_str):
     """Format datetime string to readable format"""
-    if not datetime_str or datetime_str == "N/A":
+    if not datetime_str or datetime_str == "N/A" or datetime_str == "0":
         return "N/A"
     
     try:
@@ -292,12 +308,16 @@ def get_file_versions(site_url, file_url, access_token):
     if response and 'd' in response and 'results' in response['d']:
         versions = []
         for version in response['d']['results']:
+            # Safely get size, converting if necessary
+            size_value = version.get('Size', 0)
+            size = safe_int_conversion(size_value)
+            
             versions.append({
                 'id': version.get('ID', 0),
                 'version_label': version.get('VersionLabel', ''),
                 'created': version.get('Created', ''),
                 'is_current': version.get('IsCurrentVersion', False),
-                'size': version.get('Size', 0),
+                'size': size,
                 'checkin_comment': version.get('CheckInComment', '')
             })
         return versions
@@ -331,8 +351,8 @@ def get_file_details(site_url, file_item, access_token):
         created = file_obj.get('TimeCreated', 'N/A')
         modified = file_obj.get('TimeLastModified', 'N/A')
         
-        # Get current file size
-        current_file_size = file_obj.get('Length', 0)
+        # Get current file size - safely convert
+        current_file_size = safe_int_conversion(file_obj.get('Length', 0))
         
         # Get versions
         versions = get_file_versions(site_url, file_url, access_token)
@@ -431,7 +451,7 @@ def process_files(site_url, access_token):
                 file_data['library'] = library['title']
                 file_data['library_id'] = library['id']
                 all_file_data.append(file_data)
-                print(f" ✓ ({file_data['version_count']} versions, {file_data['total_versions_size_mb']} MB total)")
+                print(f" ✓ ({file_data['version_count']} versions, {file_data['total_versions_size_mb']:.2f} MB total)")
             else:
                 print(" ✗ (Failed to get details)")
             
@@ -469,11 +489,11 @@ def generate_csv_report(file_data, output_file):
                     'Library': data.get('library', ''),
                     'File Name': data.get('file_name', ''),
                     'File URL': data.get('file_url', ''),
-                    'Current File Size (MB)': data.get('current_file_size_mb', 0.00),
+                    'Current File Size (MB)': f"{data.get('current_file_size_mb', 0.00):.2f}",
                     'Version Count': data.get('version_count', 0),
                     'First Version Date': data.get('first_version_formatted', 'N/A'),
                     'Last Version Date': data.get('last_version_formatted', 'N/A'),
-                    'Total Versions Size (MB)': data.get('total_versions_size_mb', 0.00),
+                    'Total Versions Size (MB)': f"{data.get('total_versions_size_mb', 0.00):.2f}",
                     'File Created': data.get('created_formatted', 'N/A'),
                     'File Modified': data.get('modified_formatted', 'N/A')
                 })
@@ -517,7 +537,7 @@ def generate_detailed_version_report(file_data, output_file):
                             'Version Label': version.get('version_label', ''),
                             'Version Created': format_datetime(version.get('created', 'N/A')),
                             'Is Current Version': 'Yes' if version.get('is_current', False) else 'No',
-                            'Version Size (MB)': bytes_to_mb(version.get('size', 0)),
+                            'Version Size (MB)': f"{bytes_to_mb(version.get('size', 0)):.2f}",
                             'Check-in Comment': version.get('checkin_comment', '')
                         })
         
@@ -568,8 +588,8 @@ def generate_summary_report(file_data, output_file):
                     'Library': lib,
                     'Total Files': stats['files'],
                     'Total Versions': stats['versions'],
-                    'Total Current Size (MB)': bytes_to_mb(stats['current_size']),
-                    'Total Versions Size (MB)': bytes_to_mb(stats['versions_size']),
+                    'Total Current Size (MB)': f"{bytes_to_mb(stats['current_size']):.2f}",
+                    'Total Versions Size (MB)': f"{bytes_to_mb(stats['versions_size']):.2f}",
                     'Average Versions per File': round(avg_versions, 2)
                 })
         
@@ -603,21 +623,22 @@ def print_summary_stats(file_data):
     print(f"Total version records: {total_versions}")
     print(f"Average versions per file: {avg_versions:.2f}")
     print(f"Files with no versions: {len(no_versions)}")
-    print(f"Total current file size: {bytes_to_mb(total_current_size)} MB")
-    print(f"Total versions storage size: {bytes_to_mb(total_versions_size)} MB")
+    print(f"Total current file size: {bytes_to_mb(total_current_size):.2f} MB")
+    print(f"Total versions storage size: {bytes_to_mb(total_versions_size):.2f} MB")
     print()
     
-    print("TOP 10 FILES WITH MOST VERSIONS:")
-    print("-"*80)
-    for i, file in enumerate(top_files, 1):
-        print(f"{i}. {file['file_name']}")
-        print(f"   Versions: {file['version_count']}")
-        print(f"   Library: {file['library']}")
-        print(f"   Current Size: {file['current_file_size_mb']} MB")
-        print(f"   Total Versions Size: {file['total_versions_size_mb']} MB")
-        print(f"   First Version: {file['first_version_formatted']}")
-        print(f"   Last Version: {file['last_version_formatted']}")
-        print()
+    if top_files:
+        print("TOP 10 FILES WITH MOST VERSIONS:")
+        print("-"*80)
+        for i, file in enumerate(top_files, 1):
+            print(f"{i}. {file['file_name']}")
+            print(f"   Versions: {file['version_count']}")
+            print(f"   Library: {file['library']}")
+            print(f"   Current Size: {file['current_file_size_mb']:.2f} MB")
+            print(f"   Total Versions Size: {file['total_versions_size_mb']:.2f} MB")
+            print(f"   First Version: {file['first_version_formatted']}")
+            print(f"   Last Version: {file['last_version_formatted']}")
+            print()
     
     print("="*80)
 
