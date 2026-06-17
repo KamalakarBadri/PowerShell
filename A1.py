@@ -274,10 +274,111 @@ def make_sharepoint_request(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
-def check_user_exists(graph_token_manager, user_email, max_retries=3):
-    """Check if a user exists in Azure AD via Microsoft Graph API"""
+def search_user_by_email(graph_token_manager, user_email, max_retries=3):
+    """Search for a user using the Graph search API as fallback"""
     if not user_email or user_email == '':
-        return False, "No email provided"
+        return None, "No email provided"
+    
+    try:
+        url = "https://graph.microsoft.com/v1.0/search/query"
+        
+        payload = {
+            "requests": [
+                {
+                    "entityTypes": ["person"],
+                    "query": {
+                        "queryString": user_email
+                    }
+                }
+            ]
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    "Authorization": f"Bearer {graph_token_manager.get_token()}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                
+                if response.status_code == 401:
+                    print(f"  [Graph Auth] Token expired, renewing... (Attempt {attempt + 1}/{max_retries})")
+                    graph_token_manager._renew_token()
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                # Check if we got any results
+                value = data.get('value', [])
+                if value and len(value) > 0:
+                    hits_containers = value[0].get('hitsContainers', [])
+                    if hits_containers and len(hits_containers) > 0:
+                        total = hits_containers[0].get('total', 0)
+                        
+                        if total > 0:
+                            # Found the user, extract UPN from the hits
+                            hits = hits_containers[0].get('hits', [])
+                            if hits and len(hits) > 0:
+                                # Get the first hit
+                                first_hit = hits[0]
+                                resource = first_hit.get('resource', {})
+                                
+                                # Extract userPrincipalName from the resource
+                                user_upn = resource.get('userPrincipalName', '')
+                                
+                                # If UPN not found, try to get from other fields
+                                if not user_upn:
+                                    # Try imAddress (remove SIP: prefix if present)
+                                    im_address = resource.get('imAddress', '')
+                                    if im_address:
+                                        if im_address.startswith('SIP:'):
+                                            user_upn = im_address[4:]  # Remove 'SIP:' prefix
+                                        else:
+                                            user_upn = im_address
+                                
+                                # If still not found, try to construct from email
+                                if not user_upn:
+                                    # Try to get from the email field if available
+                                    email = resource.get('email', '')
+                                    if email:
+                                        user_upn = email
+                                    else:
+                                        # Fallback to the original email
+                                        user_upn = user_email
+                                
+                                # Get display name for better tracking
+                                display_name = resource.get('displayName', '')
+                                
+                                return user_upn, f"Found via search: {display_name} ({user_upn})"
+                            
+                            # If we couldn't extract UPN but total > 0, mark as found
+                            return user_email, "Found via search (UPN extraction failed)"
+                    
+                return None, "User not found in search"
+                
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return None, "Search timeout"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return None, f"Search error: {str(e)[:100]}"
+        
+        return None, "Search max retries exceeded"
+        
+    except Exception as e:
+        return None, f"Search error: {str(e)[:100]}"
+
+def check_user_exists(graph_token_manager, user_email, max_retries=3):
+    """Check if a user exists in Azure AD via Microsoft Graph API with search fallback"""
+    if not user_email or user_email == '':
+        return False, "No email provided", None
     
     try:
         encoded_email = requests.utils.quote(user_email)
@@ -301,30 +402,41 @@ def check_user_exists(graph_token_manager, user_email, max_retries=3):
                 if response.status_code == 200:
                     user_data = response.json()
                     is_enabled = user_data.get('accountEnabled', False)
-                    return True, f"Enabled: {is_enabled}"
+                    upn = user_data.get('userPrincipalName', user_email)
+                    return True, f"Enabled: {is_enabled}", upn
+                    
                 elif response.status_code == 404:
-                    return False, "User not found"
+                    # User not found via direct lookup, try search API as fallback
+                    print(f"  [Search] User not found via direct lookup: {user_email}, trying search API...")
+                    found_upn, status = search_user_by_email(graph_token_manager, user_email, max_retries)
+                    
+                    if found_upn:
+                        # User found via search
+                        return True, status, found_upn
+                    else:
+                        # User not found via search either
+                        return False, "User not found (direct and search)", None
                 else:
                     if attempt < max_retries - 1:
                         time.sleep(1)
                         continue
-                    return False, f"HTTP {response.status_code}"
+                    return False, f"HTTP {response.status_code}", None
                     
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
-                return False, "Timeout"
+                return False, "Timeout", None
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
-                return False, str(e)[:100]
+                return False, str(e)[:100], None
         
-        return False, "Max retries exceeded"
+        return False, "Max retries exceeded", None
         
     except Exception as e:
-        return False, f"Error: {str(e)[:100]}"
+        return False, f"Error: {str(e)[:100]}", None
 
 def is_onedrive_site(site_url, template_name, title):
     """Determine if a site is a OneDrive (personal) site"""
@@ -402,10 +514,11 @@ def get_site_metadata_parallel(token_manager, site_url, max_retries=3):
 
 def check_owner_status(graph_token_manager, user_email, max_retries=3):
     """Wrapper function for parallel owner checking"""
-    exists, status = check_user_exists(graph_token_manager, user_email, max_retries)
+    exists, status, upn = check_user_exists(graph_token_manager, user_email, max_retries)
     return {
         'owner_exists': exists,
-        'owner_status': status
+        'owner_status': status,
+        'owner_upn': upn
     }
 
 def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharepoint_admin_url, list_id, page_size=100, max_workers=20, fetch_metadata=True, config=None):
@@ -465,6 +578,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                         'owner_email': created_by_email,
                         'owner_exists': 'Unknown',
                         'owner_status': 'Not checked',
+                        'owner_upn': '',
                         'storage_quota_bytes': item.get('StorageQuota', 0),
                         'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
                         'storage_used_bytes': item.get('StorageUsed', 0),
@@ -476,12 +590,6 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                         'modified': item.get('Modified', ''),
                         'last_activity': item.get('LastActivityOn', ''),
                         'num_of_files': item.get('NumOfFiles', 0),
-                        'page_views': item.get('PageViews', 0),
-                        'pages_visited': item.get('PagesVisited', 0),
-                        'external_sharing': item.get('ExternalSharing', ''),
-                        'allow_guest_signin': item.get('AllowGuestUserSignIn', False),
-                        'group_id': item.get('GroupId', ''),
-                        'hub_site_id': item.get('HubSiteId', ''),
                         'state': item.get('State', 0),
                         'time_created': item.get('TimeCreated', ''),
                         'archive_status': item.get('ArchiveStatus', ''),
@@ -567,10 +675,13 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
     if check_owner and active_sites:
         print(f"\n=== Checking Owner Status for Active OneDrive Sites ===")
         print(f"Checking owner existence for {len(active_sites)} active OneDrive sites using Graph API...")
+        print(f"  - Direct user lookup first")
+        print(f"  - Search API fallback if user not found")
         
         processed = 0
         owner_errors = 0
         orphaned_count = 0
+        search_fallback_count = 0
         
         start_time = time.time()
         
@@ -584,6 +695,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                 if not site.get('created_by_email'):
                     site['owner_exists'] = False
                     site['owner_status'] = 'No email provided'
+                    site['owner_upn'] = ''
                     orphaned_count += 1
             
             for future in as_completed(future_to_site):
@@ -592,20 +704,25 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                     result = future.result(timeout=30)
                     site['owner_exists'] = result.get('owner_exists', False)
                     site['owner_status'] = result.get('owner_status', 'Unknown')
+                    site['owner_upn'] = result.get('owner_upn', '')
                     
                     processed += 1
                     if not result.get('owner_exists', False):
                         orphaned_count += 1
                         owner_errors += 1 if 'Error' in result.get('owner_status', '') else 0
+                    elif 'search' in result.get('owner_status', '').lower():
+                        search_fallback_count += 1
                     
                     if processed % 10 == 0 or processed == 1:
                         print(f"  Progress: {processed}/{len(active_sites)} owner checks completed")
-                        print(f"    Orphaned sites found so far: {orphaned_count}")
+                        print(f"    Orphaned sites found: {orphaned_count}")
+                        print(f"    Found via search fallback: {search_fallback_count}")
                         
                 except Exception as e:
                     owner_errors += 1
                     site['owner_exists'] = False
                     site['owner_status'] = f'Error: {str(e)[:50]}'
+                    site['owner_upn'] = ''
                     orphaned_count += 1
                     print(f"  Warning: Error checking owner for {site.get('title', 'Unknown')}: {str(e)[:50]}")
         
@@ -613,6 +730,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
         print(f"\nOwner checking completed in {elapsed:.2f} seconds")
         print(f"  Total active sites checked: {processed + len([s for s in active_sites if not s.get('created_by_email')])}")
         print(f"  Orphaned sites found: {orphaned_count}")
+        print(f"  Users found via search fallback: {search_fallback_count}")
         if owner_errors > 0:
             print(f"  Errors: {owner_errors}")
     
@@ -628,7 +746,7 @@ def save_to_csv(sites, filename):
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
                 'ID', 'Time Deleted', 'Site Type', 'Is Deleted',
-                'Owner Email', 'Owner Exists', 'Owner Status',
+                'Owner Email', 'Owner Exists', 'Owner Status', 'Owner UPN',
                 'Title', 'Site URL', 'Site ID', 'Template Name',
                 'Storage Used (GB)', 'Storage Quota (GB)', 'Storage Used (%)',
                 'Created', 'Created By', 'Created By Email', 'Modified', 'Last Activity',
@@ -648,6 +766,7 @@ def save_to_csv(sites, filename):
                     'Owner Email': site.get('owner_email', ''),
                     'Owner Exists': 'Yes' if site.get('owner_exists', False) else 'No',
                     'Owner Status': site.get('owner_status', 'Not checked'),
+                    'Owner UPN': site.get('owner_upn', ''),
                     'Title': site['title'],
                     'Site URL': site['site_url'],
                     'Site ID': site['site_id'],
@@ -761,6 +880,7 @@ def main():
         total_files = sum(s['num_of_files'] for s in onedrive_sites)
         
         orphaned_sites = [s for s in active_sites if not s.get('owner_exists', True)]
+        search_found = [s for s in active_sites if 'search' in s.get('owner_status', '').lower() and s.get('owner_exists', False)]
         
         print(f"\n{'='*50}")
         print(f"ONEDRIVE SITES SUMMARY")
@@ -773,7 +893,8 @@ def main():
             print(f"\nOwner Status (Active Sites Only):")
             print(f"  Total active sites: {len(active_sites)}")
             print(f"  Orphaned sites (owner not found): {len(orphaned_sites)}")
-            if len(orphaned_sites) > 0:
+            print(f"  Found via search fallback: {len(search_found)}")
+            if len(active_sites) > 0:
                 print(f"  Percentage orphaned: {(len(orphaned_sites)/len(active_sites)*100):.2f}%")
         
         print(f"\nStorage Usage:")
@@ -828,24 +949,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-{
-    "tenant": "yourtenant.onmicrosoft.com",
-    "app_id": "your-app-id",
-    "cert_path": "cert.pem",
-    "key_path": "key.pem",
-    "sharepoint_admin_url": "https://yourtenant-admin.sharepoint.com",
-    "list_id": "317f59e4-b925-4d1c-884c-c758bf067a6c",
-    "page_size": 100,
-    "max_retries": 3,
-    "max_workers": 20,
-    "fetch_metadata": true,
-    "include_personal_sites": true,
-    "include_group_sites": false,
-    "skip_deleted_metadata": true,
-    "check_owner_exists": true
-}
