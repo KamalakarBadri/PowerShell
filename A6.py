@@ -30,25 +30,18 @@ class SharePointTokenManager:
         self.token_lock = Lock()
     
     def get_token(self):
-        """Get valid token, renew if expired or about to expire"""
         with self.token_lock:
             current_time = time.time()
-            
             if not self.token or current_time >= (self.token_expiry_time - self.refresh_buffer):
                 self._renew_token()
-            
             return self.token
     
     def _renew_token(self):
-        """Renew the access token"""
         print(f"  [Token] Renewing access token...")
-        
         scope = f"{self.sharepoint_admin_url}/.default"
         jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
         self.token = get_access_token(jwt, self.tenant_name, self.app_id, scope)
-        
         self.token_expiry_time = time.time() + 2700
-        
         print(f"  [Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
 
 class GraphTokenManager:
@@ -65,29 +58,21 @@ class GraphTokenManager:
         self.token_lock = Lock()
     
     def get_token(self):
-        """Get valid Graph token, renew if expired or about to expire"""
         with self.token_lock:
             current_time = time.time()
-            
             if not self.token or current_time >= (self.token_expiry_time - self.refresh_buffer):
                 self._renew_token()
-            
             return self.token
     
     def _renew_token(self):
-        """Renew the Graph access token"""
         print(f"  [Graph Token] Renewing access token...")
-        
         scope = "https://graph.microsoft.com/.default"
         jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
         self.token = get_graph_access_token(jwt, self.tenant_name, self.app_id)
-        
         self.token_expiry_time = time.time() + 2700
-        
         print(f"  [Graph Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
 
 def load_config(config_file="config.json"):
-    """Load configuration from JSON file"""
     try:
         with open(config_file, 'r') as f:
             config = json.load(f)
@@ -95,11 +80,12 @@ def load_config(config_file="config.json"):
         config.setdefault('page_size', 100)
         config.setdefault('max_retries', 3)
         config.setdefault('max_workers', 20)
-        config.setdefault('fetch_metadata', True)
-        config.setdefault('skip_deleted_metadata', True)
         config.setdefault('check_owner_exists', True)
         config.setdefault('fetch_manager', True)
         config.setdefault('master_report', True)
+        config.setdefault('track_archive_status', True)
+        config.setdefault('track_deletion_status', True)
+        config.setdefault('track_user_status', True)
         
         return config
     except FileNotFoundError:
@@ -116,11 +102,12 @@ def load_config(config_file="config.json"):
     "page_size": 100,
     "max_retries": 3,
     "max_workers": 20,
-    "fetch_metadata": true,
-    "skip_deleted_metadata": true,
     "check_owner_exists": true,
     "fetch_manager": true,
-    "master_report": true
+    "master_report": true,
+    "track_archive_status": true,
+    "track_deletion_status": true,
+    "track_user_status": true
 }
         """)
         raise
@@ -129,21 +116,17 @@ def load_config(config_file="config.json"):
         raise
 
 def load_certificate_and_key(certificate_path, private_key_path):
-    """Load certificate and private key from PEM files"""
     try:
         with open(certificate_path, "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
-
         with open(private_key_path, "rb") as key_file:
             private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-
         return certificate, private_key
     except Exception as e:
         print(f"Error loading certificate or private key: {str(e)}")
         raise
 
 def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
-    """Generate JWT token using certificate and private key"""
     try:
         now = int(time.time())
         expiration = now + 300
@@ -151,12 +134,7 @@ def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
         thumbprint = certificate.fingerprint(hashes.SHA1())
         x5t = base64.urlsafe_b64encode(thumbprint).decode('utf-8').replace('=', '')
         
-        jwt_header = {
-            "alg": "RS256",
-            "typ": "JWT",
-            "x5t": x5t
-        }
-        
+        jwt_header = {"alg": "RS256", "typ": "JWT", "x5t": x5t}
         jwt_payload = {
             "aud": f"https://login.microsoftonline.com/{tenant_name}/oauth2/v2.0/token",
             "exp": expiration,
@@ -166,38 +144,21 @@ def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
             "sub": app_id
         }
         
-        encoded_header = base64.urlsafe_b64encode(
-            json.dumps(jwt_header, separators=(',', ':')).encode('utf-8')
-        ).decode('utf-8').replace('=', '')
-        
-        encoded_payload = base64.urlsafe_b64encode(
-            json.dumps(jwt_payload, separators=(',', ':')).encode('utf-8')
-        ).decode('utf-8').replace('=', '')
-        
+        encoded_header = base64.urlsafe_b64encode(json.dumps(jwt_header, separators=(',', ':')).encode('utf-8')).decode('utf-8').replace('=', '')
+        encoded_payload = base64.urlsafe_b64encode(json.dumps(jwt_payload, separators=(',', ':')).encode('utf-8')).decode('utf-8').replace('=', '')
         jwt_unsigned = f"{encoded_header}.{encoded_payload}"
         
-        signature = private_key.sign(
-            jwt_unsigned.encode('utf-8'),
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
+        signature = private_key.sign(jwt_unsigned.encode('utf-8'), padding.PKCS1v15(), hashes.SHA256())
         encoded_signature = base64.urlsafe_b64encode(signature).decode('utf-8').replace('=', '')
         
-        jwt = f"{jwt_unsigned}.{encoded_signature}"
-        
-        return jwt
+        return f"{jwt_unsigned}.{encoded_signature}"
     except Exception as e:
         print(f"Error generating JWT: {str(e)}")
         raise
 
 def get_access_token(jwt, tenant_name, app_id, scope):
-    """Get SharePoint access token from Microsoft Identity Platform"""
     url = f"https://login.microsoftonline.com/{tenant_name}/oauth2/v2.0/token"
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {
         "client_id": app_id,
         "client_assertion": jwt,
@@ -205,7 +166,6 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         "scope": scope,
         "grant_type": "client_credentials"
     }
-    
     try:
         response = requests.post(url, headers=headers, data=data)
         response.raise_for_status()
@@ -215,13 +175,8 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         raise
 
 def get_graph_access_token(jwt, tenant_name, app_id):
-    """Get Microsoft Graph access token"""
     url = f"https://login.microsoftonline.com/{tenant_name}/oauth2/v2.0/token"
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {
         "client_id": app_id,
         "client_assertion": jwt,
@@ -229,7 +184,6 @@ def get_graph_access_token(jwt, tenant_name, app_id):
         "scope": "https://graph.microsoft.com/.default",
         "grant_type": "client_credentials"
     }
-    
     try:
         response = requests.post(url, headers=headers, data=data)
         response.raise_for_status()
@@ -239,7 +193,6 @@ def get_graph_access_token(jwt, tenant_name, app_id):
         raise
 
 def make_sharepoint_request(token_manager, endpoint, max_retries=3):
-    """Make SharePoint request with automatic token renewal on 401 error"""
     for attempt in range(max_retries):
         try:
             headers = {
@@ -247,7 +200,6 @@ def make_sharepoint_request(token_manager, endpoint, max_retries=3):
                 "Accept": "application/json",
                 "Content-Type": "application/json"
             }
-            
             response = requests.get(endpoint, headers=headers, timeout=30)
             
             if response.status_code == 401:
@@ -275,15 +227,13 @@ def make_sharepoint_request(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
-def get_user_deleted_time(graph_token_manager, user_id, max_retries=3):
-    """
-    Get the deleted time of a user from the deleted items
-    """
-    if not user_id:
-        return None, "No user ID provided"
+def get_user_by_email_filter(graph_token_manager, user_email, max_retries=3):
+    if not user_email:
+        return None, "No email provided"
     
     try:
-        endpoint = f"https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user/{user_id}/deletedDateTime"
+        encoded_email = requests.utils.quote(user_email)
+        endpoint = f"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{encoded_email}'&$select=id,userPrincipalName,displayName,mail,accountEnabled,userType"
         
         for attempt in range(max_retries):
             try:
@@ -292,7 +242,6 @@ def get_user_deleted_time(graph_token_manager, user_id, max_retries=3):
                     "Accept": "application/json",
                     "Content-Type": "application/json"
                 }
-                
                 response = requests.get(endpoint, headers=headers, timeout=30)
                 
                 if response.status_code == 401:
@@ -300,17 +249,22 @@ def get_user_deleted_time(graph_token_manager, user_id, max_retries=3):
                     graph_token_manager._renew_token()
                     continue
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    deleted_time = data.get('value', '')
-                    return deleted_time, f"Deleted at: {deleted_time}"
-                elif response.status_code == 404:
-                    return None, "User not in deleted items or already restored"
+                response.raise_for_status()
+                data = response.json()
+                value = data.get('value', [])
+                if value and len(value) > 0:
+                    user = value[0]
+                    return {
+                        'upn': user.get('userPrincipalName', ''),
+                        'mail': user.get('mail', user_email),
+                        'display_name': user.get('displayName', ''),
+                        'id': user.get('id', ''),
+                        'account_enabled': user.get('accountEnabled', False),
+                        'user_type': user.get('userType', ''),
+                        'status': 'Enabled' if user.get('accountEnabled', False) else 'Disabled'
+                    }, f"Found: {user.get('displayName', '')} ({user.get('userPrincipalName', '')})"
                 else:
-                    if attempt < max_retries - 1:
-                        time.sleep(1)
-                        continue
-                    return None, f"HTTP {response.status_code}"
+                    return None, "User not found"
                     
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
@@ -324,19 +278,14 @@ def get_user_deleted_time(graph_token_manager, user_id, max_retries=3):
                 return None, f"Error: {str(e)[:100]}"
         
         return None, "Max retries exceeded"
-        
     except Exception as e:
         return None, f"Error: {str(e)[:100]}"
 
 def check_user_in_deleted(graph_token_manager, user_email, max_retries=3):
-    """
-    Check if a user is in the deleted users list and get their deletion time
-    """
-    if not user_email or user_email == '':
+    if not user_email:
         return None, None, "No email provided"
     
     try:
-        # URL encode the email for the filter
         encoded_email = requests.utils.quote(user_email)
         endpoint = f"https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user?$filter=mail eq '{encoded_email}'&$select=id,userPrincipalName,displayName,mail"
         
@@ -347,7 +296,6 @@ def check_user_in_deleted(graph_token_manager, user_email, max_retries=3):
                     "Accept": "application/json",
                     "Content-Type": "application/json"
                 }
-                
                 response = requests.get(endpoint, headers=headers, timeout=30)
                 
                 if response.status_code == 401:
@@ -357,24 +305,26 @@ def check_user_in_deleted(graph_token_manager, user_email, max_retries=3):
                 
                 response.raise_for_status()
                 data = response.json()
-                
-                # Check if we got any results
                 value = data.get('value', [])
                 if value and len(value) > 0:
                     user = value[0]
                     user_id = user.get('id', '')
                     
-                    # Now get the deleted time
-                    deleted_time, time_status = get_user_deleted_time(graph_token_manager, user_id, max_retries)
+                    # Get deletion time
+                    deleted_time_endpoint = f"https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user/{user_id}/deletedDateTime"
+                    time_response = requests.get(deleted_time_endpoint, headers=headers, timeout=30)
+                    deleted_time = ""
+                    if time_response.status_code == 200:
+                        deleted_time = time_response.json().get('value', '')
                     
                     return {
                         'id': user_id,
                         'userPrincipalName': user.get('userPrincipalName', ''),
                         'displayName': user.get('displayName', ''),
                         'mail': user.get('mail', '')
-                    }, deleted_time, f"User found in deleted items (Deleted: {deleted_time if deleted_time else 'Unknown'})"
+                    }, deleted_time, "Deleted user"
                 else:
-                    return None, None, "User not in deleted items"
+                    return None, None, "Not in deleted"
                     
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
@@ -388,83 +338,10 @@ def check_user_in_deleted(graph_token_manager, user_email, max_retries=3):
                 return None, None, f"Error: {str(e)[:100]}"
         
         return None, None, "Max retries exceeded"
-        
     except Exception as e:
         return None, None, f"Error: {str(e)[:100]}"
 
-def get_user_by_email_filter(graph_token_manager, user_email, max_retries=3):
-    """
-    Get user by email using Graph API filter: /users?$filter=mail eq 'email'
-    Returns user details including UPN and account status
-    """
-    if not user_email or user_email == '':
-        return None, "No email provided"
-    
-    try:
-        # URL encode the email for the filter
-        encoded_email = requests.utils.quote(user_email)
-        endpoint = f"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{encoded_email}'&$select=id,userPrincipalName,displayName,mail,accountEnabled,userType"
-        
-        for attempt in range(max_retries):
-            try:
-                headers = {
-                    "Authorization": f"Bearer {graph_token_manager.get_token()}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json"
-                }
-                
-                response = requests.get(endpoint, headers=headers, timeout=30)
-                
-                if response.status_code == 401:
-                    print(f"  [Graph Auth] Token expired, renewing... (Attempt {attempt + 1}/{max_retries})")
-                    graph_token_manager._renew_token()
-                    continue
-                
-                response.raise_for_status()
-                data = response.json()
-                
-                # Check if we got any results
-                value = data.get('value', [])
-                if value and len(value) > 0:
-                    user = value[0]  # Take the first match
-                    upn = user.get('userPrincipalName', '')
-                    mail = user.get('mail', user_email)
-                    display_name = user.get('displayName', '')
-                    account_enabled = user.get('accountEnabled', False)
-                    user_type = user.get('userType', '')
-                    
-                    return {
-                        'upn': upn,
-                        'mail': mail,
-                        'display_name': display_name,
-                        'id': user.get('id', ''),
-                        'account_enabled': account_enabled,
-                        'user_type': user_type,
-                        'status': 'Enabled' if account_enabled else 'Disabled'
-                    }, f"Found: {display_name} ({upn}) - Status: {'Enabled' if account_enabled else 'Disabled'}"
-                else:
-                    return None, "User not found with filter"
-                    
-            except requests.exceptions.Timeout:
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return None, "Timeout"
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return None, f"Error: {str(e)[:100]}"
-        
-        return None, "Max retries exceeded"
-        
-    except Exception as e:
-        return None, f"Error: {str(e)[:100]}"
-
 def get_user_manager(graph_token_manager, user_id, max_retries=3):
-    """
-    Get the manager of a user using Graph API
-    """
     if not user_id:
         return None, "No user ID provided"
     
@@ -478,7 +355,6 @@ def get_user_manager(graph_token_manager, user_id, max_retries=3):
                     "Accept": "application/json",
                     "Content-Type": "application/json"
                 }
-                
                 response = requests.get(endpoint, headers=headers, timeout=30)
                 
                 if response.status_code == 401:
@@ -488,16 +364,11 @@ def get_user_manager(graph_token_manager, user_id, max_retries=3):
                 
                 if response.status_code == 200:
                     manager_data = response.json()
-                    manager_upn = manager_data.get('userPrincipalName', '')
-                    manager_mail = manager_data.get('mail', '')
-                    manager_display = manager_data.get('displayName', '')
-                    
                     return {
-                        'upn': manager_upn,
-                        'mail': manager_mail,
-                        'display_name': manager_display,
-                        'status': 'Found'
-                    }, f"Manager: {manager_display} ({manager_upn})"
+                        'upn': manager_data.get('userPrincipalName', ''),
+                        'mail': manager_data.get('mail', ''),
+                        'display_name': manager_data.get('displayName', '')
+                    }, "Found"
                 elif response.status_code == 404:
                     return None, "No manager assigned"
                 else:
@@ -518,234 +389,73 @@ def get_user_manager(graph_token_manager, user_id, max_retries=3):
                 return None, f"Error: {str(e)[:100]}"
         
         return None, "Max retries exceeded"
-        
     except Exception as e:
         return None, f"Error: {str(e)[:100]}"
 
-def check_user_and_manager(graph_token_manager, user_email, max_retries=3, fetch_manager=True):
-    """
-    Check if a user exists, their status (enabled/disabled), and if they're in deleted users
-    Uses filter method to find user by email
-    """
-    if not user_email or user_email == '':
+def check_user_status(graph_token_manager, user_email, max_retries=3):
+    """Check user status - returns current status and if it's a deleted user"""
+    if not user_email:
         return {
-            'owner_exists': False,
-            'owner_status': 'No email provided',
-            'owner_upn': '',
-            'owner_mail': '',
-            'owner_display_name': '',
-            'account_status': 'Not Found',
-            'user_type': '',
-            'is_deleted_user': False,
-            'deleted_time': '',
-            'manager_upn': '',
-            'manager_mail': '',
-            'manager_display_name': '',
-            'manager_status': 'No email provided'
+            'exists': False,
+            'status': 'No email',
+            'upn': '',
+            'mail': '',
+            'display_name': '',
+            'is_deleted': False,
+            'deleted_time': ''
         }
     
-    # First, try to find user using filter
+    # Try to find user
     user_data, status = get_user_by_email_filter(graph_token_manager, user_email, max_retries)
     
-    if not user_data:
-        # Try alternative approach: search by userPrincipalName if mail doesn't work
-        if '@' in user_email:
-            # Try direct lookup by UPN
-            try:
-                encoded_upn = requests.utils.quote(user_email)
-                endpoint = f"https://graph.microsoft.com/v1.0/users/{encoded_upn}"
-                
-                headers = {
-                    "Authorization": f"Bearer {graph_token_manager.get_token()}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json"
-                }
-                
-                response = requests.get(endpoint, headers=headers, timeout=30)
-                
-                if response.status_code == 200:
-                    user_data_direct = response.json()
-                    user_data = {
-                        'upn': user_data_direct.get('userPrincipalName', user_email),
-                        'mail': user_data_direct.get('mail', user_email),
-                        'display_name': user_data_direct.get('displayName', ''),
-                        'id': user_data_direct.get('id', ''),
-                        'account_enabled': user_data_direct.get('accountEnabled', False),
-                        'user_type': user_data_direct.get('userType', ''),
-                        'status': 'Enabled' if user_data_direct.get('accountEnabled', False) else 'Disabled'
-                    }
-                    status = f"Found via UPN: {user_data['display_name']} ({user_data['upn']}) - Status: {user_data['status']}"
-                else:
-                    # Check if user is in deleted items
-                    deleted_user, deleted_time, deleted_status = check_user_in_deleted(graph_token_manager, user_email, max_retries)
-                    if deleted_user:
-                        return {
-                            'owner_exists': False,
-                            'owner_status': 'User is in deleted items',
-                            'owner_upn': deleted_user.get('userPrincipalName', ''),
-                            'owner_mail': deleted_user.get('mail', user_email),
-                            'owner_display_name': deleted_user.get('displayName', ''),
-                            'account_status': 'Deleted',
-                            'user_type': 'Deleted',
-                            'is_deleted_user': True,
-                            'deleted_time': deleted_time if deleted_time else 'Unknown',
-                            'manager_upn': '',
-                            'manager_mail': '',
-                            'manager_display_name': '',
-                            'manager_status': 'User is deleted'
-                        }
-                    else:
-                        return {
-                            'owner_exists': False,
-                            'owner_status': 'User not found in active directory or deleted items',
-                            'owner_upn': '',
-                            'owner_mail': user_email,
-                            'owner_display_name': '',
-                            'account_status': 'Not Found',
-                            'user_type': 'Not Found',
-                            'is_deleted_user': False,
-                            'deleted_time': '',
-                            'manager_upn': '',
-                            'manager_mail': '',
-                            'manager_display_name': '',
-                            'manager_status': 'User not found'
-                        }
-            except Exception as e:
-                # Check if user is in deleted items
-                deleted_user, deleted_time, deleted_status = check_user_in_deleted(graph_token_manager, user_email, max_retries)
-                if deleted_user:
-                    return {
-                        'owner_exists': False,
-                        'owner_status': 'User is in deleted items',
-                        'owner_upn': deleted_user.get('userPrincipalName', ''),
-                        'owner_mail': deleted_user.get('mail', user_email),
-                        'owner_display_name': deleted_user.get('displayName', ''),
-                        'account_status': 'Deleted',
-                        'user_type': 'Deleted',
-                        'is_deleted_user': True,
-                        'deleted_time': deleted_time if deleted_time else 'Unknown',
-                        'manager_upn': '',
-                        'manager_mail': '',
-                        'manager_display_name': '',
-                        'manager_status': 'User is deleted'
-                    }
-                else:
-                    return {
-                        'owner_exists': False,
-                        'owner_status': 'User not found in active directory or deleted items',
-                        'owner_upn': '',
-                        'owner_mail': user_email,
-                        'owner_display_name': '',
-                        'account_status': 'Not Found',
-                        'user_type': 'Not Found',
-                        'is_deleted_user': False,
-                        'deleted_time': '',
-                        'manager_upn': '',
-                        'manager_mail': '',
-                        'manager_display_name': '',
-                        'manager_status': 'User not found'
-                    }
-        else:
-            # Check if user is in deleted items
-            deleted_user, deleted_time, deleted_status = check_user_in_deleted(graph_token_manager, user_email, max_retries)
-            if deleted_user:
-                return {
-                    'owner_exists': False,
-                    'owner_status': 'User is in deleted items',
-                    'owner_upn': deleted_user.get('userPrincipalName', ''),
-                    'owner_mail': deleted_user.get('mail', user_email),
-                    'owner_display_name': deleted_user.get('displayName', ''),
-                    'account_status': 'Deleted',
-                    'user_type': 'Deleted',
-                    'is_deleted_user': True,
-                    'deleted_time': deleted_time if deleted_time else 'Unknown',
-                    'manager_upn': '',
-                    'manager_mail': '',
-                    'manager_display_name': '',
-                    'manager_status': 'User is deleted'
-                }
-            else:
-                return {
-                    'owner_exists': False,
-                    'owner_status': 'User not found in active directory or deleted items',
-                    'owner_upn': '',
-                    'owner_mail': user_email,
-                    'owner_display_name': '',
-                    'account_status': 'Not Found',
-                    'user_type': 'Not Found',
-                    'is_deleted_user': False,
-                    'deleted_time': '',
-                    'manager_upn': '',
-                    'manager_mail': '',
-                    'manager_display_name': '',
-                    'manager_status': 'User not found'
-                }
+    if user_data:
+        return {
+            'exists': True,
+            'status': user_data.get('status', 'Unknown'),
+            'upn': user_data.get('upn', ''),
+            'mail': user_data.get('mail', user_email),
+            'display_name': user_data.get('display_name', ''),
+            'user_type': user_data.get('user_type', ''),
+            'is_deleted': False,
+            'deleted_time': ''
+        }
     
-    # User found, now get manager if requested
-    manager_data = None
-    manager_status = 'Not fetched'
-    
-    if fetch_manager and user_data.get('id'):
-        manager_data, manager_status = get_user_manager(graph_token_manager, user_data['id'], max_retries)
-    
-    # Determine proper manager status
-    if manager_data:
-        manager_status = 'Found'
-    elif manager_data is None and manager_status == 'No manager assigned':
-        manager_status = 'No manager assigned'
-    elif manager_data is None and 'Error' in manager_status:
-        manager_status = 'Error fetching manager'
-    elif manager_data is None:
-        manager_status = 'Not found'
+    # Check deleted users
+    deleted_user, deleted_time, _ = check_user_in_deleted(graph_token_manager, user_email, max_retries)
+    if deleted_user:
+        return {
+            'exists': False,
+            'status': 'Deleted',
+            'upn': deleted_user.get('userPrincipalName', ''),
+            'mail': deleted_user.get('mail', user_email),
+            'display_name': deleted_user.get('displayName', ''),
+            'user_type': 'Deleted',
+            'is_deleted': True,
+            'deleted_time': deleted_time
+        }
     
     return {
-        'owner_exists': True,
-        'owner_status': 'Found',
-        'owner_upn': user_data.get('upn', ''),
-        'owner_mail': user_data.get('mail', user_email),
-        'owner_display_name': user_data.get('display_name', ''),
-        'account_status': user_data.get('status', 'Unknown'),
-        'user_type': user_data.get('user_type', ''),
-        'is_deleted_user': False,
-        'deleted_time': '',
-        'manager_upn': manager_data.get('upn', '') if manager_data else '',
-        'manager_mail': manager_data.get('mail', '') if manager_data else '',
-        'manager_display_name': manager_data.get('display_name', '') if manager_data else '',
-        'manager_status': manager_status
+        'exists': False,
+        'status': 'Not Found',
+        'upn': '',
+        'mail': user_email,
+        'display_name': '',
+        'user_type': '',
+        'is_deleted': False,
+        'deleted_time': ''
     }
 
 def is_onedrive_site(site_url):
-    """
-    Identify OneDrive sites specifically by the URL pattern:
-    my.sharepoint.com/personal
-    """
     if not site_url:
         return False
-    
     site_url_lower = site_url.lower()
-    
-    # Check for the specific OneDrive URL pattern
-    if 'my.sharepoint.com/personal' in site_url_lower:
-        return True
-    
-    # Also check for alternative patterns just in case
-    if 'my.sharepoint.com' in site_url_lower and '/personal/' in site_url_lower:
-        return True
-    
-    return False
+    return 'my.sharepoint.com/personal' in site_url_lower
 
 def should_include_site(site_url, config):
-    """Determine if a site should be included based on URL pattern"""
-    # Only include sites that match the OneDrive URL pattern
     return is_onedrive_site(site_url)
 
-def check_owner_and_manager(graph_token_manager, user_email, max_retries=3, fetch_manager=True):
-    """Wrapper function for parallel owner and manager checking"""
-    result = check_user_and_manager(graph_token_manager, user_email, max_retries, fetch_manager)
-    return result
-
 def load_existing_master_report(master_file):
-    """Load existing master report to preserve history"""
+    """Load existing master report with all historical data"""
     if not os.path.exists(master_file):
         return {}, []
     
@@ -764,204 +474,306 @@ def load_existing_master_report(master_file):
         print(f"Warning: Could not load master report: {str(e)}")
         return {}, []
 
+def update_change_history(existing_row, current_value, field_name, new_value, changes):
+    """
+    Update change history for a specific field
+    Returns: updated change_history string
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Get existing history
+    history_field = f"{field_name}_history"
+    old_history = existing_row.get(history_field, '') if existing_row else ''
+    
+    # Get old value
+    old_value = existing_row.get(field_name, '') if existing_row else ''
+    
+    # Only update if value actually changed
+    if str(old_value) != str(new_value) and new_value:
+        change_entry = f"[{timestamp}] {old_value} → {new_value}"
+        if old_history:
+            new_history = f"{old_history} | {change_entry}"
+        else:
+            new_history = change_entry
+        
+        # Track the change for summary
+        changes.append({
+            'site_url': existing_row.get('Site URL', ''),
+            'field': field_name,
+            'old_value': old_value,
+            'new_value': new_value,
+            'timestamp': timestamp
+        })
+        
+        return new_history
+    
+    return old_history
+
 def update_master_report(current_sites, master_file, config):
-    """
-    Update master report with current data while preserving history
-    """
+    """Update master report preserving all historical data"""
     # Load existing master report
     existing_sites, existing_urls = load_existing_master_report(master_file)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today = datetime.now().strftime("%Y-%m-%d")
     
-    # Create a mapping of current sites by URL
-    current_sites_map = {site['site_url']: site for site in current_sites}
-    current_urls = set(current_sites_map.keys())
-    
-    # Track changes
-    changes = {
-        'new': [],
-        'removed': [],
-        'status_changed': [],
-        'manager_changed': []
-    }
+    # Track changes for summary
+    all_changes = []
     
     # Prepare data for master report
     master_data = []
+    current_urls = set()
     
     # Process current sites
     for site in current_sites:
         site_url = site['site_url']
+        current_urls.add(site_url)
         
-        # Check if this is a new site (not in existing master)
-        if site_url not in existing_sites:
-            changes['new'].append(site)
+        # Get existing data if available
+        existing_row = existing_sites.get(site_url, {})
         
-        # Check for status changes
-        if site_url in existing_sites:
-            prev = existing_sites[site_url]
-            
-            # Check account status change
-            current_status = site.get('account_status', 'Unknown')
-            prev_status = prev.get('User Account Status', 'Unknown')
-            if current_status != prev_status:
-                changes['status_changed'].append({
-                    'site': site,
-                    'old_status': prev_status,
-                    'new_status': current_status
-                })
-            
-            # Check manager change
-            current_manager = site.get('manager_upn', '')
-            prev_manager = prev.get('Manager UPN', '')
-            if current_manager != prev_manager:
-                changes['manager_changed'].append({
-                    'site': site,
-                    'old_manager': prev_manager,
-                    'new_manager': current_manager
-                })
+        # Build the updated row with history preservation
+        row = {
+            'Site URL': site_url,
+            'Title': site.get('title', existing_row.get('Title', '')),
+            'Site ID': site.get('site_id', existing_row.get('Site ID', '')),
+            'Template Name': site.get('template_name', existing_row.get('Template Name', '')),
+            'Owner Email': site.get('owner_email', existing_row.get('Owner Email', '')),
+            'Created On': site.get('time_created', existing_row.get('Created On', '')),
+            'Storage Used (GB)': site.get('storage_used_gb', existing_row.get('Storage Used (GB)', 0)),
+            'Storage Quota (GB)': site.get('storage_quota_gb', existing_row.get('Storage Quota (GB)', 0)),
+            'Last Updated': current_time
+        }
         
-        # Add site to master data
-        master_data.append({
-            'Site URL': site.get('site_url', ''),
-            'User UPN': site.get('owner_upn', ''),
-            'User Email': site.get('owner_mail', site.get('owner_email', '')),
-            'User Display Name': site.get('owner_display_name', ''),
-            'User Account Status': site.get('account_status', 'Not Checked'),
-            'User Type': site.get('user_type', ''),
-            'Is Deleted User': 'Yes' if site.get('is_deleted_user', False) else 'No',
-            'User Deleted Time': site.get('deleted_time', ''),
-            'Manager UPN': site.get('manager_upn', ''),
-            'Manager Email': site.get('manager_mail', ''),
-            'Manager Display Name': site.get('manager_display_name', ''),
-            'Manager Status': site.get('manager_status', 'Not fetched'),
-            'Owner Status': site.get('owner_status', 'Not checked'),
-            'Created On': site.get('time_created', ''),
-            'Deleted On': site.get('time_deleted', ''),
-            'Archive Status': site.get('archive_status', ''),
-            'Title': site.get('title', ''),
-            'Site ID': site.get('site_id', ''),
-            'Template Name': site.get('template_name', ''),
-            'Storage Used (GB)': site.get('storage_used_gb', 0),
-            'Storage Quota (GB)': site.get('storage_quota_gb', 0),
-            'Storage Used (%)': round(site.get('storage_used_percentage', 0), 4),
-            'Created By': site.get('created_by', ''),
-            'Created By Email': site.get('created_by_email', ''),
-            'Time Created': site.get('time_created', ''),
-            'Last Updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+        # ===== TRACK DELETION STATUS =====
+        new_deleted_on = site.get('time_deleted', '')
+        old_deleted_on = existing_row.get('Deleted On', '')
+        
+        # If site was deleted, update Deleted On
+        if new_deleted_on and not old_deleted_on:
+            row['Deleted On'] = new_deleted_on
+            row['deleted_on_history'] = update_change_history(
+                existing_row, 'Deleted On', 'deleted_on',
+                f"Site deleted on {new_deleted_on}", all_changes
+            )
+        elif old_deleted_on and not new_deleted_on:
+            # Site was restored
+            row['Deleted On'] = ''
+            row['deleted_on_history'] = update_change_history(
+                existing_row, 'Deleted On', 'deleted_on',
+                "Site restored", all_changes
+            )
+        else:
+            row['Deleted On'] = old_deleted_on
+            row['deleted_on_history'] = existing_row.get('deleted_on_history', '')
+        
+        # ===== TRACK ARCHIVE STATUS =====
+        new_archive_status = site.get('archive_status', '')
+        old_archive_status = existing_row.get('Archive Status', '')
+        
+        if new_archive_status != old_archive_status:
+            row['Archive Status'] = new_archive_status
+            row['archive_status_history'] = update_change_history(
+                existing_row, 'Archive Status', 'archive_status',
+                f"Changed from '{old_archive_status}' to '{new_archive_status}'", all_changes
+            )
+        else:
+            row['Archive Status'] = old_archive_status
+            row['archive_status_history'] = existing_row.get('archive_status_history', '')
+        
+        # ===== TRACK USER STATUS =====
+        user_info = site.get('user_info', {})
+        new_status = user_info.get('status', 'Not Found')
+        old_status = existing_row.get('User Account Status', '')
+        
+        if new_status != old_status and new_status:
+            row['User Account Status'] = new_status
+            row['user_status_history'] = update_change_history(
+                existing_row, 'User Account Status', 'user_status',
+                f"{old_status} → {new_status}", all_changes
+            )
+        else:
+            row['User Account Status'] = old_status or new_status
+            row['user_status_history'] = existing_row.get('user_status_history', '')
+        
+        # User UPN - preserve if not found
+        new_upn = user_info.get('upn', '')
+        old_upn = existing_row.get('User UPN', '')
+        if new_upn:
+            row['User UPN'] = new_upn
+        else:
+            row['User UPN'] = old_upn  # Keep historical UPN
+        
+        # User Email - preserve if not found
+        new_mail = user_info.get('mail', site.get('owner_email', ''))
+        old_mail = existing_row.get('User Email', '')
+        if new_mail:
+            row['User Email'] = new_mail
+        else:
+            row['User Email'] = old_mail
+        
+        # User Display Name - preserve if not found
+        new_display = user_info.get('display_name', '')
+        old_display = existing_row.get('User Display Name', '')
+        if new_display:
+            row['User Display Name'] = new_display
+        else:
+            row['User Display Name'] = old_display
+        
+        # User Type
+        new_user_type = user_info.get('user_type', '')
+        old_user_type = existing_row.get('User Type', '')
+        row['User Type'] = new_user_type if new_user_type else old_user_type
+        
+        # Is Deleted User
+        row['Is Deleted User'] = 'Yes' if user_info.get('is_deleted', False) else 'No'
+        
+        # User Deleted Time
+        new_deleted_time = user_info.get('deleted_time', '')
+        if new_deleted_time:
+            row['User Deleted Time'] = new_deleted_time
+        else:
+            row['User Deleted Time'] = existing_row.get('User Deleted Time', '')
+        
+        # ===== TRACK MANAGER DETAILS =====
+        manager_info = site.get('manager_info', {})
+        new_manager_upn = manager_info.get('upn', '')
+        old_manager_upn = existing_row.get('Manager UPN', '')
+        
+        if new_manager_upn and new_manager_upn != old_manager_upn:
+            row['Manager UPN'] = new_manager_upn
+            row['manager_upn_history'] = update_change_history(
+                existing_row, 'Manager UPN', 'manager_upn',
+                f"{old_manager_upn} → {new_manager_upn}", all_changes
+            )
+        else:
+            row['Manager UPN'] = old_manager_upn or new_manager_upn
+            row['manager_upn_history'] = existing_row.get('manager_upn_history', '')
+        
+        # Manager Email - preserve if not found
+        new_manager_mail = manager_info.get('mail', '')
+        old_manager_mail = existing_row.get('Manager Email', '')
+        row['Manager Email'] = new_manager_mail if new_manager_mail else old_manager_mail
+        
+        # Manager Display Name - preserve if not found
+        new_manager_display = manager_info.get('display_name', '')
+        old_manager_display = existing_row.get('Manager Display Name', '')
+        row['Manager Display Name'] = new_manager_display if new_manager_display else old_manager_display
+        
+        # Manager Status
+        new_manager_status = manager_info.get('status', 'Not fetched')
+        old_manager_status = existing_row.get('Manager Status', '')
+        if new_manager_status != old_manager_status:
+            row['Manager Status'] = new_manager_status
+        else:
+            row['Manager Status'] = old_manager_status or new_manager_status
+        
+        # ===== OWNER STATUS =====
+        new_owner_exists = user_info.get('exists', False)
+        if new_owner_exists:
+            row['Owner Exists'] = 'Yes'
+            row['Owner Status'] = 'Found'
+        else:
+            row['Owner Exists'] = existing_row.get('Owner Exists', 'No')
+            row['Owner Status'] = user_info.get('status', 'Not Found')
+        
+        # ===== SUMMARY FIELD =====
+        # Create a summary of last change
+        if all_changes:
+            last_change = all_changes[-1]
+            row['Last Change Summary'] = f"{last_change['field']}: {last_change['old_value']} → {last_change['new_value']} ({last_change['timestamp']})"
+        else:
+            row['Last Change Summary'] = existing_row.get('Last Change Summary', 'No changes')
+        
+        master_data.append(row)
     
-    # Check for removed sites (in master but not in current)
+    # Check for removed sites - keep them in report but mark as removed
     for url in existing_urls:
         if url not in current_urls:
-            changes['removed'].append({
-                'site_url': url,
-                'title': existing_sites[url].get('Title', 'Unknown')
-            })
+            existing_row = existing_sites[url]
+            row = dict(existing_row)  # Copy existing data
+            row['Last Updated'] = current_time
+            row['Last Change Summary'] = f"Site removed from SharePoint list on {current_time}"
+            row['deleted_on_history'] = update_change_history(
+                existing_row, 'Deleted On', 'deleted_on',
+                f"Site removed from list on {current_time}", all_changes
+            )
+            master_data.append(row)
     
     # Write master report
     try:
+        fieldnames = [
+            'Site URL',
+            'Title',
+            'Site ID',
+            'Template Name',
+            'Owner Email',
+            'User UPN',
+            'User Email',
+            'User Display Name',
+            'User Account Status',
+            'User Type',
+            'Is Deleted User',
+            'User Deleted Time',
+            'Manager UPN',
+            'Manager Email',
+            'Manager Display Name',
+            'Manager Status',
+            'Owner Exists',
+            'Owner Status',
+            'Created On',
+            'Deleted On',
+            'Archive Status',
+            'Storage Used (GB)',
+            'Storage Quota (GB)',
+            'Last Updated',
+            'Last Change Summary',
+            'deleted_on_history',
+            'archive_status_history',
+            'user_status_history',
+            'manager_upn_history'
+        ]
+        
         with open(master_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = [
-                'Site URL',
-                'User UPN',
-                'User Email',
-                'User Display Name',
-                'User Account Status',
-                'User Type',
-                'Is Deleted User',
-                'User Deleted Time',
-                'Manager UPN',
-                'Manager Email',
-                'Manager Display Name',
-                'Manager Status',
-                'Owner Status',
-                'Created On',
-                'Deleted On',
-                'Archive Status',
-                'Title',
-                'Site ID',
-                'Template Name',
-                'Storage Used (GB)',
-                'Storage Quota (GB)',
-                'Storage Used (%)',
-                'Created By',
-                'Created By Email',
-                'Time Created',
-                'Last Updated'
-            ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
-            # Sort by storage used (descending)
-            master_data_sorted = sorted(master_data, key=lambda x: float(x.get('Storage Used (GB)', 0)), reverse=True)
-            
-            for row in master_data_sorted:
-                writer.writerow(row)
+            writer.writerows(master_data)
         
-        print(f"\nMaster report updated: {master_file}")
+        print(f"\n✅ Master report updated: {master_file}")
         
         # Print changes summary
-        if any(changes.values()):
-            print(f"\n{'='*50}")
-            print("CHANGES SUMMARY")
-            print(f"{'='*50}")
-            if changes['new']:
-                print(f"New sites added: {len(changes['new'])}")
-            if changes['removed']:
-                print(f"Sites removed: {len(changes['removed'])}")
-            if changes['status_changed']:
-                print(f"User status changes: {len(changes['status_changed'])}")
-            if changes['manager_changed']:
-                print(f"Manager changes: {len(changes['manager_changed'])}")
+        if all_changes:
+            print(f"\n{'='*60}")
+            print("📊 CHANGES SUMMARY")
+            print(f"{'='*60}")
+            print(f"Total changes detected: {len(all_changes)}")
             
-            # Save detailed changes to a separate file
-            changes_file = master_file.replace('.csv', '_changes.csv')
-            with open(changes_file, 'w', newline='', encoding='utf-8') as f:
-                f.write("CHANGES SUMMARY\n")
-                f.write("=" * 50 + "\n\n")
-                f.write(f"Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                
-                if changes['new']:
-                    f.write(f"NEW SITES ADDED ({len(changes['new'])}):\n")
-                    for site in changes['new']:
-                        f.write(f"  - {site.get('title', 'Unknown')} ({site.get('site_url', '')})\n")
-                        f.write(f"    Owner: {site.get('owner_upn', site.get('owner_email', 'Unknown'))}\n")
-                        f.write(f"    Status: {site.get('account_status', 'Unknown')}\n")
-                    f.write("\n")
-                
-                if changes['removed']:
-                    f.write(f"SITES REMOVED ({len(changes['removed'])}):\n")
-                    for site in changes['removed']:
-                        f.write(f"  - {site['title']} ({site['site_url']})\n")
-                    f.write("\n")
-                
-                if changes['status_changed']:
-                    f.write(f"USER STATUS CHANGES ({len(changes['status_changed'])}):\n")
-                    for change in changes['status_changed']:
-                        site = change['site']
-                        f.write(f"  - {site.get('title', 'Unknown')}: {change['old_status']} -> {change['new_status']}\n")
-                        f.write(f"    UPN: {site.get('owner_upn', site.get('owner_email', 'Unknown'))}\n")
-                    f.write("\n")
-                
-                if changes['manager_changed']:
-                    f.write(f"MANAGER CHANGES ({len(changes['manager_changed'])}):\n")
-                    for change in changes['manager_changed']:
-                        site = change['site']
-                        old = change['old_manager'] if change['old_manager'] else 'None'
-                        new = change['new_manager'] if change['new_manager'] else 'None'
-                        f.write(f"  - {site.get('title', 'Unknown')}: {old} -> {new}\n")
-                    f.write("\n")
+            # Group changes by type
+            change_types = {}
+            for change in all_changes:
+                field = change['field']
+                if field not in change_types:
+                    change_types[field] = []
+                change_types[field].append(change)
             
-            print(f"Detailed changes saved to: {changes_file}")
+            for field, changes in change_types.items():
+                print(f"\n{field.replace('_', ' ').title()} Changes: {len(changes)}")
+                for change in changes[:5]:  # Show first 5
+                    site_title = existing_sites.get(change['site_url'], {}).get('Title', change['site_url'])
+                    print(f"  • {site_title}: {change['old_value']} → {change['new_value']}")
+                if len(changes) > 5:
+                    print(f"  ... and {len(changes) - 5} more")
         
-        return changes
+        return all_changes
         
     except Exception as e:
         print(f"Error updating master report: {str(e)}")
         return None
 
-def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharepoint_admin_url, list_id, page_size=100, max_workers=20, fetch_metadata=True, config=None):
-    """Get OneDrive sites with metadata and owner validation"""
-    print(f"\n=== Retrieving OneDrive Sites from Admin List ===")
-    print(f"Filtering for OneDrive sites with URL pattern: my.sharepoint.com/personal")
+def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharepoint_admin_url, list_id, page_size=100, max_workers=20, config=None):
+    """Get OneDrive sites with owner and manager information"""
+    print(f"\n{'='*60}")
+    print("📁 FETCHING ONEDRIVE SITES")
+    print(f"{'='*60}")
     
     all_sites = []
     skipped_sites = 0
@@ -974,205 +786,142 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
     batch_count = 0
     total_sites = 0
     
-    print("Fetching site list...")
     while endpoint:
         batch_count += 1
         try:
             print(f"  Processing batch {batch_count}...")
             data = make_sharepoint_request(token_manager, endpoint)
-            
             current_batch = data.get('value', [])
             
             if not current_batch:
                 break
             
-            print(f"  Found {len(current_batch)} sites in this batch")
+            print(f"    Found {len(current_batch)} sites in this batch")
             
             for item in current_batch:
                 total_sites += 1
                 
                 site_url = item.get('SiteUrl', '')
-                template_name = item.get('TemplateName', '')
-                title = item.get('Title', '')
-                time_deleted = item.get('TimeDeleted', '')
-                created_by_email = item.get('CreatedByEmail', '')
                 
-                # Check if this is a OneDrive site by URL pattern
                 if should_include_site(site_url, config):
-                    is_deleted = bool(time_deleted)
-                    
                     site_info = {
-                        'id': item.get('Id', ''),
-                        'time_deleted': time_deleted,
-                        'title': title,
                         'site_url': site_url,
+                        'title': item.get('Title', ''),
                         'site_id': item.get('SiteId', ''),
-                        'template_name': template_name,
-                        'is_deleted': is_deleted,
-                        'owner_email': created_by_email,
-                        'owner_exists': 'Unknown',
-                        'owner_status': 'Not checked',
-                        'owner_upn': '',
-                        'owner_mail': '',
-                        'owner_display_name': '',
-                        'account_status': 'Not Checked',
-                        'user_type': '',
-                        'is_deleted_user': False,
-                        'deleted_time': '',
-                        'manager_upn': '',
-                        'manager_mail': '',
-                        'manager_display_name': '',
-                        'manager_status': 'Not fetched',
-                        'storage_quota_bytes': item.get('StorageQuota', 0),
-                        'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
-                        'storage_used_bytes': item.get('StorageUsed', 0),
-                        'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
-                        'storage_used_percentage': float(item.get('StorageUsedPercentage', '0')) * 100 if item.get('StorageUsedPercentage') else 0,
-                        'created': item.get('Created', ''),
-                        'created_by': item.get('CreatedBy', ''),
-                        'created_by_email': created_by_email,
-                        'state': item.get('State', 0),
+                        'template_name': item.get('TemplateName', ''),
+                        'owner_email': item.get('CreatedByEmail', ''),
                         'time_created': item.get('TimeCreated', ''),
-                        'archive_status': item.get('ArchiveStatus', '')
+                        'time_deleted': item.get('TimeDeleted', ''),
+                        'archive_status': item.get('ArchiveStatus', ''),
+                        'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
+                        'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
+                        'created_by': item.get('CreatedBy', ''),
+                        'created_by_email': item.get('CreatedByEmail', '')
                     }
-                    
                     all_sites.append(site_info)
                 else:
                     skipped_sites += 1
-                    if skipped_sites % 100 == 0:
-                        print(f"  Skipped {skipped_sites} non-OneDrive sites...")
             
             endpoint = data.get('odata.nextLink')
-            if endpoint:
-                print(f"  Next page available")
-            else:
-                print("  No more pages")
-                
         except Exception as e:
             print(f"Error processing batch {batch_count}: {str(e)}")
             break
     
-    print(f"\nTotal sites processed: {total_sites}")
-    print(f"  - OneDrive sites found: {len(all_sites)}")
-    print(f"  - Non-OneDrive sites skipped: {skipped_sites}")
+    print(f"\n📊 Total sites processed: {total_sites}")
+    print(f"  ✅ OneDrive sites found: {len(all_sites)}")
+    print(f"  ⏭️  Non-OneDrive sites skipped: {skipped_sites}")
     
-    # Check owner exists for all sites
+    # Check owner and manager for all sites
     if check_owner and all_sites:
-        print(f"\n=== Checking Owner Status for OneDrive Sites ===")
-        print(f"Checking owner existence for {len(all_sites)} OneDrive sites using Graph API...")
-        print(f"  - Using filter: /users?$filter=mail eq 'email'")
-        print(f"  - Checking if user is Enabled, Disabled, or in Deleted Users")
+        print(f"\n{'='*60}")
+        print("👤 CHECKING USER AND MANAGER INFORMATION")
+        print(f"{'='*60}")
+        print(f"Processing {len(all_sites)} OneDrive sites...")
+        print(f"  - Checking user status (Enabled/Disabled/Deleted/Not Found)")
         if fetch_manager:
             print(f"  - Fetching manager for each user")
         
         processed = 0
-        owner_errors = 0
-        orphaned_count = 0
-        found_count = 0
-        enabled_count = 0
-        disabled_count = 0
-        deleted_user_count = 0
-        manager_found_count = 0
-        
         start_time = time.time()
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Check all sites for owner status
-            future_to_site = {
-                executor.submit(check_owner_and_manager, graph_token_manager, site.get('owner_email', ''), 3, fetch_manager): site
-                for site in all_sites if site.get('owner_email')
+            def process_site(site):
+                owner_email = site.get('owner_email', '')
+                
+                # Check user status
+                user_info = check_user_status(graph_token_manager, owner_email)
+                site['user_info'] = user_info
+                
+                # Get manager if user exists and manager fetch is enabled
+                if fetch_manager and user_info.get('exists', False):
+                    # We need user ID to get manager
+                    user_data, _ = get_user_by_email_filter(graph_token_manager, owner_email, 2)
+                    if user_data and user_data.get('id'):
+                        manager_data, manager_status = get_user_manager(graph_token_manager, user_data.get('id'), 2)
+                        if manager_data:
+                            site['manager_info'] = {
+                                'upn': manager_data.get('upn', ''),
+                                'mail': manager_data.get('mail', ''),
+                                'display_name': manager_data.get('display_name', ''),
+                                'status': 'Found'
+                            }
+                        else:
+                            site['manager_info'] = {
+                                'upn': '',
+                                'mail': '',
+                                'display_name': '',
+                                'status': manager_status if manager_status else 'No manager assigned'
+                            }
+                    else:
+                        site['manager_info'] = {
+                            'upn': '',
+                            'mail': '',
+                            'display_name': '',
+                            'status': 'User not found'
+                        }
+                else:
+                    site['manager_info'] = {
+                        'upn': '',
+                        'mail': '',
+                        'display_name': '',
+                        'status': 'Not fetched'
+                    }
+                
+                return site
+            
+            futures = {
+                executor.submit(process_site, site): site
+                for site in all_sites
             }
             
-            for site in all_sites:
-                if not site.get('owner_email'):
-                    site['owner_exists'] = False
-                    site['owner_status'] = 'No email provided'
-                    site['owner_upn'] = ''
-                    site['owner_mail'] = ''
-                    site['owner_display_name'] = ''
-                    site['account_status'] = 'Not Found'
-                    site['user_type'] = ''
-                    site['is_deleted_user'] = False
-                    site['deleted_time'] = ''
-                    site['manager_upn'] = ''
-                    site['manager_mail'] = ''
-                    site['manager_display_name'] = ''
-                    site['manager_status'] = 'No email provided'
-                    orphaned_count += 1
-            
-            for future in as_completed(future_to_site):
-                site = future_to_site[future]
+            for future in as_completed(futures):
                 try:
-                    result = future.result(timeout=30)
-                    site['owner_exists'] = result.get('owner_exists', False)
-                    site['owner_status'] = result.get('owner_status', 'Unknown')
-                    site['owner_upn'] = result.get('owner_upn', '')
-                    site['owner_mail'] = result.get('owner_mail', '')
-                    site['owner_display_name'] = result.get('owner_display_name', '')
-                    site['account_status'] = result.get('account_status', 'Not Found')
-                    site['user_type'] = result.get('user_type', '')
-                    site['is_deleted_user'] = result.get('is_deleted_user', False)
-                    site['deleted_time'] = result.get('deleted_time', '')
-                    site['manager_upn'] = result.get('manager_upn', '')
-                    site['manager_mail'] = result.get('manager_mail', '')
-                    site['manager_display_name'] = result.get('manager_display_name', '')
-                    site['manager_status'] = result.get('manager_status', 'Not fetched')
-                    
+                    future.result(timeout=60)
                     processed += 1
-                    if result.get('owner_exists', False):
-                        found_count += 1
-                        if result.get('account_status') == 'Enabled':
-                            enabled_count += 1
-                        elif result.get('account_status') == 'Disabled':
-                            disabled_count += 1
-                        elif result.get('is_deleted_user', False):
-                            deleted_user_count += 1
-                        
-                        if fetch_manager and result.get('manager_upn'):
-                            manager_found_count += 1
-                    else:
-                        orphaned_count += 1
-                        if result.get('is_deleted_user', False):
-                            deleted_user_count += 1
-                        owner_errors += 1 if 'Error' in result.get('owner_status', '') else 0
-                    
-                    if processed % 10 == 0 or processed == 1:
-                        print(f"  Progress: {processed}/{len(all_sites)} owner checks completed")
-                        print(f"    Users found: {found_count}, Orphaned: {orphaned_count}")
-                        print(f"    Enabled: {enabled_count}, Disabled: {disabled_count}, Deleted: {deleted_user_count}")
-                        if fetch_manager:
-                            print(f"    Managers found: {manager_found_count}")
-                        
+                    if processed % 10 == 0:
+                        print(f"  Progress: {processed}/{len(all_sites)}")
                 except Exception as e:
-                    owner_errors += 1
-                    site['owner_exists'] = False
-                    site['owner_status'] = f'Error: {str(e)[:50]}'
-                    site['owner_upn'] = ''
-                    site['owner_mail'] = ''
-                    site['owner_display_name'] = ''
-                    site['account_status'] = 'Error'
-                    site['user_type'] = ''
-                    site['is_deleted_user'] = False
-                    site['deleted_time'] = ''
-                    site['manager_upn'] = ''
-                    site['manager_mail'] = ''
-                    site['manager_display_name'] = ''
-                    site['manager_status'] = f'Error: {str(e)[:50]}'
-                    orphaned_count += 1
-                    print(f"  Warning: Error checking owner for {site.get('title', 'Unknown')}: {str(e)[:50]}")
+                    print(f"  ⚠️ Error processing site: {str(e)[:100]}")
         
         elapsed = time.time() - start_time
-        print(f"\nOwner checking completed in {elapsed:.2f} seconds")
-        print(f"  Total sites checked: {processed + len([s for s in all_sites if not s.get('owner_email')])}")
-        print(f"  Users found: {found_count}")
-        print(f"    - Enabled: {enabled_count}")
-        print(f"    - Disabled: {disabled_count}")
-        print(f"    - Deleted users: {deleted_user_count}")
-        print(f"  Orphaned sites found: {orphaned_count}")
-        if fetch_manager:
-            print(f"  Managers found: {manager_found_count}")
-        if owner_errors > 0:
-            print(f"  Errors: {owner_errors}")
+        print(f"\n✅ Processing completed in {elapsed:.2f} seconds")
+        
+        # Count statuses
+        enabled = sum(1 for s in all_sites if s.get('user_info', {}).get('status') == 'Enabled')
+        disabled = sum(1 for s in all_sites if s.get('user_info', {}).get('status') == 'Disabled')
+        deleted = sum(1 for s in all_sites if s.get('user_info', {}).get('is_deleted', False))
+        not_found = sum(1 for s in all_sites if s.get('user_info', {}).get('status') == 'Not Found')
+        no_email = sum(1 for s in all_sites if not s.get('owner_email'))
+        
+        managers_found = sum(1 for s in all_sites if s.get('manager_info', {}).get('upn'))
+        
+        print(f"\n📊 User Status Summary:")
+        print(f"  ✅ Enabled: {enabled}")
+        print(f"  ⚠️  Disabled: {disabled}")
+        print(f"  ❌ Deleted: {deleted}")
+        print(f"  🔍 Not Found: {not_found}")
+        print(f"  📧 No Email: {no_email}")
+        print(f"\n👔 Managers Found: {managers_found}")
     
     return all_sites
 
@@ -1187,26 +936,14 @@ def main():
     sharepoint_admin_url = config.get('sharepoint_admin_url')
     list_id = config.get('list_id')
     page_size = config.get('page_size', 100)
-    max_retries = config.get('max_retries', 3)
     max_workers = config.get('max_workers', 20)
-    fetch_metadata = config.get('fetch_metadata', True)
-    skip_deleted_metadata = config.get('skip_deleted_metadata', True)
-    check_owner = config.get('check_owner_exists', True)
-    fetch_manager = config.get('fetch_manager', True)
     master_report = config.get('master_report', True)
     
-    print(f"Configuration loaded:")
-    print(f"  Tenant: {tenant_name}")
-    print(f"  SharePoint Admin URL: {sharepoint_admin_url}")
-    print(f"  List ID: {list_id}")
-    print(f"  Page Size: {page_size}")
-    print(f"  Max Retries: {max_retries}")
-    print(f"  Max Workers: {max_workers}")
-    print(f"  Fetch Metadata: {fetch_metadata}")
-    print(f"  Skip Deleted Site Metadata: {skip_deleted_metadata}")
-    print(f"  Check Owner Exists: {check_owner}")
-    print(f"  Fetch Manager: {fetch_manager}")
-    print(f"  Master Report Mode: {master_report}")
+    print(f"\n{'='*60}")
+    print("📊 ONEDRIVE MASTER REPORT - WITH CHANGE HISTORY")
+    print(f"{'='*60}")
+    print(f"📅 Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🏢 Tenant: {tenant_name}")
     
     if not sharepoint_admin_url:
         print("Error: sharepoint_admin_url is required in config.json")
@@ -1216,20 +953,18 @@ def main():
         return
     
     try:
+        # Load certificates
         certificate, private_key = load_certificate_and_key(certificate_path, private_key_path)
-        print("Certificate and private key loaded successfully")
+        print("✅ Certificate and private key loaded successfully")
         
+        # Initialize token managers
         sharepoint_token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_admin_url)
         graph_token_manager = GraphTokenManager(certificate, private_key, tenant_name, app_id)
         
-        initial_token = sharepoint_token_manager.get_token()
-        print("SharePoint access token retrieved successfully")
-        print(f"  Token expires at: {datetime.fromtimestamp(sharepoint_token_manager.token_expiry_time).strftime('%H:%M:%S')}")
-        
-        if check_owner:
-            initial_graph_token = graph_token_manager.get_token()
-            print("Graph access token retrieved successfully")
-            print(f"  Token expires at: {datetime.fromtimestamp(graph_token_manager.token_expiry_time).strftime('%H:%M:%S')}")
+        # Get initial tokens
+        sharepoint_token_manager.get_token()
+        graph_token_manager.get_token()
+        print("✅ Tokens retrieved successfully")
         
         # Get OneDrive sites
         onedrive_sites = get_all_sites_from_list_optimized(
@@ -1239,12 +974,11 @@ def main():
             list_id,
             page_size,
             max_workers,
-            fetch_metadata,
             config
         )
         
         if not onedrive_sites:
-            print("\nNo OneDrive sites found!")
+            print("\n⚠️ No OneDrive sites found!")
             return
         
         # Master report filename
@@ -1255,123 +989,21 @@ def main():
         if master_report:
             changes = update_master_report(onedrive_sites, master_file, config)
         else:
-            # Generate timestamped report instead
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             master_file = f"{tenant_clean}_onedrive_report_{timestamp}.csv"
-            save_to_csv(onedrive_sites, master_file)
+            # Simple save without history tracking
+            save_simple_report(onedrive_sites, master_file)
             changes = None
         
-        # Print summary
-        active_sites = [s for s in onedrive_sites if not s.get('is_deleted', False)]
-        deleted_sites = [s for s in onedrive_sites if s.get('is_deleted', False)]
-        
-        total_storage = sum(s['storage_used_gb'] for s in onedrive_sites)
-        total_quota = sum(s['storage_quota_gb'] for s in onedrive_sites)
-        
-        orphaned_sites = [s for s in onedrive_sites if not s.get('owner_exists', True)]
-        found_users = [s for s in onedrive_sites if s.get('owner_exists', False)]
-        enabled_users = [s for s in onedrive_sites if s.get('account_status') == 'Enabled']
-        disabled_users = [s for s in onedrive_sites if s.get('account_status') == 'Disabled']
-        deleted_users = [s for s in onedrive_sites if s.get('is_deleted_user', False)]
-        manager_found = [s for s in onedrive_sites if s.get('manager_upn', '')]
-        
-        print(f"\n{'='*50}")
-        print(f"ONEDRIVE USER MANAGER REPORT")
-        print(f"{'='*50}")
-        print(f"Total OneDrive Sites: {len(onedrive_sites)}")
-        print(f"  Active sites: {len(active_sites)}")
-        print(f"  Soft-deleted sites: {len(deleted_sites)}")
-        
-        if check_owner:
-            print(f"\nUser Status Summary:")
-            print(f"  Total sites: {len(onedrive_sites)}")
-            print(f"  Users found: {len(found_users)}")
-            print(f"    - Enabled: {len(enabled_users)}")
-            print(f"    - Disabled: {len(disabled_users)}")
-            print(f"    - Deleted users: {len(deleted_users)}")
-            print(f"  Orphaned sites (owner not found): {len(orphaned_sites)}")
-            if len(onedrive_sites) > 0:
-                print(f"  Percentage orphaned: {(len(orphaned_sites)/len(onedrive_sites)*100):.2f}%")
-            
-            if fetch_manager:
-                print(f"\nManager Status:")
-                print(f"  Managers found: {len(manager_found)}")
-                if len(found_users) > 0:
-                    print(f"  Percentage with managers: {(len(manager_found)/len(found_users)*100):.2f}%")
-        
-        print(f"\nStorage Usage:")
-        print(f"  Total Storage Used: {total_storage:.2f} GB")
-        print(f"  Total Storage Quota: {total_quota:.2f} GB")
-        if total_quota > 0:
-            print(f"  Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
-        
-        # Top 5 largest sites
-        largest_sites = sorted(onedrive_sites, key=lambda x: x['storage_used_gb'], reverse=True)[:5]
-        if largest_sites:
-            print(f"\nTop 5 Largest OneDrive Sites:")
-            for i, site in enumerate(largest_sites, 1):
-                status = "[DELETED]" if site.get('is_deleted') else ""
-                user_status = f"[{site.get('account_status', 'Unknown')}]" if site.get('account_status') and site.get('account_status') != 'Not Checked' else ""
-                manager_info = f"Manager: {site.get('manager_upn', 'N/A')}" if site.get('manager_upn') else ""
-                print(f"  {i}. {status} {site['title']}: {site['storage_used_gb']:.2f} GB {user_status} {manager_info}")
-        
-        # Orphaned sites
-        if check_owner and orphaned_sites:
-            print(f"\nOrphaned OneDrive Sites (Owner Not Found):")
-            for site in orphaned_sites[:5]:
-                print(f"  - {site['title']} ({site['owner_email']}) - {site['owner_status']}")
-            if len(orphaned_sites) > 5:
-                print(f"  ... and {len(orphaned_sites) - 5} more")
-            
-            orphaned_storage = sum(s['storage_used_gb'] for s in orphaned_sites)
-            if orphaned_storage > 0:
-                print(f"  Storage used by orphaned sites: {orphaned_storage:.2f} GB")
-        
-        # Disabled users
-        if check_owner and disabled_users:
-            print(f"\nDisabled User Accounts ({len(disabled_users)} total):")
-            for site in disabled_users[:5]:
-                print(f"  - {site['title']} - Owner: {site.get('owner_upn', site.get('owner_email', 'Unknown'))}")
-            if len(disabled_users) > 5:
-                print(f"  ... and {len(disabled_users) - 5} more")
-            
-            disabled_storage = sum(s['storage_used_gb'] for s in disabled_users)
-            if disabled_storage > 0:
-                print(f"  Storage used by disabled accounts: {disabled_storage:.2f} GB")
-        
-        # Deleted users
-        if check_owner and deleted_users:
-            print(f"\nDeleted User Accounts ({len(deleted_users)} total):")
-            for site in deleted_users[:5]:
-                deleted_time = site.get('deleted_time', 'Unknown')
-                print(f"  - {site['title']} - Owner: {site.get('owner_upn', site.get('owner_email', 'Unknown'))} - Deleted: {deleted_time}")
-            if len(deleted_users) > 5:
-                print(f"  ... and {len(deleted_users) - 5} more")
-            
-            deleted_user_storage = sum(s['storage_used_gb'] for s in deleted_users)
-            if deleted_user_storage > 0:
-                print(f"  Storage used by deleted accounts: {deleted_user_storage:.2f} GB")
-        
-        # Deleted sites
-        if deleted_sites:
-            print(f"\nSoft-Deleted OneDrive Sites ({len(deleted_sites)} total):")
-            for site in deleted_sites[:5]:
-                print(f"  - {site['title']} - Deleted: {site.get('time_deleted', 'Unknown')}")
-            if len(deleted_sites) > 5:
-                print(f"  ... and {len(deleted_sites) - 5} more")
-            
-            deleted_storage = sum(s['storage_used_gb'] for s in deleted_sites)
-            if deleted_storage > 0:
-                print(f"  Storage used by deleted sites: {deleted_storage:.2f} GB")
-        
-        print(f"\n{'='*50}")
-        print(f"Script completed successfully!")
-        print(f"Master report: {master_file}")
-        if changes and any(changes.values()):
-            print(f"Changes summary: {master_file.replace('.csv', '_changes.csv')}")
+        print(f"\n{'='*60}")
+        print("✅ SCRIPT COMPLETED SUCCESSFULLY!")
+        print(f"{'='*60}")
+        print(f"📄 Master Report: {master_file}")
+        if changes:
+            print(f"📊 Changes detected: {len(changes)}")
         
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        print(f"\n❌ An error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
