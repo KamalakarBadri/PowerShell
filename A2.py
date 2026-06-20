@@ -254,6 +254,54 @@ def format_datetime(datetime_str):
         return datetime_str  # Return original if parsing fails
 
 # ============================================================
+# VERSION RETRIEVAL USING ITEM ID
+# ============================================================
+
+def get_file_versions_by_item_id(site_url, list_id, item_id, access_token):
+    """
+    Get file versions using Item ID
+    API Endpoint: /_api/Web/Lists(guid'{list_id}')/items({item_id})/versions
+    """
+    try:
+        # Build the correct URL for getting versions by item ID
+        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
+        
+        response = make_sharepoint_request(versions_url, access_token)
+        
+        if not response or 'd' not in response:
+            return []
+        
+        versions = []
+        if 'results' in response['d']:
+            for version in response['d']['results']:
+                # Extract version information from the response
+                # Using the field names from the sample output
+                version_data = {
+                    'id': version.get('VersionId', 0),
+                    'version_label': version.get('VersionLabel', ''),
+                    'version_id': version.get('VersionId', 0),
+                    'ui_version': version.get('OData__x005f_UIVersion', 0),
+                    'ui_version_string': version.get('OData__x005f_UIVersionString', ''),
+                    'created': version.get('Created', ''),
+                    'is_current': version.get('IsCurrentVersion', False),
+                    'size': safe_int_conversion(version.get('File_x005f_x0020_x005f_Size', '0')),
+                    'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
+                    'file_ref': version.get('FileRef', ''),
+                    'file_leaf_ref': version.get('FileLeafRef', ''),
+                    'author': version.get('Author', {}).get('LookupValue', ''),
+                    'editor': version.get('Editor', {}).get('LookupValue', ''),
+                    'modified': version.get('Modified', ''),
+                    'file_size': version.get('File_x005f_x0020_x005f_Size', '0')
+                }
+                versions.append(version_data)
+        
+        return versions
+        
+    except Exception as e:
+        print(f"Error getting versions for item {item_id}: {str(e)}")
+        return []
+
+# ============================================================
 # SHAREPOINT DATA RETRIEVAL FUNCTIONS
 # ============================================================
 
@@ -277,8 +325,8 @@ def get_all_libraries(site_url, access_token):
 
 def get_all_files_in_library(site_url, library_id, access_token):
     """Get all files from a document library with pagination"""
-    # Use the correct API endpoint to get files and folders
-    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$expand=File,Folder&$select=Id,Title,File/Name,File/ServerRelativeUrl,File/Length,File/TimeCreated,File/TimeLastModified,Created,Modified,FileSystemObjectType"
+    # Get items with file information - using FSObjType filter
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$filter=FSObjType eq 0&$select=Id,Title,FSObjType,Created,Modified,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size"
     all_items = []
     next_url = items_url
     
@@ -295,75 +343,41 @@ def get_all_files_in_library(site_url, library_id, access_token):
         if '__next' in response.get('d', {}):
             next_url = response['d']['__next']
     
-    # Filter to only files (FileSystemObjectType 0 = File)
-    return [item for item in all_items if item.get('FileSystemObjectType') == 0]
+    # Filter to only files (FSObjType 0 = File)
+    return [item for item in all_items if item.get('FSObjType') == 0]
 
-def get_file_versions(site_url, file_url, access_token):
-    """Get all versions of a file"""
-    # Build the versions API URL
-    versions_url = f"{site_url}/_api/web/GetFileByServerRelativeUrl('{file_url}')/versions"
-    
-    response = make_sharepoint_request(versions_url, access_token)
-    
-    if response and 'd' in response and 'results' in response['d']:
-        versions = []
-        for version in response['d']['results']:
-            # Safely get size, converting if necessary
-            size_value = version.get('Size', 0)
-            size = safe_int_conversion(size_value)
-            
-            versions.append({
-                'id': version.get('ID', 0),
-                'version_label': version.get('VersionLabel', ''),
-                'created': version.get('Created', ''),
-                'is_current': version.get('IsCurrentVersion', False),
-                'size': size,
-                'checkin_comment': version.get('CheckInComment', '')
-            })
-        return versions
-    
-    # If no versions found, return empty list
-    return []
-
-def get_file_details(site_url, file_item, access_token):
-    """Get detailed information about a file including its versions"""
+def get_file_details_by_item_id(site_url, list_id, item_id, access_token):
+    """Get detailed information about a file using its Item ID"""
     try:
-        # Extract file information
-        file_obj = file_item.get('File', {})
+        # Get the item details
+        item_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})"
+        item_response = make_sharepoint_request(item_url, access_token)
         
-        # Get file URL
-        file_url = file_obj.get('ServerRelativeUrl', '')
+        if not item_response or 'd' not in item_response:
+            return None
         
-        if not file_url:
-            # Try alternative methods to get file URL
-            if 'FileDirRef' in file_item and 'FileLeafRef' in file_item:
-                file_url = f"{file_item.get('FileDirRef', '')}/{file_item.get('FileLeafRef', '')}"
-            else:
-                # Skip files without URL
-                return None
+        item_data = item_response['d']
         
-        # Get file name
-        file_name = file_obj.get('Name', '')
-        if not file_name:
-            file_name = file_item.get('Title', '')
+        # Get basic item info
+        title = item_data.get('Title', '')
+        created = item_data.get('Created', 'N/A')
+        modified = item_data.get('Modified', 'N/A')
+        file_leaf_ref = item_data.get('FileLeafRef', '')
+        file_ref = item_data.get('FileRef', '')
+        file_size = item_data.get('File_x005f_x0020_x005f_Size', '0')
         
-        # Get file creation and modification times
-        created = file_obj.get('TimeCreated', 'N/A')
-        modified = file_obj.get('TimeLastModified', 'N/A')
+        file_name = title if title else file_leaf_ref
         
-        # Get current file size - safely convert
-        current_file_size = safe_int_conversion(file_obj.get('Length', 0))
-        
-        # Get versions
-        versions = get_file_versions(site_url, file_url, access_token)
+        # Get versions using Item ID
+        versions = get_file_versions_by_item_id(site_url, list_id, item_id, access_token)
         
         # Calculate version history summary
         version_count = len(versions)
         first_version_date = 'N/A'
         last_version_date = 'N/A'
         total_versions_size = 0
+        current_file_size = safe_int_conversion(file_size)
         
-        # Calculate total size of all versions including current
         if versions:
             # Sort versions by creation date
             sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
@@ -382,8 +396,11 @@ def get_file_details(site_url, file_item, access_token):
             total_versions_size = current_file_size
         
         return {
+            'item_id': item_id,
+            'list_id': list_id,
             'file_name': file_name,
-            'file_url': file_url,
+            'file_ref': file_ref,
+            'file_leaf_ref': file_leaf_ref,
             'created': created,
             'modified': modified,
             'current_file_size': current_file_size,
@@ -400,7 +417,7 @@ def get_file_details(site_url, file_item, access_token):
             'last_version_formatted': format_datetime(last_version_date)
         }
     except Exception as e:
-        print(f"Error getting file details: {str(e)}")
+        print(f"Error getting file details for item {item_id}: {str(e)}")
         return None
 
 # ============================================================
@@ -442,10 +459,13 @@ def process_files(site_url, access_token):
         # Process each file
         for file_item in files:
             processed += 1
-            file_name = file_item.get('Title', 'Unknown')
-            print(f"  Processing file {processed}/{total_files}: {file_name}...", end="")
+            item_id = file_item.get('Id')
+            file_name = file_item.get('Title', file_item.get('FileLeafRef', 'Unknown'))
             
-            file_data = get_file_details(site_url, file_item, access_token)
+            print(f"  Processing file {processed}/{total_files}: {file_name} (ID: {item_id})...", end="")
+            
+            # Get file details using Item ID
+            file_data = get_file_details_by_item_id(site_url, library['id'], item_id, access_token)
             
             if file_data:
                 file_data['library'] = library['title']
@@ -456,7 +476,7 @@ def process_files(site_url, access_token):
                 print(" ✗ (Failed to get details)")
             
             # Add a small delay to avoid rate limiting
-            time.sleep(0.3)
+            time.sleep(0.5)
     
     print(f"\nProcessed {len(all_file_data)} files with version history.")
     return all_file_data
@@ -466,8 +486,9 @@ def generate_csv_report(file_data, output_file):
     try:
         fieldnames = [
             'Library',
+            'Item ID',
             'File Name',
-            'File URL',
+            'File Path',
             'Current File Size (MB)',
             'Version Count',
             'First Version Date',
@@ -487,8 +508,9 @@ def generate_csv_report(file_data, output_file):
             for data in sorted_data:
                 writer.writerow({
                     'Library': data.get('library', ''),
+                    'Item ID': data.get('item_id', 0),
                     'File Name': data.get('file_name', ''),
-                    'File URL': data.get('file_url', ''),
+                    'File Path': data.get('file_ref', ''),
                     'Current File Size (MB)': f"{data.get('current_file_size_mb', 0.00):.2f}",
                     'Version Count': data.get('version_count', 0),
                     'First Version Date': data.get('first_version_formatted', 'N/A'),
@@ -509,14 +531,18 @@ def generate_detailed_version_report(file_data, output_file):
     try:
         detailed_fieldnames = [
             'Library',
+            'Item ID',
             'File Name',
-            'File URL',
+            'File Path',
             'Version ID',
             'Version Label',
+            'UI Version',
             'Version Created',
             'Is Current Version',
             'Version Size (MB)',
-            'Check-in Comment'
+            'Check-in Comment',
+            'Author',
+            'Editor'
         ]
         
         # Create detailed output filename
@@ -531,14 +557,18 @@ def generate_detailed_version_report(file_data, output_file):
                     for version in data['versions']:
                         writer.writerow({
                             'Library': data.get('library', ''),
+                            'Item ID': data.get('item_id', 0),
                             'File Name': data.get('file_name', ''),
-                            'File URL': data.get('file_url', ''),
+                            'File Path': data.get('file_ref', ''),
                             'Version ID': version.get('id', 0),
                             'Version Label': version.get('version_label', ''),
+                            'UI Version': version.get('ui_version_string', ''),
                             'Version Created': format_datetime(version.get('created', 'N/A')),
                             'Is Current Version': 'Yes' if version.get('is_current', False) else 'No',
                             'Version Size (MB)': f"{bytes_to_mb(version.get('size', 0)):.2f}",
-                            'Check-in Comment': version.get('checkin_comment', '')
+                            'Check-in Comment': version.get('checkin_comment', ''),
+                            'Author': version.get('author', ''),
+                            'Editor': version.get('editor', '')
                         })
         
         print(f"✓ Detailed version report generated: {detailed_output}")
@@ -632,6 +662,7 @@ def print_summary_stats(file_data):
         print("-"*80)
         for i, file in enumerate(top_files, 1):
             print(f"{i}. {file['file_name']}")
+            print(f"   Item ID: {file.get('item_id', 0)}")
             print(f"   Versions: {file['version_count']}")
             print(f"   Library: {file['library']}")
             print(f"   Current Size: {file['current_file_size_mb']:.2f} MB")
@@ -647,9 +678,10 @@ def print_summary_stats(file_data):
 # ============================================================
 
 def main():
-    """Main function to generate file version history report"""
+    """Main function to generate file version history report using Item ID"""
     print("="*80)
     print("FILE VERSION HISTORY REPORT GENERATOR")
+    print("(Using Item ID for version retrieval)")
     print("="*80)
     print(f"SharePoint Site: {CONFIG['site_url']}")
     print(f"Output File: {CONFIG['output_csv']}")
