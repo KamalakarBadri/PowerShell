@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import sys
 import os
+import re
 
 class SharePointTokenManager:
     """Manages SharePoint token with automatic renewal"""
@@ -83,9 +84,7 @@ def load_config(config_file="config.json"):
         config.setdefault('check_owner_exists', True)
         config.setdefault('fetch_manager', True)
         config.setdefault('master_report', True)
-        config.setdefault('track_archive_status', True)
-        config.setdefault('track_deletion_status', True)
-        config.setdefault('track_user_status', True)
+        config.setdefault('ignore_url_pattern', r'm_[A-Za-z0-9]+_[A-Za-z0-9]+')
         
         return config
     except FileNotFoundError:
@@ -105,9 +104,7 @@ def load_config(config_file="config.json"):
     "check_owner_exists": true,
     "fetch_manager": true,
     "master_report": true,
-    "track_archive_status": true,
-    "track_deletion_status": true,
-    "track_user_status": true
+    "ignore_url_pattern": "m_[A-Za-z0-9]+_[A-Za-z0-9]+"
 }
         """)
         raise
@@ -445,6 +442,22 @@ def check_user_status(graph_token_manager, user_email, max_retries=3):
         'deleted_time': ''
     }
 
+def should_ignore_url(site_url, config):
+    """
+    Check if URL should be ignored based on pattern
+    Default pattern: m_[A-Za-z0-9]+_[A-Za-z0-9]+ (matches m_XXXXXX_XXX)
+    """
+    if not site_url:
+        return False
+    
+    ignore_pattern = config.get('ignore_url_pattern', r'm_[A-Za-z0-9]+_[A-Za-z0-9]+')
+    
+    # Check if the URL contains the pattern
+    if re.search(ignore_pattern, site_url, re.IGNORECASE):
+        return True
+    
+    return False
+
 def is_onedrive_site(site_url):
     if not site_url:
         return False
@@ -452,16 +465,23 @@ def is_onedrive_site(site_url):
     return 'my.sharepoint.com/personal' in site_url_lower
 
 def should_include_site(site_url, config):
+    """Determine if a site should be included"""
+    # First check if URL should be ignored
+    if should_ignore_url(site_url, config):
+        return False
+    
+    # Then check if it's a OneDrive site
     return is_onedrive_site(site_url)
 
 def load_existing_master_report(master_file):
-    """Load existing master report with all historical data"""
+    """Load existing master report"""
     if not os.path.exists(master_file):
-        return {}, []
+        return {}, [], False
     
     try:
         existing_sites = {}
         site_urls = []
+        is_first_run = False
         with open(master_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -469,52 +489,22 @@ def load_existing_master_report(master_file):
                 if site_url:
                     existing_sites[site_url] = row
                     site_urls.append(site_url)
-        return existing_sites, site_urls
+        return existing_sites, site_urls, is_first_run
     except Exception as e:
         print(f"Warning: Could not load master report: {str(e)}")
-        return {}, []
-
-def update_change_history(existing_row, current_value, field_name, new_value, changes):
-    """
-    Update change history for a specific field
-    Returns: updated change_history string
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Get existing history
-    history_field = f"{field_name}_history"
-    old_history = existing_row.get(history_field, '') if existing_row else ''
-    
-    # Get old value
-    old_value = existing_row.get(field_name, '') if existing_row else ''
-    
-    # Only update if value actually changed
-    if str(old_value) != str(new_value) and new_value:
-        change_entry = f"[{timestamp}] {old_value} → {new_value}"
-        if old_history:
-            new_history = f"{old_history} | {change_entry}"
-        else:
-            new_history = change_entry
-        
-        # Track the change for summary
-        changes.append({
-            'site_url': existing_row.get('Site URL', ''),
-            'field': field_name,
-            'old_value': old_value,
-            'new_value': new_value,
-            'timestamp': timestamp
-        })
-        
-        return new_history
-    
-    return old_history
+        return {}, [], False
 
 def update_master_report(current_sites, master_file, config):
-    """Update master report preserving all historical data"""
+    """Update master report with change tracking"""
     # Load existing master report
-    existing_sites, existing_urls = load_existing_master_report(master_file)
+    existing_sites, existing_urls, _ = load_existing_master_report(master_file)
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Check if this is the first run
+    is_first_run = len(existing_sites) == 0
+    
+    if is_first_run:
+        print("\n📝 FIRST RUN DETECTED - Creating baseline without history")
     
     # Track changes for summary
     all_changes = []
@@ -531,7 +521,7 @@ def update_master_report(current_sites, master_file, config):
         # Get existing data if available
         existing_row = existing_sites.get(site_url, {})
         
-        # Build the updated row with history preservation
+        # Build the updated row
         row = {
             'Site URL': site_url,
             'Title': site.get('title', existing_row.get('Title', '')),
@@ -540,163 +530,168 @@ def update_master_report(current_sites, master_file, config):
             'Owner Email': site.get('owner_email', existing_row.get('Owner Email', '')),
             'Created On': site.get('time_created', existing_row.get('Created On', '')),
             'Storage Used (GB)': site.get('storage_used_gb', existing_row.get('Storage Used (GB)', 0)),
-            'Storage Quota (GB)': site.get('storage_quota_gb', existing_row.get('Storage Quota (GB)', 0)),
             'Last Updated': current_time
         }
         
-        # ===== TRACK DELETION STATUS =====
-        new_deleted_on = site.get('time_deleted', '')
-        old_deleted_on = existing_row.get('Deleted On', '')
-        
-        # If site was deleted, update Deleted On
-        if new_deleted_on and not old_deleted_on:
-            row['Deleted On'] = new_deleted_on
-            row['deleted_on_history'] = update_change_history(
-                existing_row, 'Deleted On', 'deleted_on',
-                f"Site deleted on {new_deleted_on}", all_changes
-            )
-        elif old_deleted_on and not new_deleted_on:
-            # Site was restored
-            row['Deleted On'] = ''
-            row['deleted_on_history'] = update_change_history(
-                existing_row, 'Deleted On', 'deleted_on',
-                "Site restored", all_changes
-            )
-        else:
-            row['Deleted On'] = old_deleted_on
-            row['deleted_on_history'] = existing_row.get('deleted_on_history', '')
-        
-        # ===== TRACK ARCHIVE STATUS =====
-        new_archive_status = site.get('archive_status', '')
-        old_archive_status = existing_row.get('Archive Status', '')
-        
-        if new_archive_status != old_archive_status:
-            row['Archive Status'] = new_archive_status
-            row['archive_status_history'] = update_change_history(
-                existing_row, 'Archive Status', 'archive_status',
-                f"Changed from '{old_archive_status}' to '{new_archive_status}'", all_changes
-            )
-        else:
-            row['Archive Status'] = old_archive_status
-            row['archive_status_history'] = existing_row.get('archive_status_history', '')
-        
-        # ===== TRACK USER STATUS =====
+        # Get user info
         user_info = site.get('user_info', {})
-        new_status = user_info.get('status', 'Not Found')
-        old_status = existing_row.get('User Account Status', '')
         
-        if new_status != old_status and new_status:
-            row['User Account Status'] = new_status
-            row['user_status_history'] = update_change_history(
-                existing_row, 'User Account Status', 'user_status',
-                f"{old_status} → {new_status}", all_changes
-            )
-        else:
-            row['User Account Status'] = old_status or new_status
-            row['user_status_history'] = existing_row.get('user_status_history', '')
-        
-        # User UPN - preserve if not found
+        # ===== USER UPN =====
         new_upn = user_info.get('upn', '')
         old_upn = existing_row.get('User UPN', '')
-        if new_upn:
-            row['User UPN'] = new_upn
-        else:
-            row['User UPN'] = old_upn  # Keep historical UPN
         
-        # User Email - preserve if not found
+        if is_first_run:
+            row['User UPN'] = new_upn if new_upn else site.get('owner_email', '')
+            row['UPN Change History'] = ''
+        else:
+            if new_upn and new_upn != old_upn:
+                row['User UPN'] = new_upn
+                history = existing_row.get('UPN Change History', '')
+                change_entry = f"[{current_time}] {old_upn} → {new_upn}"
+                row['UPN Change History'] = f"{history} | {change_entry}" if history else change_entry
+                all_changes.append({
+                    'site': site_url,
+                    'field': 'UPN',
+                    'old_value': old_upn,
+                    'new_value': new_upn
+                })
+            else:
+                row['User UPN'] = old_upn if old_upn else (new_upn if new_upn else site.get('owner_email', ''))
+                row['UPN Change History'] = existing_row.get('UPN Change History', '')
+        
+        # ===== USER DETAILS =====
         new_mail = user_info.get('mail', site.get('owner_email', ''))
-        old_mail = existing_row.get('User Email', '')
-        if new_mail:
-            row['User Email'] = new_mail
-        else:
-            row['User Email'] = old_mail
-        
-        # User Display Name - preserve if not found
         new_display = user_info.get('display_name', '')
-        old_display = existing_row.get('User Display Name', '')
-        if new_display:
-            row['User Display Name'] = new_display
-        else:
-            row['User Display Name'] = old_display
         
-        # User Type
-        new_user_type = user_info.get('user_type', '')
-        old_user_type = existing_row.get('User Type', '')
-        row['User Type'] = new_user_type if new_user_type else old_user_type
+        row['User Email'] = new_mail if new_mail else existing_row.get('User Email', site.get('owner_email', ''))
+        row['User Display Name'] = new_display if new_display else existing_row.get('User Display Name', '')
+        row['User Account Status'] = user_info.get('status', existing_row.get('User Account Status', 'Not Found'))
+        row['User Type'] = user_info.get('user_type', existing_row.get('User Type', ''))
+        row['User Deleted Time'] = user_info.get('deleted_time', existing_row.get('User Deleted Time', ''))
         
-        # Is Deleted User
-        row['Is Deleted User'] = 'Yes' if user_info.get('is_deleted', False) else 'No'
-        
-        # User Deleted Time
-        new_deleted_time = user_info.get('deleted_time', '')
-        if new_deleted_time:
-            row['User Deleted Time'] = new_deleted_time
-        else:
-            row['User Deleted Time'] = existing_row.get('User Deleted Time', '')
-        
-        # ===== TRACK MANAGER DETAILS =====
+        # ===== MANAGER =====
         manager_info = site.get('manager_info', {})
         new_manager_upn = manager_info.get('upn', '')
         old_manager_upn = existing_row.get('Manager UPN', '')
         
-        if new_manager_upn and new_manager_upn != old_manager_upn:
+        if is_first_run:
             row['Manager UPN'] = new_manager_upn
-            row['manager_upn_history'] = update_change_history(
-                existing_row, 'Manager UPN', 'manager_upn',
-                f"{old_manager_upn} → {new_manager_upn}", all_changes
-            )
+            row['Manager Change History'] = ''
         else:
-            row['Manager UPN'] = old_manager_upn or new_manager_upn
-            row['manager_upn_history'] = existing_row.get('manager_upn_history', '')
+            if new_manager_upn and new_manager_upn != old_manager_upn:
+                row['Manager UPN'] = new_manager_upn
+                history = existing_row.get('Manager Change History', '')
+                change_entry = f"[{current_time}] {old_manager_upn} → {new_manager_upn}"
+                row['Manager Change History'] = f"{history} | {change_entry}" if history else change_entry
+                all_changes.append({
+                    'site': site_url,
+                    'field': 'Manager',
+                    'old_value': old_manager_upn,
+                    'new_value': new_manager_upn
+                })
+            else:
+                row['Manager UPN'] = old_manager_upn if old_manager_upn else new_manager_upn
+                row['Manager Change History'] = existing_row.get('Manager Change History', '')
         
-        # Manager Email - preserve if not found
-        new_manager_mail = manager_info.get('mail', '')
-        old_manager_mail = existing_row.get('Manager Email', '')
-        row['Manager Email'] = new_manager_mail if new_manager_mail else old_manager_mail
+        # Manager details
+        row['Manager Email'] = manager_info.get('mail', existing_row.get('Manager Email', ''))
+        row['Manager Display Name'] = manager_info.get('display_name', existing_row.get('Manager Display Name', ''))
+        row['Manager Status'] = manager_info.get('status', existing_row.get('Manager Status', 'Not fetched'))
         
-        # Manager Display Name - preserve if not found
-        new_manager_display = manager_info.get('display_name', '')
-        old_manager_display = existing_row.get('Manager Display Name', '')
-        row['Manager Display Name'] = new_manager_display if new_manager_display else old_manager_display
+        # ===== ARCHIVE STATUS =====
+        new_archive_status = site.get('archive_status', '')
+        old_archive_status = existing_row.get('Archive Status', '')
         
-        # Manager Status
-        new_manager_status = manager_info.get('status', 'Not fetched')
-        old_manager_status = existing_row.get('Manager Status', '')
-        if new_manager_status != old_manager_status:
-            row['Manager Status'] = new_manager_status
+        if is_first_run:
+            row['Archive Status'] = new_archive_status
+            row['Archive Change History'] = ''
         else:
-            row['Manager Status'] = old_manager_status or new_manager_status
+            if new_archive_status != old_archive_status:
+                row['Archive Status'] = new_archive_status
+                history = existing_row.get('Archive Change History', '')
+                change_entry = f"[{current_time}] {old_archive_status} → {new_archive_status}"
+                row['Archive Change History'] = f"{history} | {change_entry}" if history else change_entry
+                all_changes.append({
+                    'site': site_url,
+                    'field': 'Archive Status',
+                    'old_value': old_archive_status,
+                    'new_value': new_archive_status
+                })
+            else:
+                row['Archive Status'] = old_archive_status
+                row['Archive Change History'] = existing_row.get('Archive Change History', '')
+        
+        # ===== DELETION STATUS =====
+        # Get TimeDeleted value (could be empty string or datetime string)
+        new_time_deleted = site.get('time_deleted', '')
+        old_time_deleted = existing_row.get('Deleted On', '')
+        
+        # Check if TimeDeleted has a value (not empty)
+        new_is_deleted = bool(new_time_deleted and new_time_deleted.strip())
+        old_is_deleted = bool(old_time_deleted and old_time_deleted.strip())
+        
+        if is_first_run:
+            # First run - just set the value, no history
+            row['Deleted On'] = new_time_deleted
+            row['Deletion Change History'] = ''
+            # Only set status if actually deleted
+            if new_is_deleted:
+                row['Deletion Status'] = 'Deleted'
+            else:
+                row['Deletion Status'] = ''  # Empty for active sites
+        else:
+            # Track Deletion Status changes
+            if new_is_deleted != old_is_deleted:
+                row['Deleted On'] = new_time_deleted
+                history = existing_row.get('Deletion Change History', '')
+                
+                if new_is_deleted and not old_is_deleted:
+                    # Site was DELETED
+                    change_entry = f"[{current_time}] → Deleted (on {new_time_deleted})"
+                    row['Deletion Status'] = 'Deleted'
+                elif not new_is_deleted and old_is_deleted:
+                    # Site was RESTORED (TimeDeleted became empty)
+                    change_entry = f"[{current_time}] → Restored (Deleted on {old_time_deleted} was removed)"
+                    row['Deletion Status'] = ''  # Empty for restored/active sites
+                else:
+                    change_entry = f"[{current_time}] Status changed"
+                    row['Deletion Status'] = 'Deleted' if new_is_deleted else ''
+                
+                row['Deletion Change History'] = f"{history} | {change_entry}" if history else change_entry
+                all_changes.append({
+                    'site': site_url,
+                    'field': 'Deletion Status',
+                    'old_value': 'Deleted' if old_is_deleted else '',
+                    'new_value': 'Deleted' if new_is_deleted else ''
+                })
+            else:
+                # No change in deletion status
+                row['Deleted On'] = old_time_deleted if old_time_deleted else new_time_deleted
+                row['Deletion Change History'] = existing_row.get('Deletion Change History', '')
+                row['Deletion Status'] = 'Deleted' if new_is_deleted else ''  # Empty for active/restored
         
         # ===== OWNER STATUS =====
-        new_owner_exists = user_info.get('exists', False)
-        if new_owner_exists:
+        if user_info.get('exists', False):
             row['Owner Exists'] = 'Yes'
             row['Owner Status'] = 'Found'
         else:
             row['Owner Exists'] = existing_row.get('Owner Exists', 'No')
             row['Owner Status'] = user_info.get('status', 'Not Found')
         
-        # ===== SUMMARY FIELD =====
-        # Create a summary of last change
-        if all_changes:
-            last_change = all_changes[-1]
-            row['Last Change Summary'] = f"{last_change['field']}: {last_change['old_value']} → {last_change['new_value']} ({last_change['timestamp']})"
-        else:
-            row['Last Change Summary'] = existing_row.get('Last Change Summary', 'No changes')
-        
         master_data.append(row)
     
-    # Check for removed sites - keep them in report but mark as removed
+    # Check for removed sites - keep them in report
     for url in existing_urls:
         if url not in current_urls:
             existing_row = existing_sites[url]
-            row = dict(existing_row)  # Copy existing data
+            row = dict(existing_row)
             row['Last Updated'] = current_time
-            row['Last Change Summary'] = f"Site removed from SharePoint list on {current_time}"
-            row['deleted_on_history'] = update_change_history(
-                existing_row, 'Deleted On', 'deleted_on',
-                f"Site removed from list on {current_time}", all_changes
-            )
+            # Mark as removed from list if not a first run
+            if not is_first_run:
+                history = existing_row.get('Deletion Change History', '')
+                change_entry = f"[{current_time}] Site removed from SharePoint list"
+                row['Deletion Change History'] = f"{history} | {change_entry}" if history else change_entry
+                row['Deletion Status'] = 'Deleted' if row.get('Deleted On') else ''
             master_data.append(row)
     
     # Write master report
@@ -708,40 +703,44 @@ def update_master_report(current_sites, master_file, config):
             'Template Name',
             'Owner Email',
             'User UPN',
+            'UPN Change History',
             'User Email',
             'User Display Name',
             'User Account Status',
             'User Type',
-            'Is Deleted User',
             'User Deleted Time',
             'Manager UPN',
+            'Manager Change History',
             'Manager Email',
             'Manager Display Name',
             'Manager Status',
+            'Archive Status',
+            'Archive Change History',
+            'Deleted On',
+            'Deletion Status',
+            'Deletion Change History',
             'Owner Exists',
             'Owner Status',
             'Created On',
-            'Deleted On',
-            'Archive Status',
             'Storage Used (GB)',
-            'Storage Quota (GB)',
-            'Last Updated',
-            'Last Change Summary',
-            'deleted_on_history',
-            'archive_status_history',
-            'user_status_history',
-            'manager_upn_history'
+            'Last Updated'
         ]
         
         with open(master_file, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(master_data)
+            
+            # Sort by storage used (descending)
+            master_data_sorted = sorted(master_data, key=lambda x: float(x.get('Storage Used (GB)', 0)), reverse=True)
+            writer.writerows(master_data_sorted)
         
         print(f"\n✅ Master report updated: {master_file}")
         
-        # Print changes summary
-        if all_changes:
+        # Print summary
+        if is_first_run:
+            print(f"\n📝 FIRST RUN COMPLETE - Baseline created with {len(current_sites)} sites")
+            print("   No change history tracked yet. Future runs will track changes.")
+        elif all_changes:
             print(f"\n{'='*60}")
             print("📊 CHANGES SUMMARY")
             print(f"{'='*60}")
@@ -756,12 +755,15 @@ def update_master_report(current_sites, master_file, config):
                 change_types[field].append(change)
             
             for field, changes in change_types.items():
-                print(f"\n{field.replace('_', ' ').title()} Changes: {len(changes)}")
-                for change in changes[:5]:  # Show first 5
-                    site_title = existing_sites.get(change['site_url'], {}).get('Title', change['site_url'])
-                    print(f"  • {site_title}: {change['old_value']} → {change['new_value']}")
+                print(f"\n{field} Changes: {len(changes)}")
+                for change in changes[:5]:
+                    old_val = change['old_value'] if change['old_value'] else '(empty)'
+                    new_val = change['new_value'] if change['new_value'] else '(empty)'
+                    print(f"  • {change['site']}: {old_val} → {new_val}")
                 if len(changes) > 5:
                     print(f"  ... and {len(changes) - 5} more")
+        else:
+            print(f"\n📊 No changes detected since last run")
         
         return all_changes
         
@@ -777,6 +779,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
     
     all_sites = []
     skipped_sites = 0
+    ignored_sites = 0
     
     check_owner = config.get('check_owner_exists', True)
     fetch_manager = config.get('fetch_manager', True)
@@ -803,7 +806,13 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                 
                 site_url = item.get('SiteUrl', '')
                 
-                if should_include_site(site_url, config):
+                # Check if URL should be ignored
+                if should_ignore_url(site_url, config):
+                    ignored_sites += 1
+                    continue
+                
+                # Check if it's a OneDrive site
+                if is_onedrive_site(site_url):
                     site_info = {
                         'site_url': site_url,
                         'title': item.get('Title', ''),
@@ -814,7 +823,6 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
                         'time_deleted': item.get('TimeDeleted', ''),
                         'archive_status': item.get('ArchiveStatus', ''),
                         'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
-                        'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
                         'created_by': item.get('CreatedBy', ''),
                         'created_by_email': item.get('CreatedByEmail', '')
                     }
@@ -829,6 +837,7 @@ def get_all_sites_from_list_optimized(token_manager, graph_token_manager, sharep
     
     print(f"\n📊 Total sites processed: {total_sites}")
     print(f"  ✅ OneDrive sites found: {len(all_sites)}")
+    print(f"  ⏭️  Ignored sites (pattern match): {ignored_sites}")
     print(f"  ⏭️  Non-OneDrive sites skipped: {skipped_sites}")
     
     # Check owner and manager for all sites
@@ -938,12 +947,14 @@ def main():
     page_size = config.get('page_size', 100)
     max_workers = config.get('max_workers', 20)
     master_report = config.get('master_report', True)
+    ignore_pattern = config.get('ignore_url_pattern', r'm_[A-Za-z0-9]+_[A-Za-z0-9]+')
     
     print(f"\n{'='*60}")
-    print("📊 ONEDRIVE MASTER REPORT - WITH CHANGE HISTORY")
+    print("📊 ONEDRIVE MASTER REPORT - WITH CHANGE TRACKING")
     print(f"{'='*60}")
     print(f"📅 Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🏢 Tenant: {tenant_name}")
+    print(f"🔍 Ignore URL Pattern: {ignore_pattern}")
     
     if not sharepoint_admin_url:
         print("Error: sharepoint_admin_url is required in config.json")
@@ -985,22 +996,33 @@ def main():
         tenant_clean = tenant_name.split('.')[0] if '.' in tenant_name else tenant_name
         master_file = f"{tenant_clean}_onedrive_master_report.csv"
         
+        # Check if this is first run
+        is_first_run = not os.path.exists(master_file)
+        
+        if is_first_run:
+            print(f"\n📝 FIRST RUN DETECTED!")
+            print("   Creating baseline master report without change history.")
+            print("   Change tracking will begin from the next run.")
+        
         # Update master report
         if master_report:
             changes = update_master_report(onedrive_sites, master_file, config)
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             master_file = f"{tenant_clean}_onedrive_report_{timestamp}.csv"
-            # Simple save without history tracking
-            save_simple_report(onedrive_sites, master_file)
             changes = None
         
         print(f"\n{'='*60}")
         print("✅ SCRIPT COMPLETED SUCCESSFULLY!")
         print(f"{'='*60}")
         print(f"📄 Master Report: {master_file}")
-        if changes:
+        
+        if is_first_run:
+            print(f"📝 Status: First run - baseline created")
+        elif changes:
             print(f"📊 Changes detected: {len(changes)}")
+        else:
+            print(f"📊 No changes detected")
         
     except Exception as e:
         print(f"\n❌ An error occurred: {str(e)}")
