@@ -20,12 +20,12 @@ from cryptography.hazmat.backends import default_backend
 
 CONFIG = {
     # SharePoint Site Configuration
-    "site_url": "https://test.sharepoint.com/sites/New365",  # Your SharePoint site URL
+    "site_url": "https://geekbyteonline.sharepoint.com/sites/Team_Site2",  # Your SharePoint site URL
     
     # Authentication Configuration
     "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",  # Your tenant ID
     "app_id": "73efa35d-6188-42d4-b258-838a977eb149",      # Your app/client ID
-    "scope": "https://test.sharepoint.com/.default",        # Your SharePoint scope
+    "scope": "https://geekbyteonline.sharepoint.com/.default",  # Your SharePoint scope
     
     # Certificate Paths
     "certificate_path": "certificate.pem",
@@ -175,19 +175,16 @@ def get_cached_token():
         print(f"✗ Authentication failed: {str(e)}")
         return None
 
-def make_sharepoint_request(url, access_token, method='GET', data=None, headers=None):
+def make_sharepoint_request(url, access_token):
     """Make a request to SharePoint REST API"""
-    default_headers = {
+    headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json;odata=verbose",
         "Content-Type": "application/json"
     }
     
-    if headers:
-        default_headers.update(headers)
-    
     try:
-        response = requests.request(method, url, headers=default_headers, json=data)
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -236,65 +233,64 @@ def format_datetime(datetime_str):
         return "N/A"
     
     try:
-        # Remove timezone offset if present
-        datetime_str = re.sub(r'[+-]\d{2}:\d{2}$', '', datetime_str)
-        
-        # Add Z if missing at end
-        if not datetime_str.endswith('Z'):
-            datetime_str += 'Z'
-        
-        # Handle both formats: with and without milliseconds
-        if '.' in datetime_str:
-            dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-        else:
-            dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
-        
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        # Handle the format from SharePoint
+        # Example: "2026-06-20T20:22:33"
+        if 'T' in datetime_str:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return datetime_str
     except Exception as e:
-        return datetime_str  # Return original if parsing fails
+        return datetime_str
 
 # ============================================================
-# VERSION RETRIEVAL USING ITEM ID
+# VERSION RETRIEVAL USING ITEM ID - EXACT ENDPOINT
 # ============================================================
 
 def get_file_versions_by_item_id(site_url, list_id, item_id, access_token):
     """
     Get file versions using Item ID
-    API Endpoint: /_api/Web/Lists(guid'{list_id}')/items({item_id})/versions
+    EXACT ENDPOINT: https://geekbyteonline.sharepoint.com/sites/Team_Site2/_api/Web/Lists(guid'e6a3eb36-59ce-44e2-a7b9-77dd61e2b67b')/items(3)/versions
     """
     try:
-        # Build the correct URL for getting versions by item ID
+        # Build the exact URL as tested
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
         
+        print(f"\n        Fetching versions from: {versions_url}")
         response = make_sharepoint_request(versions_url, access_token)
         
-        if not response or 'd' not in response:
+        if not response:
+            print(f"        No response from versions API")
+            return []
+        
+        if 'd' not in response:
+            print(f"        No 'd' in response")
+            return []
+        
+        if 'results' not in response['d']:
+            print(f"        No 'results' in response['d']")
             return []
         
         versions = []
-        if 'results' in response['d']:
-            for version in response['d']['results']:
-                # Extract version information from the response
-                # Using the field names from the sample output
-                version_data = {
-                    'id': version.get('VersionId', 0),
-                    'version_label': version.get('VersionLabel', ''),
-                    'version_id': version.get('VersionId', 0),
-                    'ui_version': version.get('OData__x005f_UIVersion', 0),
-                    'ui_version_string': version.get('OData__x005f_UIVersionString', ''),
-                    'created': version.get('Created', ''),
-                    'is_current': version.get('IsCurrentVersion', False),
-                    'size': safe_int_conversion(version.get('File_x005f_x0020_x005f_Size', '0')),
-                    'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
-                    'file_ref': version.get('FileRef', ''),
-                    'file_leaf_ref': version.get('FileLeafRef', ''),
-                    'author': version.get('Author', {}).get('LookupValue', ''),
-                    'editor': version.get('Editor', {}).get('LookupValue', ''),
-                    'modified': version.get('Modified', ''),
-                    'file_size': version.get('File_x005f_x0020_x005f_Size', '0')
-                }
-                versions.append(version_data)
+        for version in response['d']['results']:
+            # Extract version information - using exact field names from your sample
+            version_data = {
+                'version_id': version.get('VersionId', 0),
+                'version_label': version.get('VersionLabel', ''),
+                'ui_version_string': version.get('OData__x005f_UIVersionString', ''),
+                'ui_version': version.get('OData__x005f_UIVersion', 0),
+                'created': version.get('Created', ''),
+                'is_current': version.get('IsCurrentVersion', False),
+                'size': safe_int_conversion(version.get('File_x005f_x0020_x005f_Size', '0')),
+                'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
+                'file_ref': version.get('FileRef', ''),
+                'file_leaf_ref': version.get('FileLeafRef', ''),
+                'author': version.get('Author', {}).get('LookupValue', '') if version.get('Author') else '',
+                'editor': version.get('Editor', {}).get('LookupValue', '') if version.get('Editor') else '',
+                'modified': version.get('Modified', '')
+            }
+            versions.append(version_data)
         
+        print(f"        Found {len(versions)} versions")
         return versions
         
     except Exception as e:
@@ -307,7 +303,7 @@ def get_file_versions_by_item_id(site_url, list_id, item_id, access_token):
 
 def get_all_libraries(site_url, access_token):
     """Get all document libraries from SharePoint site"""
-    lists_url = urljoin(site_url + "/", "_api/web/lists")
+    lists_url = f"{site_url}/_api/web/lists"
     response = make_sharepoint_request(lists_url, access_token)
     
     if response and 'd' in response and 'results' in response['d']:
@@ -325,26 +321,19 @@ def get_all_libraries(site_url, access_token):
 
 def get_all_files_in_library(site_url, library_id, access_token):
     """Get all files from a document library with pagination"""
-    # Get items with file information - using FSObjType filter
+    # Use FSObjType filter to get only files
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$filter=FSObjType eq 0&$select=Id,Title,FSObjType,Created,Modified,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size"
-    all_items = []
-    next_url = items_url
     
-    while next_url:
-        response = make_sharepoint_request(next_url, access_token)
-        if not response:
-            break
-        
-        if 'd' in response and 'results' in response['d']:
-            all_items.extend(response['d']['results'])
-        
-        # Check for next page
-        next_url = None
-        if '__next' in response.get('d', {}):
-            next_url = response['d']['__next']
+    print(f"\n    Fetching files from library...")
+    response = make_sharepoint_request(items_url, access_token)
     
-    # Filter to only files (FSObjType 0 = File)
-    return [item for item in all_items if item.get('FSObjType') == 0]
+    if not response or 'd' not in response:
+        return []
+    
+    if 'results' not in response['d']:
+        return []
+    
+    return response['d']['results']
 
 def get_file_details_by_item_id(site_url, list_id, item_id, access_token):
     """Get detailed information about a file using its Item ID"""
@@ -444,7 +433,9 @@ def process_files(site_url, access_token):
     processed = 0
     
     for library in libraries:
-        print(f"\nProcessing library: {library['title']}")
+        print(f"\n{'='*60}")
+        print(f"Processing library: {library['title']}")
+        print(f"{'='*60}")
         
         # Get all files in the library
         files = get_all_files_in_library(site_url, library['id'], access_token)
@@ -462,7 +453,7 @@ def process_files(site_url, access_token):
             item_id = file_item.get('Id')
             file_name = file_item.get('Title', file_item.get('FileLeafRef', 'Unknown'))
             
-            print(f"  Processing file {processed}/{total_files}: {file_name} (ID: {item_id})...", end="")
+            print(f"\n  [{processed}/{total_files}] Processing: {file_name} (ID: {item_id})", end="")
             
             # Get file details using Item ID
             file_data = get_file_details_by_item_id(site_url, library['id'], item_id, access_token)
@@ -478,7 +469,8 @@ def process_files(site_url, access_token):
             # Add a small delay to avoid rate limiting
             time.sleep(0.5)
     
-    print(f"\nProcessed {len(all_file_data)} files with version history.")
+    print(f"\n{'='*60}")
+    print(f"Processed {len(all_file_data)} files with version history.")
     return all_file_data
 
 def generate_csv_report(file_data, output_file):
@@ -520,7 +512,7 @@ def generate_csv_report(file_data, output_file):
                     'File Modified': data.get('modified_formatted', 'N/A')
                 })
         
-        print(f"\n✓ Report generated successfully: {output_file}")
+        print(f"\n✓ Main report generated: {output_file}")
         print(f"  Total files with version history: {len(file_data)}")
         
     except Exception as e:
@@ -560,7 +552,7 @@ def generate_detailed_version_report(file_data, output_file):
                             'Item ID': data.get('item_id', 0),
                             'File Name': data.get('file_name', ''),
                             'File Path': data.get('file_ref', ''),
-                            'Version ID': version.get('id', 0),
+                            'Version ID': version.get('version_id', 0),
                             'Version Label': version.get('version_label', ''),
                             'UI Version': version.get('ui_version_string', ''),
                             'Version Created': format_datetime(version.get('created', 'N/A')),
@@ -728,7 +720,9 @@ def main():
     # Print summary statistics
     print_summary_stats(file_data)
     
-    print("\nReport generation completed successfully!")
+    print("\n" + "="*80)
+    print("REPORT GENERATION COMPLETED SUCCESSFULLY!")
+    print("="*80)
     print(f"✓ Main Report: {output_file}")
     print(f"✓ Detailed Version Report: {output_file.replace('.csv', '_Detailed_Versions.csv')}")
     print(f"✓ Summary Report: {output_file.replace('.csv', '_Summary.csv')}")
