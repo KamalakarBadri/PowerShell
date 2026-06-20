@@ -30,7 +30,7 @@ CONFIG = {
     "private_key_path": "private_key.pem",
     
     # Output Configuration
-    "output_csv": f"SharePoint_Lists_Report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    "output_csv": f"SharePoint_Lists_With_Versions_Report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
 }
 
 # Token cache
@@ -230,16 +230,6 @@ def get_all_lists(site_url, access_token):
     
     return all_lists
 
-def get_list_details(site_url, list_id, access_token):
-    """Get additional details for a specific list"""
-    # This is optional - can get more details if needed
-    list_url = f"{site_url}/_api/web/lists(guid'{list_id}')"
-    response = make_sharepoint_request(list_url, access_token)
-    
-    if response and 'd' in response:
-        return response['d']
-    return None
-
 def get_list_type_name(base_template):
     """Convert BaseTemplate number to readable name"""
     list_types = {
@@ -345,6 +335,219 @@ def format_datetime(datetime_str):
         return datetime_str  # Return original if parsing fails
 
 # ============================================================
+# VERSION HISTORY FUNCTIONS USING ITEM ID
+# ============================================================
+
+def get_file_versions_by_item_id(site_url, list_id, item_id, access_token):
+    """Get file versions using Item ID instead of ServerRelativeUrl"""
+    try:
+        # Method 1: Using the file object from the item
+        # First, get the file object from the item
+        item_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items({item_id})?$expand=File"
+        item_response = make_sharepoint_request(item_url, access_token)
+        
+        if not item_response or 'd' not in item_response:
+            return []
+        
+        item_data = item_response['d']
+        
+        # Check if this item has a File object
+        if 'File' not in item_data or not item_data['File']:
+            # This might be a folder or list item without a file
+            return []
+        
+        # Get the file ID or URL from the File object
+        file_obj = item_data['File']
+        
+        # Method 2: Get versions using the File ID
+        file_id = file_obj.get('Id', None)
+        if file_id:
+            # Use the file ID to get versions
+            versions_url = f"{site_url}/_api/web/GetFileById('{file_id}')/versions"
+        else:
+            # Fallback: Use server relative URL if available
+            file_url = file_obj.get('ServerRelativeUrl', '')
+            if file_url:
+                versions_url = f"{site_url}/_api/web/GetFileByServerRelativeUrl('{file_url}')/versions"
+            else:
+                return []
+        
+        versions_response = make_sharepoint_request(versions_url, access_token)
+        
+        if not versions_response or 'd' not in versions_response:
+            return []
+        
+        versions = []
+        if 'results' in versions_response['d']:
+            for version in versions_response['d']['results']:
+                versions.append({
+                    'id': version.get('ID', 0),
+                    'version_label': version.get('VersionLabel', ''),
+                    'created': version.get('Created', ''),
+                    'is_current': version.get('IsCurrentVersion', False),
+                    'size': version.get('Size', 0),
+                    'checkin_comment': version.get('CheckInComment', '')
+                })
+        
+        return versions
+        
+    except Exception as e:
+        print(f"Error getting versions for item {item_id}: {str(e)}")
+        return []
+
+def get_file_details_by_item_id(site_url, list_id, item_id, access_token):
+    """Get file details using Item ID"""
+    try:
+        # Get the item with expanded File and Folder properties
+        item_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items({item_id})?$expand=File,Folder"
+        item_response = make_sharepoint_request(item_url, access_token)
+        
+        if not item_response or 'd' not in item_response:
+            return None
+        
+        item_data = item_response['d']
+        
+        # Check if this is a file (has File object) or folder
+        file_obj = item_data.get('File')
+        folder_obj = item_data.get('Folder')
+        
+        if not file_obj and not folder_obj:
+            return None
+        
+        # Get basic item info
+        title = item_data.get('Title', '')
+        created = item_data.get('Created', 'N/A')
+        modified = item_data.get('Modified', 'N/A')
+        item_type = item_data.get('FileSystemObjectType', 0)  # 0=File, 1=Folder
+        
+        file_name = title
+        file_url = ''
+        current_file_size = 0
+        
+        if file_obj:
+            file_name = file_obj.get('Name', title)
+            file_url = file_obj.get('ServerRelativeUrl', '')
+            current_file_size = file_obj.get('Length', 0)
+        elif folder_obj:
+            file_name = folder_obj.get('Name', title)
+            file_url = folder_obj.get('ServerRelativeUrl', '')
+        
+        # Get versions
+        versions = get_file_versions_by_item_id(site_url, list_id, item_id, access_token)
+        
+        # Calculate version history summary
+        version_count = len(versions)
+        first_version_date = 'N/A'
+        last_version_date = 'N/A'
+        total_versions_size = 0
+        
+        if versions:
+            # Sort versions by creation date
+            sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
+            first_version = sorted_versions[0]
+            last_version = sorted_versions[-1]
+            
+            first_version_date = first_version.get('created', 'N/A')
+            last_version_date = last_version.get('created', 'N/A')
+            
+            # Calculate total size of all versions
+            for version in versions:
+                total_versions_size += version.get('size', 0)
+        
+        # If no versions, total size is just the current file size
+        if version_count == 0:
+            total_versions_size = current_file_size
+        
+        return {
+            'item_id': item_id,
+            'file_name': file_name,
+            'file_url': file_url,
+            'created': created,
+            'modified': modified,
+            'current_file_size': current_file_size,
+            'version_count': version_count,
+            'first_version_date': first_version_date,
+            'last_version_date': last_version_date,
+            'total_versions_size': total_versions_size,
+            'versions': versions,
+            'created_formatted': format_datetime(created),
+            'modified_formatted': format_datetime(modified),
+            'first_version_formatted': format_datetime(first_version_date),
+            'last_version_formatted': format_datetime(last_version_date),
+            'is_folder': (item_type == 1)
+        }
+        
+    except Exception as e:
+        print(f"Error getting file details for item {item_id}: {str(e)}")
+        return None
+
+def get_all_items_in_library(site_url, library_id, access_token):
+    """Get all items from a document library with pagination"""
+    # Only get items that are files (FileSystemObjectType = 0)
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$filter=FileSystemObjectType eq 0&$select=Id,Title,FileSystemObjectType,Created,Modified"
+    all_items = []
+    next_url = items_url
+    
+    while next_url:
+        print(f"    Fetching items from library...")
+        response = make_sharepoint_request(next_url, access_token)
+        
+        if not response:
+            break
+        
+        if 'd' in response and 'results' in response['d']:
+            all_items.extend(response['d']['results'])
+        
+        # Check for next page
+        next_url = None
+        if '__next' in response.get('d', {}):
+            next_url = response['d']['__next']
+    
+    return all_items
+
+def process_library_items(site_url, library, access_token):
+    """Process all items in a library and get their version details using Item ID"""
+    library_id = library['id']
+    library_title = library['title']
+    
+    print(f"\n  Processing library: {library_title}")
+    
+    # Get all items in the library
+    items = get_all_items_in_library(site_url, library_id, access_token)
+    
+    if not items:
+        print(f"    No items found in {library_title}")
+        return []
+    
+    print(f"    Found {len(items)} items")
+    
+    processed_items = []
+    processed_count = 0
+    
+    for item in items:
+        processed_count += 1
+        item_id = item.get('Id')
+        title = item.get('Title', f'Item_{item_id}')
+        
+        print(f"    Processing item {processed_count}/{len(items)}: {title} (ID: {item_id})...", end="")
+        
+        # Get file details using Item ID
+        file_details = get_file_details_by_item_id(site_url, library_id, item_id, access_token)
+        
+        if file_details:
+            file_details['library_title'] = library_title
+            file_details['library_id'] = library_id
+            processed_items.append(file_details)
+            print(f" ✓ ({file_details['version_count']} versions)")
+        else:
+            print(" ✗ (Failed or not a file)")
+        
+        # Add a small delay to avoid rate limiting
+        time.sleep(0.3)
+    
+    return processed_items
+
+# ============================================================
 # MAIN PROCESSING FUNCTIONS
 # ============================================================
 
@@ -357,12 +560,13 @@ def process_lists(site_url, access_token):
     
     if not lists_data:
         print("No lists or libraries found.")
-        return []
+        return [], []
     
     print(f"Found {len(lists_data)} lists/libraries.")
     
-    # Process each list
+    # Process each list for summary
     processed_lists = []
+    all_file_data = []
     
     for list_item in lists_data:
         # Extract required fields
@@ -371,14 +575,6 @@ def process_lists(site_url, access_token):
         base_template = list_item.get('BaseTemplate', 0)
         hidden = list_item.get('Hidden', False)
         list_id = list_item.get('Id', '')
-        
-        # Get additional details
-        created = list_item.get('Created', 'N/A')
-        description = list_item.get('Description', '')
-        enable_versioning = list_item.get('EnableVersioning', False)
-        enable_minor_versions = list_item.get('EnableMinorVersions', False)
-        is_application_list = list_item.get('IsApplicationList', False)
-        is_catalog = list_item.get('IsCatalog', False)
         
         # Get list type name and category
         list_type_name = get_list_type_name(base_template)
@@ -395,23 +591,32 @@ def process_lists(site_url, access_token):
             'TemplateName': list_type_name,
             'Category': list_category,
             'Hidden': 'Yes' if hidden else 'No',
-            'IsDocumentLibrary': 'Yes' if is_document_library else 'No',
-            'Created': format_datetime(created),
-            'Description': description,
-            'EnableVersioning': 'Yes' if enable_versioning else 'No',
-            'EnableMinorVersions': 'Yes' if enable_minor_versions else 'No',
-            'IsApplicationList': 'Yes' if is_application_list else 'No',
-            'IsCatalog': 'Yes' if is_catalog else 'No'
+            'IsDocumentLibrary': 'Yes' if is_document_library else 'No'
         }
         
         processed_lists.append(processed_list)
+        
+        # If it's a document library, process its items for version history
+        if is_document_library and not hidden:
+            print(f"\n{'='*60}")
+            print(f"PROCESSING DOCUMENT LIBRARY: {title}")
+            print(f"{'='*60}")
+            
+            library_info = {
+                'id': list_id,
+                'title': title
+            }
+            
+            library_items = process_library_items(site_url, library_info, access_token)
+            all_file_data.extend(library_items)
+            
+            print(f"\n  Completed processing {len(library_items)} items from {title}")
     
-    return processed_lists
+    return processed_lists, all_file_data
 
-def generate_csv_report(lists_data, output_file):
-    """Generate CSV report from lists data"""
+def generate_list_summary_report(lists_data, output_file):
+    """Generate CSV report for lists summary"""
     try:
-        # Define field order for CSV
         fieldnames = [
             'Title',
             'ID',
@@ -420,149 +625,166 @@ def generate_csv_report(lists_data, output_file):
             'TemplateName',
             'Category',
             'Hidden',
-            'IsDocumentLibrary',
-            'Created',
-            'Description',
-            'EnableVersioning',
-            'EnableMinorVersions',
-            'IsApplicationList',
-            'IsCatalog'
+            'IsDocumentLibrary'
         ]
         
         with open(output_file, 'w', newline='', encoding='utf-8-sig') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            # Sort by Category, then by Title
             sorted_data = sorted(lists_data, key=lambda x: (x['Category'], x['Title']))
             
             for data in sorted_data:
                 writer.writerow(data)
         
-        print(f"\n✓ Report generated successfully: {output_file}")
-        print(f"  Total lists/libraries: {len(lists_data)}")
+        print(f"\n✓ List summary report generated: {output_file}")
         
     except Exception as e:
-        print(f"Error generating CSV report: {str(e)}")
+        print(f"Error generating list summary report: {str(e)}")
 
-def print_summary_stats(lists_data):
-    """Print summary statistics about the lists"""
+def generate_version_history_report(file_data, output_file):
+    """Generate CSV report for version history"""
+    try:
+        fieldnames = [
+            'Library',
+            'Item ID',
+            'File Name',
+            'File URL',
+            'Current File Size (bytes)',
+            'Version Count',
+            'First Version Date',
+            'Last Version Date',
+            'Total Versions Size (bytes)',
+            'File Created',
+            'File Modified'
+        ]
+        
+        # Create version history output filename
+        version_output = output_file.replace('.csv', '_Version_History.csv')
+        
+        with open(version_output, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Sort by version count descending
+            sorted_data = sorted(file_data, key=lambda x: x.get('version_count', 0), reverse=True)
+            
+            for data in sorted_data:
+                writer.writerow({
+                    'Library': data.get('library_title', ''),
+                    'Item ID': data.get('item_id', 0),
+                    'File Name': data.get('file_name', ''),
+                    'File URL': data.get('file_url', ''),
+                    'Current File Size (bytes)': data.get('current_file_size', 0),
+                    'Version Count': data.get('version_count', 0),
+                    'First Version Date': data.get('first_version_formatted', 'N/A'),
+                    'Last Version Date': data.get('last_version_formatted', 'N/A'),
+                    'Total Versions Size (bytes)': data.get('total_versions_size', 0),
+                    'File Created': data.get('created_formatted', 'N/A'),
+                    'File Modified': data.get('modified_formatted', 'N/A')
+                })
+        
+        print(f"✓ Version history report generated: {version_output}")
+        
+    except Exception as e:
+        print(f"Error generating version history report: {str(e)}")
+
+def generate_detailed_version_report(file_data, output_file):
+    """Generate detailed version report with individual versions"""
+    try:
+        detailed_fieldnames = [
+            'Library',
+            'Item ID',
+            'File Name',
+            'File URL',
+            'Version ID',
+            'Version Label',
+            'Version Created',
+            'Is Current Version',
+            'Version Size (bytes)',
+            'Check-in Comment'
+        ]
+        
+        detailed_output = output_file.replace('.csv', '_Detailed_Versions.csv')
+        
+        with open(detailed_output, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=detailed_fieldnames)
+            writer.writeheader()
+            
+            for data in file_data:
+                if data.get('versions'):
+                    for version in data['versions']:
+                        writer.writerow({
+                            'Library': data.get('library_title', ''),
+                            'Item ID': data.get('item_id', 0),
+                            'File Name': data.get('file_name', ''),
+                            'File URL': data.get('file_url', ''),
+                            'Version ID': version.get('id', 0),
+                            'Version Label': version.get('version_label', ''),
+                            'Version Created': format_datetime(version.get('created', 'N/A')),
+                            'Is Current Version': 'Yes' if version.get('is_current', False) else 'No',
+                            'Version Size (bytes)': version.get('size', 0),
+                            'Check-in Comment': version.get('checkin_comment', '')
+                        })
+        
+        print(f"✓ Detailed version report generated: {detailed_output}")
+        
+    except Exception as e:
+        print(f"Error generating detailed version report: {str(e)}")
+
+def print_summary_stats(lists_data, file_data):
+    """Print summary statistics"""
     if not lists_data:
         print("\nNo data to summarize.")
         return
     
     total_lists = len(lists_data)
+    doc_libraries = [l for l in lists_data if l.get('IsDocumentLibrary') == 'Yes']
+    hidden_lists = [l for l in lists_data if l.get('Hidden') == 'Yes']
     
-    # Count by category
-    category_counts = {}
-    hidden_count = 0
-    doc_library_count = 0
-    total_items = 0
-    
-    for list_item in lists_data:
-        category = list_item.get('Category', 'Unknown')
-        category_counts[category] = category_counts.get(category, 0) + 1
-        
-        if list_item.get('Hidden') == 'Yes':
-            hidden_count += 1
-        
-        if list_item.get('IsDocumentLibrary') == 'Yes':
-            doc_library_count += 1
-        
-        total_items += list_item.get('ItemCount', 0)
+    total_items = sum(l.get('ItemCount', 0) for l in lists_data)
     
     print("\n" + "="*80)
-    print("SHAREPOINT LISTS AND LIBRARIES SUMMARY")
+    print("SHAREPOINT LISTS AND VERSION HISTORY SUMMARY")
     print("="*80)
     print(f"Total lists/libraries: {total_lists}")
+    print(f"Document libraries: {len(doc_libraries)}")
+    print(f"Hidden lists: {len(hidden_lists)}")
     print(f"Total items across all lists: {total_items:,}")
-    print(f"Document libraries: {doc_library_count}")
-    print(f"Hidden lists: {hidden_count}")
-    print("\nLists by Category:")
     
-    # Sort categories by count
-    sorted_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
-    for category, count in sorted_categories:
-        print(f"  {category}: {count}")
+    if file_data:
+        total_files = len(file_data)
+        total_versions = sum(f.get('version_count', 0) for f in file_data)
+        files_with_versions = len([f for f in file_data if f.get('version_count', 0) > 0])
+        
+        print(f"\nFiles processed with version history: {total_files}")
+        print(f"Files with versions: {files_with_versions}")
+        print(f"Total version records: {total_versions}")
+        
+        # Find files with most versions
+        if file_data:
+            top_files = sorted(file_data, key=lambda x: x.get('version_count', 0), reverse=True)[:10]
+            print("\nTOP 10 FILES WITH MOST VERSIONS:")
+            print("-"*80)
+            for i, file in enumerate(top_files, 1):
+                if file.get('version_count', 0) > 0:
+                    print(f"{i:2d}. {file.get('file_name', 'Unknown')}")
+                    print(f"    Versions: {file.get('version_count', 0)}")
+                    print(f"    Library: {file.get('library_title', '')}")
+                    print(f"    Item ID: {file.get('item_id', 0)}")
+                    print()
     
     print("="*80)
-
-def print_top_lists(lists_data):
-    """Print top lists by item count"""
-    if not lists_data:
-        return
-    
-    # Filter out hidden lists and sort by item count
-    visible_lists = [l for l in lists_data if l.get('Hidden') == 'No']
-    sorted_lists = sorted(visible_lists, key=lambda x: x['ItemCount'], reverse=True)
-    
-    # Get top 10
-    top_lists = sorted_lists[:10]
-    
-    if top_lists:
-        print("\nTOP 10 LISTS/LIBRARIES BY ITEM COUNT:")
-        print("-"*80)
-        for i, list_item in enumerate(top_lists, 1):
-            print(f"{i:2d}. {list_item['Title']}")
-            print(f"    Items: {list_item['ItemCount']:,}")
-            print(f"    Category: {list_item['Category']}")
-            print(f"    Template: {list_item['TemplateName']}")
-            print()
-
-def generate_category_report(lists_data, output_file):
-    """Generate a summary report by category"""
-    try:
-        # Create category summary
-        category_summary = {}
-        for list_item in lists_data:
-            category = list_item.get('Category', 'Unknown')
-            if category not in category_summary:
-                category_summary[category] = {
-                    'count': 0,
-                    'items': 0,
-                    'hidden': 0,
-                    'doc_libraries': 0
-                }
-            
-            category_summary[category]['count'] += 1
-            category_summary[category]['items'] += list_item.get('ItemCount', 0)
-            
-            if list_item.get('Hidden') == 'Yes':
-                category_summary[category]['hidden'] += 1
-            
-            if list_item.get('IsDocumentLibrary') == 'Yes':
-                category_summary[category]['doc_libraries'] += 1
-        
-        # Create summary output filename
-        summary_output = output_file.replace('.csv', '_Category_Summary.csv')
-        
-        with open(summary_output, 'w', newline='', encoding='utf-8-sig') as csvfile:
-            fieldnames = ['Category', 'Total Lists', 'Total Items', 'Hidden Lists', 'Document Libraries']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for category, stats in sorted(category_summary.items()):
-                writer.writerow({
-                    'Category': category,
-                    'Total Lists': stats['count'],
-                    'Total Items': stats['items'],
-                    'Hidden Lists': stats['hidden'],
-                    'Document Libraries': stats['doc_libraries']
-                })
-        
-        print(f"✓ Category summary report generated: {summary_output}")
-        
-    except Exception as e:
-        print(f"Error generating category summary: {str(e)}")
 
 # ============================================================
 # MAIN FUNCTION
 # ============================================================
 
 def main():
-    """Main function to generate SharePoint lists report"""
+    """Main function to generate SharePoint lists and version history report"""
     print("="*80)
-    print("SHAREPOINT LISTS AND LIBRARIES REPORT GENERATOR")
+    print("SHAREPOINT LISTS AND VERSION HISTORY REPORT GENERATOR")
+    print("(Using Item ID for version retrieval)")
     print("="*80)
     print(f"SharePoint Site: {CONFIG['site_url']}")
     print(f"Output File: {CONFIG['output_csv']}")
@@ -582,10 +804,10 @@ def main():
     site_url = get_site_url()
     
     # Process all lists
-    print("Starting list discovery...")
+    print("Starting list discovery and version history analysis...")
     start_time = time.time()
     
-    lists_data = process_lists(site_url, access_token)
+    lists_data, file_data = process_lists(site_url, access_token)
     
     elapsed_time = time.time() - start_time
     print(f"\nProcessing completed in {elapsed_time:.2f} seconds.")
@@ -597,34 +819,35 @@ def main():
     # Generate reports
     output_file = CONFIG['output_csv']
     
-    # Main report
-    generate_csv_report(lists_data, output_file)
+    # List summary report
+    generate_list_summary_report(lists_data, output_file)
     
-    # Category summary report
-    generate_category_report(lists_data, output_file)
+    # Version history report
+    if file_data:
+        generate_version_history_report(file_data, output_file)
+        generate_detailed_version_report(file_data, output_file)
+    else:
+        print("\nNo files with version history were found.")
     
     # Print summary statistics
-    print_summary_stats(lists_data)
-    
-    # Print top lists
-    print_top_lists(lists_data)
+    print_summary_stats(lists_data, file_data)
     
     print("\nReport generation completed successfully!")
-    print(f"✓ Main Report: {output_file}")
-    print(f"✓ Category Summary: {output_file.replace('.csv', '_Category_Summary.csv')}")
+    print(f"✓ List Summary Report: {output_file}")
+    if file_data:
+        print(f"✓ Version History Report: {output_file.replace('.csv', '_Version_History.csv')}")
+        print(f"✓ Detailed Version Report: {output_file.replace('.csv', '_Detailed_Versions.csv')}")
     
-    # Print sample of the data
     print("\n" + "="*80)
-    print("SAMPLE DATA (First 5 visible lists):")
+    print("SAMPLE DATA (First 5 visible document libraries):")
     print("="*80)
     
-    visible_lists = [l for l in lists_data if l.get('Hidden') == 'No'][:5]
-    for i, list_item in enumerate(visible_lists, 1):
-        print(f"\n{i}. Title: {list_item['Title']}")
-        print(f"   Items: {list_item['ItemCount']:,}")
-        print(f"   Template: {list_item['TemplateName']} (BaseTemplate: {list_item['BaseTemplate']})")
-        print(f"   Category: {list_item['Category']}")
-        print(f"   Created: {list_item['Created']}")
+    visible_doc_libs = [l for l in lists_data if l.get('IsDocumentLibrary') == 'Yes' and l.get('Hidden') == 'No'][:5]
+    for i, lib in enumerate(visible_doc_libs, 1):
+        print(f"\n{i}. Library: {lib['Title']}")
+        print(f"   Items: {lib['ItemCount']:,}")
+        print(f"   Template: {lib['TemplateName']}")
+        print(f"   Category: {lib['Category']}")
 
 if __name__ == "__main__":
     main()
