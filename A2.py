@@ -221,7 +221,6 @@ def format_datetime(datetime_str):
     
     try:
         if 'T' in datetime_str:
-            # Handle milliseconds if present
             if '.' in datetime_str:
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ")
             else:
@@ -366,7 +365,6 @@ def update_summary_report(library_summary):
     global csv_writers, csv_files
     
     try:
-        # Clear existing summary data
         csv_files['summary'].close()
         csv_files['summary'] = open(csv_files['summary'].name, 'w', newline='', encoding='utf-8-sig')
         csv_writers['summary'] = csv.DictWriter(csv_files['summary'], 
@@ -405,40 +403,69 @@ def close_reports():
             pass
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL FUNCTIONS
+# SHAREPOINT DATA RETRIEVAL FUNCTIONS WITH PAGINATION
 # ============================================================
 
 def get_all_libraries(site_url, access_token):
-    """Get all document libraries from SharePoint site"""
+    """Get all document libraries from SharePoint site with pagination"""
     print("\nGetting document libraries...")
     lists_url = f"{site_url}/_api/web/lists"
-    response = make_sharepoint_request(lists_url, access_token)
+    all_libraries = []
+    next_url = lists_url
     
-    if response and 'd' in response and 'results' in response['d']:
-        libraries = []
-        for lst in response['d']['results']:
-            if lst['BaseTemplate'] == 101:
-                libraries.append({
-                    'id': lst['Id'],
-                    'title': lst['Title']
-                })
-        return libraries
-    return []
+    while next_url:
+        print(f"  Fetching libraries page...")
+        response = make_sharepoint_request(next_url, access_token)
+        
+        if not response or 'd' not in response:
+            break
+        
+        if 'results' in response['d']:
+            for lst in response['d']['results']:
+                if lst['BaseTemplate'] == 101:
+                    all_libraries.append({
+                        'id': lst['Id'],
+                        'title': lst['Title']
+                    })
+        
+        # Check for next page
+        next_url = None
+        if '__next' in response.get('d', {}):
+            next_url = response['d']['__next']
+    
+    return all_libraries
 
 def get_all_items_from_library(site_url, library_id, access_token):
-    """Get all items from a library with File expanded to get file properties"""
-    print(f"    Fetching all items from library...")
+    """Get all items from a library with pagination and File expanded"""
+    print(f"    Fetching items from library...")
+    
     # Use $expand=File to get file properties
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$expand=File"
-    response = make_sharepoint_request(items_url, access_token)
+    all_items = []
+    next_url = items_url
+    page_count = 0
     
-    if not response or 'd' not in response:
-        return []
+    while next_url:
+        page_count += 1
+        print(f"    Fetching page {page_count}...", end="")
+        response = make_sharepoint_request(next_url, access_token)
+        
+        if not response or 'd' not in response:
+            print(" ✗ Failed")
+            break
+        
+        if 'results' in response['d']:
+            items_in_page = len(response['d']['results'])
+            all_items.extend(response['d']['results'])
+            print(f" ✓ Got {items_in_page} items")
+        
+        # Check for next page
+        next_url = None
+        if '__next' in response.get('d', {}):
+            next_url = response['d']['__next']
     
-    if 'results' not in response['d']:
-        return []
-    
-    return response['d']['results']
+    print(f"    Total items fetched: {len(all_items)}")
+    return all_items
 
 def get_file_versions(site_url, list_id, item_id, access_token):
     """Get versions for a specific item using /items({item_id})/versions"""
@@ -598,7 +625,7 @@ def process_files(site_url, access_token, output_file):
     # Initialize reports
     initialize_reports(output_file)
     
-    # Get all document libraries
+    # Get all document libraries with pagination
     libraries = get_all_libraries(site_url, access_token)
     
     if not libraries:
@@ -606,7 +633,7 @@ def process_files(site_url, access_token, output_file):
         close_reports()
         return []
     
-    print(f"Found {len(libraries)} document libraries:")
+    print(f"\nFound {len(libraries)} document libraries:")
     for lib in libraries:
         print(f"  - {lib['title']}")
     
@@ -621,7 +648,7 @@ def process_files(site_url, access_token, output_file):
         print(f"Processing library: {library['title']}")
         print(f"{'='*60}")
         
-        # Get all items from the library with File expanded
+        # Get all items from the library with pagination
         items = get_all_items_from_library(site_url, library['id'], access_token)
         
         if not items:
@@ -666,7 +693,7 @@ def process_files(site_url, access_token, output_file):
             else:
                 print(" ✗ (Failed to process)")
             
-            # Small delay
+            # Small delay to avoid rate limiting
             time.sleep(0.3)
     
     print(f"\n{'='*60}")
@@ -686,7 +713,7 @@ def main():
     """Main function"""
     print("="*80)
     print("FILE VERSION HISTORY REPORT GENERATOR")
-    print("(Real-time report updates using Item ID)")
+    print("(Real-time report updates with pagination support)")
     print("="*80)
     print(f"SharePoint Site: {CONFIG['site_url']}")
     print(f"Output File: {CONFIG['output_csv']}")
