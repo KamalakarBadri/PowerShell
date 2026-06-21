@@ -18,23 +18,16 @@ from cryptography.hazmat.backends import default_backend
 # ============================================================
 
 CONFIG = {
-    # SharePoint Site Configuration
     "site_url": "https://geekbyteonline.sharepoint.com/sites/Team_Site2",
-    
-    # Authentication Configuration
     "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
     "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
     "scope": "https://geekbyteonline.sharepoint.com/.default",
-    
-    # Certificate Paths
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
-    
-    # Output Configuration
     "output_csv": f"File_Version_History_Report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
 }
 
-# Token cache with expiration
+# Token cache
 TOKEN_CACHE = {
     "token": None,
     "expires": 0
@@ -52,7 +45,7 @@ def load_certificate_and_key():
     """Load certificate and private key from PEM files"""
     try:
         if not os.path.exists(CONFIG['certificate_path']) or not os.path.exists(CONFIG['private_key_path']):
-            raise Exception(f"Certificate files not found. Check paths: {CONFIG['certificate_path']}, {CONFIG['private_key_path']}")
+            raise Exception(f"Certificate files not found.")
         
         with open(CONFIG['certificate_path'], "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
@@ -69,7 +62,7 @@ def get_jwt_token(certificate, private_key):
     """Generate JWT token using certificate and private key"""
     try:
         now = int(time.time())
-        expiration = now + 300  # 5 minutes
+        expiration = now + 300
         
         thumbprint = certificate.fingerprint(hashes.SHA1())
         x5t = base64.urlsafe_b64encode(thumbprint).decode('utf-8').replace('=', '')
@@ -134,7 +127,6 @@ def get_access_token(jwt, scope):
         return response.json()["access_token"]
     except requests.exceptions.HTTPError as err:
         print(f"HTTP Error: {err}")
-        print(f"Response: {response.text}")
         raise
     except Exception as err:
         print(f"Error: {err}")
@@ -155,10 +147,9 @@ def get_cached_token(force_refresh=False):
         token = get_access_token(jwt, CONFIG['scope'])
         
         if token:
-            # Cache the token with expiration (assuming 1 hour lifetime)
             cache["token"] = token
             cache["expires"] = time.time() + 3600
-            print(f"  ✓ Token obtained, expires at: {datetime.fromtimestamp(cache['expires']).strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"  ✓ Token obtained, valid for 1 hour")
             return token
         else:
             print("  ✗ Failed to get token")
@@ -167,47 +158,53 @@ def get_cached_token(force_refresh=False):
         print(f"  ✗ Authentication failed: {str(e)}")
         return None
 
-def make_sharepoint_request(url, access_token, max_retries=2):
-    """Make a request to SharePoint REST API with token refresh on 401"""
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json;odata=verbose",
-        "Content-Type": "application/json"
-    }
+def get_current_token():
+    """Get current valid token, refreshing if needed"""
+    return get_cached_token()
+
+def make_sharepoint_request(url):
+    """Make a request to SharePoint REST API with automatic token refresh"""
+    max_retries = 2
     
     for attempt in range(max_retries + 1):
         try:
+            # Get current valid token
+            token = get_current_token()
+            if not token:
+                print(f"  ✗ No valid token available")
+                return None
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json;odata=verbose",
+                "Content-Type": "application/json"
+            }
+            
             response = requests.get(url, headers=headers)
             
             # If unauthorized (401), refresh token and retry
             if response.status_code == 401 and attempt < max_retries:
-                print(f"  ⚠️ Token expired (401), refreshing...")
-                new_token = get_cached_token(force_refresh=True)
-                if new_token:
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    access_token = new_token  # Update for next attempts
-                    continue
-                else:
-                    print(f"  ✗ Failed to refresh token")
-                    return None
+                print(f"  ⚠️ Token expired, refreshing...")
+                # Force refresh the token
+                TOKEN_CACHE["token"] = None  # Invalidate current token
+                TOKEN_CACHE["expires"] = 0
+                continue
             
             response.raise_for_status()
             return response.json()
             
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401 and attempt < max_retries:
-                print(f"  ⚠️ Token expired (401), refreshing...")
-                new_token = get_cached_token(force_refresh=True)
-                if new_token:
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    access_token = new_token
-                    continue
-            print(f"  Request failed (attempt {attempt + 1}): {str(e)}")
+                print(f"  ⚠️ Token expired, refreshing...")
+                TOKEN_CACHE["token"] = None
+                TOKEN_CACHE["expires"] = 0
+                continue
+            print(f"  Request failed: {str(e)}")
             return None
         except requests.exceptions.RequestException as e:
-            print(f"  Request failed (attempt {attempt + 1}): {str(e)}")
+            print(f"  Request failed: {str(e)}")
             if attempt < max_retries:
-                time.sleep(2)  # Wait before retry
+                time.sleep(2)
                 continue
             return None
     
@@ -269,18 +266,9 @@ def initialize_reports(output_file):
     # Main Report
     main_file = output_file
     main_fieldnames = [
-        'Library',
-        'Item ID',
-        'File Name',
-        'File Path',
-        'Current File Size (MB)',
-        'Version Count',
-        'First Version Date',
-        'Last Version Date',
-        'Total Versions Size (MB)',
-        'File Created',
-        'File Modified',
-        'Processed At'
+        'Library', 'Item ID', 'File Name', 'File Path', 'Current File Size (MB)',
+        'Version Count', 'First Version Date', 'Last Version Date', 
+        'Total Versions Size (MB)', 'File Created', 'File Modified', 'Processed At'
     ]
     
     csv_files['main'] = open(main_file, 'w', newline='', encoding='utf-8-sig')
@@ -292,20 +280,9 @@ def initialize_reports(output_file):
     # Detailed Report
     detailed_file = output_file.replace('.csv', '_Detailed_Versions.csv')
     detailed_fieldnames = [
-        'Library',
-        'Item ID',
-        'File Name',
-        'File Path',
-        'Version ID',
-        'Version Label',
-        'UI Version',
-        'Version Created',
-        'Is Current Version',
-        'Version Size (MB)',
-        'Check-in Comment',
-        'Author',
-        'Editor',
-        'Processed At'
+        'Library', 'Item ID', 'File Name', 'File Path', 'Version ID', 
+        'Version Label', 'UI Version', 'Version Created', 'Is Current Version',
+        'Version Size (MB)', 'Check-in Comment', 'Author', 'Editor', 'Processed At'
     ]
     
     csv_files['detailed'] = open(detailed_file, 'w', newline='', encoding='utf-8-sig')
@@ -317,13 +294,9 @@ def initialize_reports(output_file):
     # Summary Report
     summary_file = output_file.replace('.csv', '_Summary.csv')
     summary_fieldnames = [
-        'Library',
-        'Total Files',
-        'Total Versions',
-        'Total Current Size (MB)',
-        'Total Versions Size (MB)',
-        'Average Versions per File',
-        'Last Updated'
+        'Library', 'Total Files', 'Total Versions', 
+        'Total Current Size (MB)', 'Total Versions Size (MB)',
+        'Average Versions per File', 'Last Updated'
     ]
     
     csv_files['summary'] = open(summary_file, 'w', newline='', encoding='utf-8-sig')
@@ -431,11 +404,11 @@ def close_reports():
             pass
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL FUNCTIONS WITH TOKEN REFRESH
+# SHAREPOINT DATA RETRIEVAL FUNCTIONS
 # ============================================================
 
-def get_all_libraries(site_url, access_token):
-    """Get all document libraries from SharePoint site with pagination and token refresh"""
+def get_all_libraries(site_url):
+    """Get all document libraries from SharePoint site with pagination"""
     print("\nGetting document libraries...")
     lists_url = f"{site_url}/_api/web/lists"
     all_libraries = []
@@ -443,7 +416,7 @@ def get_all_libraries(site_url, access_token):
     
     while next_url:
         print(f"  Fetching libraries page...")
-        response = make_sharepoint_request(next_url, access_token)
+        response = make_sharepoint_request(next_url)
         
         if not response or 'd' not in response:
             break
@@ -456,15 +429,14 @@ def get_all_libraries(site_url, access_token):
                         'title': lst['Title']
                     })
         
-        # Check for next page
         next_url = None
         if '__next' in response.get('d', {}):
             next_url = response['d']['__next']
     
     return all_libraries
 
-def get_all_items_from_library(site_url, library_id, access_token):
-    """Get all items from a library with pagination and token refresh"""
+def get_all_items_from_library(site_url, library_id):
+    """Get all items from a library with pagination"""
     print(f"    Fetching items from library...")
     
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$expand=File"
@@ -475,7 +447,7 @@ def get_all_items_from_library(site_url, library_id, access_token):
     while next_url:
         page_count += 1
         print(f"    Fetching page {page_count}...", end="")
-        response = make_sharepoint_request(next_url, access_token)
+        response = make_sharepoint_request(next_url)
         
         if not response or 'd' not in response:
             print(" ✗ Failed")
@@ -486,7 +458,6 @@ def get_all_items_from_library(site_url, library_id, access_token):
             all_items.extend(response['d']['results'])
             print(f" ✓ Got {items_in_page} items")
         
-        # Check for next page
         next_url = None
         if '__next' in response.get('d', {}):
             next_url = response['d']['__next']
@@ -494,12 +465,12 @@ def get_all_items_from_library(site_url, library_id, access_token):
     print(f"    Total items fetched: {len(all_items)}")
     return all_items
 
-def get_file_versions(site_url, list_id, item_id, access_token):
-    """Get versions for a specific item with token refresh"""
+def get_file_versions(site_url, list_id, item_id):
+    """Get versions for a specific item"""
     try:
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
         
-        response = make_sharepoint_request(versions_url, access_token)
+        response = make_sharepoint_request(versions_url)
         
         if not response or 'd' not in response:
             return []
@@ -552,7 +523,7 @@ def get_file_details_from_item(item):
         'modified': item.get('Modified', 'N/A')
     }
 
-def process_file_item(site_url, list_id, item, access_token, library_title, library_summary):
+def process_file_item(site_url, list_id, item, library_title, library_summary):
     """Process a single item and update reports dynamically"""
     try:
         item_id = item.get('Id')
@@ -562,7 +533,7 @@ def process_file_item(site_url, list_id, item, access_token, library_title, libr
             return None
         
         file_details = get_file_details_from_item(item)
-        versions = get_file_versions(site_url, list_id, item_id, access_token)
+        versions = get_file_versions(site_url, list_id, item_id)
         
         version_count = len(versions)
         total_versions_size = 0
@@ -631,12 +602,12 @@ def process_file_item(site_url, list_id, item, access_token, library_title, libr
 # MAIN PROCESSING FUNCTIONS
 # ============================================================
 
-def process_files(site_url, access_token, output_file):
-    """Process all files and update reports dynamically with token refresh"""
+def process_files(site_url, output_file):
+    """Process all files and update reports dynamically"""
     
     initialize_reports(output_file)
     
-    libraries = get_all_libraries(site_url, access_token)
+    libraries = get_all_libraries(site_url)
     
     if not libraries:
         print("No document libraries found.")
@@ -657,7 +628,7 @@ def process_files(site_url, access_token, output_file):
         print(f"Processing library: {library['title']}")
         print(f"{'='*60}")
         
-        items = get_all_items_from_library(site_url, library['id'], access_token)
+        items = get_all_items_from_library(site_url, library['id'])
         
         if not items:
             print(f"  No items found in {library['title']}")
@@ -684,7 +655,6 @@ def process_files(site_url, access_token, output_file):
                 site_url, 
                 library['id'], 
                 file_item, 
-                access_token, 
                 library['title'],
                 library_summary
             )
@@ -692,7 +662,6 @@ def process_files(site_url, access_token, output_file):
             if file_data:
                 all_file_data.append(file_data)
                 print(f" ✓ ({file_data['version_count']} versions, {file_data['total_versions_size_mb']:.2f} MB total)")
-                print(f"  → Reports updated dynamically")
             else:
                 print(" ✗ (Failed to process)")
             
@@ -700,7 +669,6 @@ def process_files(site_url, access_token, output_file):
     
     print(f"\n{'='*60}")
     print(f"Processed {len(all_file_data)} files with version history.")
-    print("Reports have been updated in real-time.")
     
     close_reports()
     
@@ -733,11 +701,10 @@ def main():
     output_file = CONFIG['output_csv']
     
     print("Starting file processing...")
-    print("Reports will be updated after each file is processed.")
-    print("Token will be automatically refreshed if it expires.")
+    print("Token will be automatically refreshed only when expired.")
     start_time = time.time()
     
-    file_data = process_files(site_url, access_token, output_file)
+    file_data = process_files(site_url, output_file)
     
     elapsed_time = time.time() - start_time
     print(f"\nProcessing completed in {elapsed_time:.2f} seconds.")
