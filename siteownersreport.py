@@ -2,6 +2,7 @@
 """
 SharePoint Site Admin Report Generator
 Generates a CSV report of site administrators for a list of SharePoint sites
+Supports input from CSV file or interactive input
 """
 
 import requests
@@ -179,7 +180,6 @@ def parse_site_users_xml(xml_content: str) -> List[Dict[str, Any]]:
 def get_site_admins(site_url: str) -> List[Dict[str, Any]]:
     """Get all site administrators for a SharePoint site"""
     try:
-        # Ensure site URL ends properly
         if not site_url.endswith('/'):
             site_url += '/'
         
@@ -212,23 +212,28 @@ def normalize_site_url(site_input: str) -> str:
     """Normalize site URL from various input formats"""
     site_input = site_input.strip()
     
-    # If it's already a full URL
     if site_input.startswith('http'):
         return site_input
     
-    # If it's a relative path like "sites/sitename"
     if not site_input.startswith('sites/'):
         site_input = f"sites/{site_input}"
     
     tenant_name = CONFIG['tenant_name'].split('.')[0]
     return f"https://{tenant_name}.sharepoint.com/{site_input}"
 
-def generate_report(site_list: List[str], output_file: str = "sharepoint_admin_report.csv"):
+def generate_report(site_list: List[Dict[str, str]], output_file: str = "sharepoint_admin_report.csv"):
     """Generate CSV report for a list of SharePoint sites"""
     
     report_data = []
     
-    for site_input in site_list:
+    for site_entry in site_list:
+        site_input = site_entry.get('site_url') or site_entry.get('Site URL') or site_entry.get('Site') or site_entry.get('site')
+        site_name = site_entry.get('site_name') or site_entry.get('Site Name') or site_entry.get('Name') or site_input
+        
+        if not site_input:
+            logger.warning(f"Skipping entry with no site URL: {site_entry}")
+            continue
+        
         try:
             site_url = normalize_site_url(site_input)
             logger.info(f"Processing site: {site_url}")
@@ -238,43 +243,45 @@ def generate_report(site_list: List[str], output_file: str = "sharepoint_admin_r
             if not admins:
                 report_data.append({
                     'Site URL': site_url,
-                    'Site Name': site_input,
+                    'Site Name': site_name,
                     'Admin Emails': '',
                     'Admin Names': '',
                     'Admin Count': 0,
-                    'Error': 'No admins found or site inaccessible'
+                    'Error': 'No admins found or site inaccessible',
+                    'Additional Info': site_entry.get('additional_info', '')
                 })
             else:
-                # Extract admin emails and names
                 admin_emails = [admin.get('email', admin.get('login_name', '')) for admin in admins if admin.get('email') or admin.get('login_name')]
                 admin_names = [admin.get('title', admin.get('login_name', '')) for admin in admins if admin.get('title') or admin.get('login_name')]
                 
                 report_data.append({
                     'Site URL': site_url,
-                    'Site Name': site_input,
+                    'Site Name': site_name,
                     'Admin Emails': ', '.join(admin_emails) if admin_emails else '',
                     'Admin Names': ', '.join(admin_names) if admin_names else '',
                     'Admin Count': len(admins),
-                    'Error': ''
+                    'Error': '',
+                    'Additional Info': site_entry.get('additional_info', '')
                 })
                 
         except Exception as e:
             logger.error(f"Error processing {site_input}: {str(e)}")
             report_data.append({
                 'Site URL': site_input,
-                'Site Name': site_input,
+                'Site Name': site_name,
                 'Admin Emails': '',
                 'Admin Names': '',
                 'Admin Count': 0,
-                'Error': str(e)
+                'Error': str(e),
+                'Additional Info': site_entry.get('additional_info', '')
             })
     
     # Write to CSV
     try:
+        output_headers = ['Site URL', 'Site Name', 'Admin Emails', 'Admin Names', 'Admin Count', 'Error', 'Additional Info']
+        
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Site URL', 'Site Name', 'Admin Emails', 'Admin Names', 'Admin Count', 'Error']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+            writer = csv.DictWriter(csvfile, fieldnames=output_headers)
             writer.writeheader()
             for row in report_data:
                 writer.writerow(row)
@@ -283,7 +290,6 @@ def generate_report(site_list: List[str], output_file: str = "sharepoint_admin_r
         print(f"\n✅ Report generated: {output_file}")
         print(f"📊 Processed {len(site_list)} sites")
         
-        # Print summary
         successful = sum(1 for row in report_data if not row['Error'])
         print(f"✅ Successful: {successful}")
         print(f"❌ Failed: {len(site_list) - successful}")
@@ -292,33 +298,114 @@ def generate_report(site_list: List[str], output_file: str = "sharepoint_admin_r
         logger.error(f"Failed to write CSV report: {str(e)}")
         raise
 
+def read_sites_from_csv(csv_file: str) -> List[Dict[str, str]]:
+    """Read sites from input CSV file"""
+    sites = []
+    
+    try:
+        with open(csv_file, 'r', encoding='utf-8') as file:
+            reader = csv.DictReader(file)
+            
+            # Check if headers exist
+            if not reader.fieldnames:
+                print("❌ CSV file has no headers")
+                return []
+            
+            print(f"\n📋 Found headers: {', '.join(reader.fieldnames)}")
+            print(f"   Expected headers: 'Site URL', 'Site Name' (or variations)")
+            print()
+            
+            for row in reader:
+                # Try to find site URL column
+                site_url = None
+                for col in ['Site URL', 'Site', 'site_url', 'site', 'URL', 'url']:
+                    if col in row and row[col]:
+                        site_url = row[col]
+                        break
+                
+                if site_url:
+                    site_entry = {'site_url': site_url}
+                    
+                    # Try to find site name column
+                    for col in ['Site Name', 'Name', 'site_name', 'name']:
+                        if col in row and row[col]:
+                            site_entry['site_name'] = row[col]
+                            break
+                    
+                    # Store any additional columns as additional_info
+                    additional_info = []
+                    for key, value in row.items():
+                        if key not in ['Site URL', 'Site', 'site_url', 'site', 'URL', 'url', 
+                                       'Site Name', 'Name', 'site_name', 'name'] and value:
+                            additional_info.append(f"{key}: {value}")
+                    
+                    if additional_info:
+                        site_entry['additional_info'] = ' | '.join(additional_info)
+                    else:
+                        site_entry['additional_info'] = ''
+                    
+                    sites.append(site_entry)
+                else:
+                    logger.warning(f"Skipping row with no site URL: {row}")
+        
+        return sites
+        
+    except Exception as e:
+        logger.error(f"Failed to read CSV file: {str(e)}")
+        return []
+
 def main():
     """Main function to run the report generator"""
     
-    print("=" * 60)
+    print("=" * 70)
     print("SharePoint Site Admin Report Generator")
-    print("=" * 60)
+    print("=" * 70)
     print()
     
-    # Get site list from user
-    print("Enter SharePoint sites (one per line, press Enter twice to finish):")
-    print("Examples:")
-    print("  - Full URL: https://tenant.sharepoint.com/sites/projectx")
-    print("  - Short name: projectx")
-    print("  - Path: sites/projectx")
+    print("Choose input method:")
+    print("1. Interactive input (enter sites manually)")
+    print("2. CSV file input")
     print()
+    
+    choice = input("Enter your choice (1 or 2): ").strip()
     
     site_list = []
-    while True:
-        line = input().strip()
-        if not line:
-            if site_list:
-                break
-            else:
-                print("Please enter at least one site")
-                continue
-        site_list.append(line)
-        print(f"  Added: {line}")
+    
+    if choice == '2':
+        csv_file = input("Enter input CSV file path: ").strip()
+        
+        if not os.path.exists(csv_file):
+            print(f"❌ File not found: {csv_file}")
+            return
+        
+        print(f"\n📄 Reading sites from: {csv_file}")
+        site_list = read_sites_from_csv(csv_file)
+        
+        if not site_list:
+            print("❌ No sites found in CSV file")
+            return
+        
+        print(f"\n✅ Found {len(site_list)} sites in CSV file")
+        
+    else:
+        # Interactive input
+        print("\nEnter SharePoint sites (one per line, press Enter twice to finish):")
+        print("Examples:")
+        print("  - Full URL: https://tenant.sharepoint.com/sites/projectx")
+        print("  - Short name: projectx")
+        print("  - Path: sites/projectx")
+        print()
+        
+        while True:
+            line = input().strip()
+            if not line:
+                if site_list:
+                    break
+                else:
+                    print("Please enter at least one site")
+                    continue
+            site_list.append({'site_url': line, 'site_name': line, 'additional_info': ''})
+            print(f"  Added: {line}")
     
     if not site_list:
         print("No sites provided. Exiting.")
@@ -327,11 +414,9 @@ def main():
     print(f"\n📋 Processing {len(site_list)} sites...")
     print()
     
-    # Generate timestamp for filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = f"sharepoint_admin_report_{timestamp}.csv"
     
-    # Generate report
     generate_report(site_list, output_file)
 
 if __name__ == "__main__":
