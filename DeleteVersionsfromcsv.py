@@ -1,3 +1,7 @@
+site_url,list_id,item_id,keep_last_n
+https://geekbyteonline.sharepoint.com/sites/Team_Site2,e6a3eb36-59ce-44e2-a7b9-77dd61e2b67b,3,50
+https://geekbyteonline.sharepoint.com/sites/Team_Site2,e6a3eb36-59ce-44e2-a7b9-77dd61e2b67b,8,50
+
 import requests
 import json
 import uuid
