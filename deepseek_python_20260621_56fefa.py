@@ -34,10 +34,8 @@ CONFIG = {
     "output_csv": None
 }
 
-# File extension filter: update here in the main script only.
-# None means process all files. Example: ["docx", "pdf", "xlsx"]
+# File extension filter: set to None for all files, or use a single line like ["docx", "pdf"]
 FILE_EXTENSIONS = None
-ALLOWED_FILE_EXTENSIONS = None
 
 # Token cache
 TOKEN_CACHE = {
