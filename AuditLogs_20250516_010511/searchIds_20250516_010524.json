@@ -1,0 +1,62 @@
+{
+    "https://geekbyteonline.sharepoint.com/sites/2DayRetention_PageViewed": {
+        "SearchId": "ed8c8ea7-2b08-41a2-87db-a136f443ec54",
+        "CreatedTime": "2025-05-15T19:35:11.983197Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/2DayRetention_FileAccessed": {
+        "SearchId": "cd50dda4-a452-4688-9cb7-679ed0d27ab9",
+        "CreatedTime": "2025-05-15T19:35:12.341710Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/2DayRetention_FileDownloaded": {
+        "SearchId": "dd91e84c-f5f0-42f9-8149-f9d12dd4c1ab",
+        "CreatedTime": "2025-05-15T19:35:12.730408Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Pharmacy_PageViewed": {
+        "SearchId": "0c312f9c-87e8-4584-aef6-a32c0f6e456b",
+        "CreatedTime": "2025-05-15T19:35:13.082952Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Pharmacy_FileAccessed": {
+        "SearchId": "97b087c9-80d0-453f-a843-fbfc35fbff22",
+        "CreatedTime": "2025-05-15T19:35:13.493710Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Pharmacy_FileDownloaded": {
+        "SearchId": "fb6e9932-cd3b-4567-9c3a-3354651fab97",
+        "CreatedTime": "2025-05-15T19:35:13.902241Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Radiation-Imaging_PageViewed": {
+        "SearchId": "4465e114-c54e-4879-bae6-659887f2657f",
+        "CreatedTime": "2025-05-15T19:35:14.311425Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Radiation-Imaging_FileAccessed": {
+        "SearchId": "78fe1b80-1233-47eb-b311-fe4344ab54aa",
+        "CreatedTime": "2025-05-15T19:35:14.711246Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/Radiation-Imaging_FileDownloaded": {
+        "SearchId": "18e8bb05-aeb3-4ef8-9c86-a260256023cc",
+        "CreatedTime": "2025-05-15T19:35:15.131162Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/geetkteam_PageViewed": {
+        "SearchId": "c849f822-fba3-48d9-8d30-68d5422edcd8",
+        "CreatedTime": "2025-05-15T19:35:15.370468Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/geetkteam_FileAccessed": {
+        "SearchId": "ff0405fc-693b-429d-8b1f-0579c07fa576",
+        "CreatedTime": "2025-05-15T19:35:15.760359Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/geetkteam_FileDownloaded": {
+        "SearchId": "d1565903-5822-4928-a17c-55729eea4960",
+        "CreatedTime": "2025-05-15T19:35:16.060772Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/New365Site5_PageViewed": {
+        "SearchId": "fd8b01ce-3ac7-4dee-ac99-bcb453b351cd",
+        "CreatedTime": "2025-05-15T19:35:16.305746Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/New365Site5_FileAccessed": {
+        "SearchId": "f00cc359-a57f-4288-92d4-c1556c22b358",
+        "CreatedTime": "2025-05-15T19:35:16.769431Z"
+    },
+    "https://geekbyteonline.sharepoint.com/sites/New365Site5_FileDownloaded": {
+        "SearchId": "db121892-b1c8-4baf-ad07-4db9a1a29b49",
+        "CreatedTime": "2025-05-15T19:35:17.110213Z"
+    }
+}

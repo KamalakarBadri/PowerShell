@@ -30,8 +30,14 @@ CONFIG = {
     # ============================================================
     "min_file_size_mb": 200,  # Only check version history for files > 200 MB
     
-    "output_csv": f"File_Version_History_Report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    # Output filename is generated from the site name prefix if None.
+    "output_csv": None
 }
+
+# File extension filter: update here in the main script only.
+# None means process all files. Example: ["docx", "pdf", "xlsx"]
+FILE_EXTENSIONS = None
+ALLOWED_FILE_EXTENSIONS = None
 
 # Token cache
 TOKEN_CACHE = {
@@ -216,6 +222,53 @@ def get_site_url():
     """Get the site URL from CONFIG"""
     return CONFIG['site_url'].rstrip('/')
 
+
+def get_site_prefix(site_url):
+    """Extract site prefix from a SharePoint URL"""
+    normalized = site_url.rstrip('/')
+    parts = normalized.split('/')
+    if 'sites' in parts:
+        idx = parts.index('sites')
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    if parts:
+        return parts[-1]
+    return 'Site'
+
+
+def get_report_filename(site_url):
+    """Create output filename using the site prefix"""
+    site_prefix = get_site_prefix(site_url)
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    return f"{site_prefix}_File_Version_History_Report_{timestamp}.csv"
+
+
+def normalize_extensions(extensions):
+    """Normalize configured file extensions for comparison"""
+    if not extensions:
+        return None
+    if isinstance(extensions, str):
+        extensions = [extensions]
+    normalized = []
+    for ext in extensions:
+        if not ext:
+            continue
+        ext = ext.lower().strip()
+        if ext.startswith('.'):
+            ext = ext[1:]
+        if ext:
+            normalized.append(ext)
+    return normalized or None
+
+
+def should_process_file(file_name):
+    """Decide whether a file matches the configured extension filter"""
+    if not ALLOWED_FILE_EXTENSIONS:
+        return True
+    _, ext = os.path.splitext(file_name or '')
+    ext = ext.lower().lstrip('.')
+    return ext in ALLOWED_FILE_EXTENSIONS
+
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
@@ -273,7 +326,7 @@ def initialize_reports(output_file):
     # Main Report
     main_file = output_file
     main_fieldnames = [
-        'Library', 'Item ID', 'File Name', 'File Path', 'Current File Size (MB)',
+        'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 'Current File Size (MB)',
         'Version Count', 'First Version Date', 'Last Version Date', 
         'Total Versions Size (MB)', 'File Created', 'File Modified', 
         'Versions Checked', 'Processed At'
@@ -285,34 +338,6 @@ def initialize_reports(output_file):
     csv_files['main'].flush()
     print(f"✓ Main report initialized: {main_file}")
     print(f"  Version history will only be checked for files > {CONFIG['min_file_size_mb']} MB")
-    
-    # Detailed Report
-    detailed_file = output_file.replace('.csv', '_Detailed_Versions.csv')
-    detailed_fieldnames = [
-        'Library', 'Item ID', 'File Name', 'File Path', 'Version ID', 
-        'Version Label', 'UI Version', 'Version Created', 'Is Current Version',
-        'Version Size (MB)', 'Check-in Comment', 'Author', 'Editor', 'Processed At'
-    ]
-    
-    csv_files['detailed'] = open(detailed_file, 'w', newline='', encoding='utf-8-sig')
-    csv_writers['detailed'] = csv.DictWriter(csv_files['detailed'], fieldnames=detailed_fieldnames)
-    csv_writers['detailed'].writeheader()
-    csv_files['detailed'].flush()
-    print(f"✓ Detailed report initialized: {detailed_file}")
-    
-    # Summary Report
-    summary_file = output_file.replace('.csv', '_Summary.csv')
-    summary_fieldnames = [
-        'Library', 'Total Files', 'Files Checked', 'Files Skipped',
-        'Total Versions', 'Total Current Size (MB)', 'Total Versions Size (MB)',
-        'Average Versions per File', 'Last Updated'
-    ]
-    
-    csv_files['summary'] = open(summary_file, 'w', newline='', encoding='utf-8-sig')
-    csv_writers['summary'] = csv.DictWriter(csv_files['summary'], fieldnames=summary_fieldnames)
-    csv_writers['summary'].writeheader()
-    csv_files['summary'].flush()
-    print(f"✓ Summary report initialized: {summary_file}")
 
 def append_to_main_report(data):
     """Append a row to the main report"""
@@ -321,6 +346,7 @@ def append_to_main_report(data):
     try:
         row = {
             'Library': data.get('library', ''),
+            'List ID': data.get('list_id', ''),
             'Item ID': data.get('item_id', 0),
             'File Name': data.get('file_name', ''),
             'File Path': data.get('file_path', ''),
@@ -339,71 +365,6 @@ def append_to_main_report(data):
         return True
     except Exception as e:
         print(f"Error appending to main report: {str(e)}")
-        return False
-
-def append_to_detailed_report(data):
-    """Append version rows to the detailed report"""
-    global csv_writers, csv_files
-    
-    try:
-        if data.get('versions_checked', False) and data.get('versions'):
-            for version in data['versions']:
-                row = {
-                    'Library': data.get('library', ''),
-                    'Item ID': data.get('item_id', 0),
-                    'File Name': data.get('file_name', ''),
-                    'File Path': data.get('file_path', ''),
-                    'Version ID': version.get('version_id', 0),
-                    'Version Label': version.get('version_label', ''),
-                    'UI Version': version.get('ui_version_string', ''),
-                    'Version Created': format_datetime(version.get('created', 'N/A')),
-                    'Is Current Version': 'Yes' if version.get('is_current', False) else 'No',
-                    'Version Size (MB)': f"{bytes_to_mb(version.get('size', 0)):.2f}",
-                    'Check-in Comment': version.get('checkin_comment', ''),
-                    'Author': version.get('author', ''),
-                    'Editor': version.get('editor', ''),
-                    'Processed At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                csv_writers['detailed'].writerow(row)
-        csv_files['detailed'].flush()
-        return True
-    except Exception as e:
-        print(f"Error appending to detailed report: {str(e)}")
-        return False
-
-def update_summary_report(library_summary):
-    """Update the summary report with current data"""
-    global csv_writers, csv_files
-    
-    try:
-        csv_files['summary'].close()
-        csv_files['summary'] = open(csv_files['summary'].name, 'w', newline='', encoding='utf-8-sig')
-        csv_writers['summary'] = csv.DictWriter(csv_files['summary'], 
-                                               fieldnames=['Library', 'Total Files', 'Files Checked', 'Files Skipped',
-                                                          'Total Versions', 'Total Current Size (MB)', 
-                                                          'Total Versions Size (MB)', 'Average Versions per File', 
-                                                          'Last Updated'])
-        csv_writers['summary'].writeheader()
-        
-        for lib, stats in library_summary.items():
-            avg_versions = stats['versions'] / stats['files_checked'] if stats['files_checked'] > 0 else 0
-            row = {
-                'Library': lib,
-                'Total Files': stats['total_files'],
-                'Files Checked': stats['files_checked'],
-                'Files Skipped': stats['files_skipped'],
-                'Total Versions': stats['versions'],
-                'Total Current Size (MB)': f"{bytes_to_mb(stats['current_size']):.2f}",
-                'Total Versions Size (MB)': f"{bytes_to_mb(stats['versions_size']):.2f}",
-                'Average Versions per File': round(avg_versions, 2),
-                'Last Updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            csv_writers['summary'].writerow(row)
-        
-        csv_files['summary'].flush()
-        return True
-    except Exception as e:
-        print(f"Error updating summary report: {str(e)}")
         return False
 
 def close_reports():
@@ -536,7 +497,7 @@ def get_file_details_from_item(item):
         'modified': item.get('Modified', 'N/A')
     }
 
-def process_file_item(site_url, list_id, item, library_title, library_summary):
+def process_file_item(site_url, list_id, item, library_title):
     """Process a single item and update reports dynamically"""
     try:
         item_id = item.get('Id')
@@ -579,7 +540,7 @@ def process_file_item(site_url, list_id, item, library_title, library_summary):
         
         file_data = {
             'library': library_title,
-            'library_id': list_id,
+            'list_id': list_id,
             'item_id': item_id,
             'file_name': file_details['file_name'],
             'file_path': file_details['file_path'],
@@ -598,37 +559,7 @@ def process_file_item(site_url, list_id, item, library_title, library_summary):
             'last_version_formatted': format_datetime(last_version_date)
         }
         
-        # Update library summary
-        if library_title not in library_summary:
-            library_summary[library_title] = {
-                'total_files': 0,
-                'files_checked': 0,
-                'files_skipped': 0,
-                'versions': 0,
-                'current_size': 0,
-                'versions_size': 0
-            }
-        
-        library_summary[library_title]['total_files'] += 1
-        if check_versions:
-            library_summary[library_title]['files_checked'] += 1
-        else:
-            library_summary[library_title]['files_skipped'] += 1
-        
-        library_summary[library_title]['versions'] += version_count
-        library_summary[library_title]['current_size'] += current_file_size
-        library_summary[library_title]['versions_size'] += total_versions_size
-        
-        # Append to main report immediately
         append_to_main_report(file_data)
-        
-        # Append to detailed report only if versions were checked and found
-        if check_versions and versions:
-            append_to_detailed_report(file_data)
-        
-        # Update summary report
-        update_summary_report(library_summary)
-        
         return file_data
         
     except Exception as e:
@@ -661,7 +592,7 @@ def process_files(site_url, output_file):
     all_file_data = []
     total_files = 0
     processed = 0
-    library_summary = {}
+    skipped_by_extension = 0
     
     for library in libraries:
         print(f"\n{'='*60}")
@@ -680,17 +611,17 @@ def process_files(site_url, output_file):
             print(f"  No files found in {library['title']}")
             continue
         
-        # Count files by size category
-        large_files = [f for f in files if bytes_to_mb(safe_int_conversion(f.get('File', {}).get('Length', 0))) > CONFIG['min_file_size_mb']]
-        small_files = len(files) - len(large_files)
+        valid_files = [f for f in files if should_process_file(f.get('File', {}).get('Name', f"Item_{f.get('Id', 0)}"))]
+        filtered_out = len(files) - len(valid_files)
+        skipped_by_extension += filtered_out
         
         print(f"  Found {len(files)} files in {library['title']}")
-        print(f"  - Large files (> {CONFIG['min_file_size_mb']} MB): {len(large_files)} (will check versions)")
-        print(f"  - Small files (≤ {CONFIG['min_file_size_mb']} MB): {small_files} (will skip version check)")
+        print(f"  - Files matching extension filter: {len(valid_files)}")
+        print(f"  - Files skipped by extension filter: {filtered_out}")
         
-        total_files += len(files)
+        total_files += len(valid_files)
         
-        for file_item in files:
+        for file_item in valid_files:
             processed += 1
             item_id = file_item.get('Id')
             file_obj = file_item.get('File', {})
@@ -706,8 +637,7 @@ def process_files(site_url, output_file):
                 site_url, 
                 library['id'], 
                 file_item, 
-                library['title'],
-                library_summary
+                library['title']
             )
             
             if file_data:
@@ -738,9 +668,15 @@ def main():
     print("FILE VERSION HISTORY REPORT GENERATOR")
     print("(Smart version checking - only for large files)")
     print("="*80)
+    global ALLOWED_FILE_EXTENSIONS
+    ALLOWED_FILE_EXTENSIONS = normalize_extensions(FILE_EXTENSIONS)
+    site_url = get_site_url()
+    output_file = CONFIG.get('output_csv') or get_report_filename(site_url)
+    CONFIG['output_csv'] = output_file
+
     print(f"SharePoint Site: {CONFIG['site_url']}")
     print(f"Min File Size for Version Check: {CONFIG['min_file_size_mb']} MB")
-    print(f"Output File: {CONFIG['output_csv']}")
+    print(f"Output File: {output_file}")
     print("="*80)
     
     print("\nAuthenticating to SharePoint...")
@@ -784,8 +720,6 @@ def main():
     print(f"Total versions found: {sum(f['version_count'] for f in file_data)}")
     print("="*80)
     print(f"✓ Main Report: {output_file}")
-    print(f"✓ Detailed Report: {output_file.replace('.csv', '_Detailed_Versions.csv')}")
-    print(f"✓ Summary Report: {output_file.replace('.csv', '_Summary.csv')}")
     print("="*80)
 
 if __name__ == "__main__":
