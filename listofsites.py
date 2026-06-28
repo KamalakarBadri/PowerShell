@@ -4,31 +4,47 @@ import uuid
 import base64
 import time
 import requests
+import os
+from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
 
-# Configuration
-tenant_name = "geeke.onmicrosoft.com"
-app_id = ""
-scope_graph = "https://gr/.default"
-scope_sharepoint = "https://geekbyarepoint.com/.default"
+def load_config(config_file="config.json"):
+    """Load configuration from JSON file"""
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Set default values for optional parameters
+        config.setdefault('sharepoint_url', None)
+        config.setdefault('output_prefix', 'sharepoint_sites')
+        config.setdefault('page_size', 100)
+        config.setdefault('preview_count', 5)
+        
+        return config
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{config_file}' not found.")
+        print("Please create a config.json file with the required parameters.")
+        raise
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON format in '{config_file}'.")
+        raise
+    except Exception as e:
+        print(f"Error loading configuration: {str(e)}")
+        raise
 
-# Certificate paths (update these with your actual file paths)
-CERTIFICATE_PATH = "certificate.pem"
-PRIVATE_KEY_PATH = "private_key.pem"
-
-def load_certificate_and_key():
+def load_certificate_and_key(certificate_path, private_key_path):
     """Load certificate and private key from PEM files"""
     try:
         # Load certificate
-        with open(CERTIFICATE_PATH, "rb") as cert_file:
+        with open(certificate_path, "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
 
         # Load private key
-        with open(PRIVATE_KEY_PATH, "rb") as key_file:
+        with open(private_key_path, "rb") as key_file:
             private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
 
         return certificate, private_key
@@ -37,7 +53,7 @@ def load_certificate_and_key():
         print(f"Error loading certificate or private key: {str(e)}")
         raise
 
-def get_jwt_token(certificate, private_key, scope):
+def get_jwt_token(certificate, private_key, tenant_name, app_id, scope):
     """Generate JWT token using certificate and private key"""
     try:
         # Create JWT timestamp for expiration (5 minutes from now)
@@ -94,7 +110,7 @@ def get_jwt_token(certificate, private_key, scope):
         print(f"Error generating JWT: {str(e)}")
         raise
 
-def get_access_token(jwt, scope):
+def get_access_token(jwt, tenant_name, app_id, scope):
     """Get access token from Microsoft Identity Platform"""
     url = f"https://login.microsoftonline.com/{tenant_name}/oauth2/v2.0/token"
     
@@ -142,161 +158,34 @@ def make_sharepoint_request(token, endpoint):
         print(f"Error making SharePoint request: {err}")
         raise
 
-def get_all_sites_with_nextlink_pagination(token):
-    """Get all sites using @odata.nextLink pagination"""
-    print("\n=== Getting All Sites with @odata.nextLink Pagination ===")
+def get_all_sites_with_pagination(token, sharepoint_url, page_size=100):
+    """Get all sites with proper pagination handling"""
+    print(f"\n=== Getting All Sites with Pagination (page size: {page_size}) ===")
     
     all_sites = []
     sharepoint_sites = []
     personal_sites = []
     
-    # Start with the initial endpoint
-    next_url = "https://geekbyteonline.sharepoint.com/_api/v2.0/sites"
-    page_count = 0
+    # Initial endpoint
+    endpoint = f"{sharepoint_url}/_api/v2.0/sites?$top={page_size}"
+    batch_count = 0
     
-    while next_url:
+    while endpoint:
+        batch_count += 1
         try:
-            page_count += 1
-            print(f"Processing page {page_count}...")
-            print(f"URL: {next_url}")
-            
-            sites_data = make_sharepoint_request(token, next_url)
-            current_batch = sites_data.get('value', [])
-            
-            print(f"Found {len(current_batch)} sites in this batch")
-            
-            for site in current_batch:
-                site_info = {
-                    'id': site.get('id'),
-                    'name': site.get('name'),
-                    'title': site.get('title'),
-                    'webUrl': site.get('webUrl'),
-                    'createdDateTime': site.get('createdDateTime'),
-                    'isPersonalSite': site.get('isPersonalSite', False),
-                    'dataLocationCode': site.get('dataLocationCode'),
-                    'siteCollection': site.get('siteCollection', {}),
-                    'template': site.get('template', {}),
-                    'sensitivityLabel': site.get('sensitivityLabel', {})
-                }
-                
-                all_sites.append(site_info)
-                
-                # Separate personal sites from SharePoint sites
-                if site.get('isPersonalSite', False):
-                    site_info['type'] = 'Personal Site'
-                    personal_sites.append(site_info)
-                    print(f"  Personal Site: {site.get('title', site.get('name'))}")
-                else:
-                    site_info['type'] = 'SharePoint Site'
-                    sharepoint_sites.append(site_info)
-                    print(f"  SharePoint Site: {site.get('title', site.get('name'))}")
-            
-            # Check for next link
-            next_url = sites_data.get('@odata.nextLink')
-            if next_url:
-                print(f"Next link found: {next_url[:100]}...")
-                # Add a small delay to avoid rate limiting
-                time.sleep(0.5)
-            else:
-                print("No more pages available")
-                
-        except Exception as e:
-            print(f"Error processing page {page_count}: {str(e)}")
-            break
-    
-    print(f"\nCompleted pagination - processed {page_count} pages")
-    print(f"Total sites retrieved: {len(all_sites)}")
-    
-    return {
-        'all_sites': all_sites,
-        'sharepoint_sites': sharepoint_sites,
-        'personal_sites': personal_sites
-    }
-
-def get_all_sites_from_sharepoint(token):
-    """Get all sites using SharePoint REST API v2.0 (original method)"""
-    print("\n=== Getting All Sites from SharePoint API (Single Request) ===")
-    
-    all_sites = []
-    sharepoint_sites = []
-    personal_sites = []
-    
-    # Use the SharePoint REST API endpoint
-    sites_endpoint = "https://geekbyteonline.sharepoint.com/_api/v2.0/sites"
-    
-    try:
-        sites_data = make_sharepoint_request(token, sites_endpoint)
-        
-        for site in sites_data.get('value', []):
-            site_info = {
-                'id': site.get('id'),
-                'name': site.get('name'),
-                'title': site.get('title'),
-                'webUrl': site.get('webUrl'),
-                'createdDateTime': site.get('createdDateTime'),
-                'isPersonalSite': site.get('isPersonalSite', False),
-                'dataLocationCode': site.get('dataLocationCode'),
-                'siteCollection': site.get('siteCollection', {}),
-                'template': site.get('template', {}),
-                'sensitivityLabel': site.get('sensitivityLabel', {})
-            }
-            
-            all_sites.append(site_info)
-            
-            # Separate personal sites from SharePoint sites
-            if site.get('isPersonalSite', False):
-                site_info['type'] = 'Personal Site'
-                personal_sites.append(site_info)
-                print(f"Personal Site: {site.get('title', site.get('name'))} - {site.get('webUrl')}")
-            else:
-                site_info['type'] = 'SharePoint Site'
-                sharepoint_sites.append(site_info)
-                print(f"SharePoint Site: {site.get('title', site.get('name'))} - {site.get('webUrl')}")
-        
-        # Check if there's a nextLink indicating more data
-        if '@odata.nextLink' in sites_data:
-            print(f"\nWARNING: @odata.nextLink found in response!")
-            print(f"This means there are more sites available.")
-            print(f"Consider using get_all_sites_with_nextlink_pagination() for complete results.")
-            print(f"Next link: {sites_data['@odata.nextLink']}")
-        
-        return {
-            'all_sites': all_sites,
-            'sharepoint_sites': sharepoint_sites,
-            'personal_sites': personal_sites
-        }
-        
-    except Exception as e:
-        print(f"Error getting sites from SharePoint API: {str(e)}")
-        return {
-            'all_sites': [],
-            'sharepoint_sites': [],
-            'personal_sites': []
-        }
-
-def get_sites_with_pagination(token, page_size=100):
-    """Get all sites with $top and $skip pagination"""
-    print(f"\n=== Getting All Sites with $top/$skip Pagination (page size: {page_size}) ===")
-    
-    all_sites = []
-    sharepoint_sites = []
-    personal_sites = []
-    skip = 0
-    
-    while True:
-        try:
-            # Use $top and $skip for pagination
-            sites_endpoint = f"https://geekbyteonline.sharepoint.com/_api/v2.0/sites?$top={page_size}&$skip={skip}"
-            sites_data = make_sharepoint_request(token, sites_endpoint)
+            print(f"Processing batch {batch_count}...")
+            sites_data = make_sharepoint_request(token, endpoint)
             
             current_batch = sites_data.get('value', [])
             
             if not current_batch:
                 break
             
-            print(f"Processing batch {skip // page_size + 1} - {len(current_batch)} sites")
+            print(f"  Found {len(current_batch)} sites in this batch")
             
             for site in current_batch:
+                template_name = site.get('template', {}).get('name', 'Unknown')
+                
                 site_info = {
                     'id': site.get('id'),
                     'name': site.get('name'),
@@ -306,7 +195,7 @@ def get_sites_with_pagination(token, page_size=100):
                     'isPersonalSite': site.get('isPersonalSite', False),
                     'dataLocationCode': site.get('dataLocationCode'),
                     'siteCollection': site.get('siteCollection', {}),
-                    'template': site.get('template', {}),
+                    'template': template_name,
                     'sensitivityLabel': site.get('sensitivityLabel', {})
                 }
                 
@@ -316,21 +205,27 @@ def get_sites_with_pagination(token, page_size=100):
                 if site.get('isPersonalSite', False):
                     site_info['type'] = 'Personal Site'
                     personal_sites.append(site_info)
-                    print(f"  Personal Site: {site.get('title', site.get('name'))}")
+                    print(f"    Personal Site: {site.get('title', site.get('name'))} - Template: {template_name}")
                 else:
                     site_info['type'] = 'SharePoint Site'
                     sharepoint_sites.append(site_info)
-                    print(f"  SharePoint Site: {site.get('title', site.get('name'))}")
+                    print(f"    SharePoint Site: {site.get('title', site.get('name'))} - Template: {template_name}")
             
-            skip += page_size
-            
-            # If we got fewer results than requested, we've reached the end
-            if len(current_batch) < page_size:
-                break
+            # Check for next link for pagination
+            endpoint = None
+            if '@odata.nextLink' in sites_data:
+                endpoint = sites_data['@odata.nextLink']
+                print(f"  Next page available: {endpoint}")
+            else:
+                print("  No more pages available")
                 
         except Exception as e:
-            print(f"Error getting sites batch starting at {skip}: {str(e)}")
+            print(f"Error getting sites batch {batch_count}: {str(e)}")
             break
+    
+    print(f"\nTotal sites retrieved: {len(all_sites)}")
+    print(f"SharePoint sites: {len(sharepoint_sites)}")
+    print(f"Personal sites: {len(personal_sites)}")
     
     return {
         'all_sites': all_sites,
@@ -338,7 +233,7 @@ def get_sites_with_pagination(token, page_size=100):
         'personal_sites': personal_sites
     }
 
-def save_sites_to_file(all_sites_data, filename="sharepoint_sites.json"):
+def save_sites_to_file(all_sites_data, filename):
     """Save all sites data to a JSON file as backup"""
     try:
         with open(filename, "w") as f:
@@ -359,11 +254,11 @@ def extract_site_id(full_site_id):
     except Exception:
         return full_site_id
 
-def save_sites_to_csv(all_sites_data, filename="sharepoint_sites_report.csv"):
+def save_sites_to_csv(all_sites_data, filename):
     """Save sites data to CSV with specific columns"""
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Site Name', 'Creation Date', 'Is Personal Site', 'Web URL', 'Site ID']
+            fieldnames = ['Site Name', 'Creation Date', 'Is Personal Site', 'Web URL', 'Site ID', 'Template']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -377,20 +272,18 @@ def save_sites_to_csv(all_sites_data, filename="sharepoint_sites_report.csv"):
                 is_personal = site.get('isPersonalSite', False)
                 web_url = site.get('webUrl', '')
                 site_id = extract_site_id(site.get('id', ''))
+                template = site.get('template', 'Unknown')
                 
                 writer.writerow({
                     'Site Name': site_name,
                     'Creation Date': creation_date,
                     'Is Personal Site': is_personal,
                     'Web URL': web_url,
-                    'Site ID': site_id
+                    'Site ID': site_id,
+                    'Template': template
                 })
         
         print(f"\nCSV report saved to {filename}")
-        
-        # Also create separate CSV files for SharePoint and Personal sites
-        save_filtered_csv(all_sites_data, False, "sharepoint_sites_only.csv")
-        save_filtered_csv(all_sites_data, True, "personal_sites_only.csv")
         
     except Exception as e:
         print(f"Error saving CSV report: {str(e)}")
@@ -399,7 +292,7 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
     """Save filtered CSV (either SharePoint sites or Personal sites only)"""
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Site Name', 'Creation Date', 'Is Personal Site', 'Web URL', 'Site ID']
+            fieldnames = ['Site Name', 'Creation Date', 'Is Personal Site', 'Web URL', 'Site ID', 'Template']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -414,13 +307,15 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
                     is_personal = site.get('isPersonalSite', False)
                     web_url = site.get('webUrl', '')
                     site_id = extract_site_id(site.get('id', ''))
+                    template = site.get('template', 'Unknown')
                     
                     writer.writerow({
                         'Site Name': site_name,
                         'Creation Date': creation_date,
                         'Is Personal Site': is_personal,
                         'Web URL': web_url,
-                        'Site ID': site_id
+                        'Site ID': site_id,
+                        'Template': template
                     })
                     filtered_count += 1
         
@@ -433,8 +328,8 @@ def save_filtered_csv(all_sites_data, is_personal_filter, filename):
 def print_csv_preview(all_sites_data, preview_count=5):
     """Print a preview of the CSV data"""
     print(f"\n=== CSV Report Preview (First {preview_count} Sites) ===")
-    print("Site Name | Creation Date | Is Personal Site | Web URL | Site ID")
-    print("-" * 100)
+    print("Site Name | Creation Date | Is Personal Site | Web URL | Site ID | Template")
+    print("-" * 120)
     
     count = 0
     for site in all_sites_data.get('all_sites', []):
@@ -446,11 +341,12 @@ def print_csv_preview(all_sites_data, preview_count=5):
         is_personal = 'Yes' if site.get('isPersonalSite', False) else 'No'
         web_url = site.get('webUrl', '')
         site_id = extract_site_id(site.get('id', ''))
+        template = site.get('template', 'Unknown')
         
         # Truncate long URLs for display
-        display_url = web_url[:50] + "..." if len(web_url) > 50 else web_url
+        display_url = web_url[:40] + "..." if len(web_url) > 40 else web_url
         
-        print(f"{site_name[:20]:<20} | {creation_date:<12} | {is_personal:<16} | {display_url:<30} | {site_id}")
+        print(f"{site_name[:20]:<20} | {creation_date:<12} | {is_personal:<16} | {display_url:<30} | {site_id:<36} | {template}")
         count += 1
     
     total_sites = len(all_sites_data.get('all_sites', []))
@@ -472,7 +368,7 @@ def generate_summary_report(all_sites_data):
     # Template breakdown
     template_breakdown = {}
     for site in all_sites:
-        template_name = site.get('template', {}).get('name', 'Unknown')
+        template_name = site.get('template', 'Unknown')
         if template_name not in template_breakdown:
             template_breakdown[template_name] = {'total': 0, 'sharepoint': 0, 'personal': 0}
         template_breakdown[template_name]['total'] += 1
@@ -487,7 +383,6 @@ def generate_summary_report(all_sites_data):
     
     # Recent sites (created in last 30 days)
     try:
-        from datetime import datetime, timedelta
         thirty_days_ago = datetime.now() - timedelta(days=30)
         recent_sites = []
         
@@ -508,21 +403,48 @@ def generate_summary_report(all_sites_data):
         print(f"\nCould not calculate recent sites: {str(e)}")
 
 def main():
+    # Load configuration from JSON file
+    config = load_config("config.json")
+    
+    # Set up configuration from config
+    tenant_name = config.get('tenant')
+    app_id = config.get('app_id')
+    certificate_path = config.get('cert_path')
+    private_key_path = config.get('key_path')
+    sharepoint_url = config.get('sharepoint_url') or f"https://{tenant_name.split('.')[0]}.sharepoint.com"
+    output_prefix = config.get('output_prefix')
+    page_size = config.get('page_size')
+    preview_count = config.get('preview_count')
+    
+    # Define scopes
+    scope_graph = "https://graph.microsoft.com/.default"
+    scope_sharepoint = f"{sharepoint_url}/.default"
+    
+    print(f"Configuration loaded from config.json:")
+    print(f"  Tenant: {tenant_name}")
+    print(f"  App ID: {app_id}")
+    print(f"  Certificate: {certificate_path}")
+    print(f"  Private Key: {private_key_path}")
+    print(f"  SharePoint URL: {sharepoint_url}")
+    print(f"  Output Prefix: {output_prefix}")
+    print(f"  Page Size: {page_size}")
+    print(f"  Preview Count: {preview_count}")
+    
     try:
         # Load certificate and private key
-        certificate, private_key = load_certificate_and_key()
+        certificate, private_key = load_certificate_and_key(certificate_path, private_key_path)
         print("Certificate and private key loaded successfully")
         
         # Get Graph token
-        graph_jwt = get_jwt_token(certificate, private_key, scope_graph)
+        graph_jwt = get_jwt_token(certificate, private_key, tenant_name, app_id, scope_graph)
         print("Generated Graph JWT")
-        graph_token = get_access_token(graph_jwt, scope_graph)
+        graph_token = get_access_token(graph_jwt, tenant_name, app_id, scope_graph)
         print("Graph access token retrieved successfully")
         
         # Get SharePoint token
-        sharepoint_jwt = get_jwt_token(certificate, private_key, scope_sharepoint)
+        sharepoint_jwt = get_jwt_token(certificate, private_key, tenant_name, app_id, scope_sharepoint)
         print("Generated SharePoint JWT")
-        sharepoint_token = get_access_token(sharepoint_jwt, scope_sharepoint)
+        sharepoint_token = get_access_token(sharepoint_jwt, tenant_name, app_id, scope_sharepoint)
         print("SharePoint access token retrieved successfully")
         
         # Save tokens to file
@@ -531,10 +453,10 @@ def main():
             "sharepoint_token": sharepoint_token
         }
         
-        with open("tokens.json", "w") as f:
+        with open(f"{output_prefix}_tokens.json", "w") as f:
             json.dump(tokens, f, indent=2)
         
-        print("Tokens saved to tokens.json")
+        print(f"Tokens saved to {output_prefix}_tokens.json")
         
         # Now get all SharePoint sites and personal sites using SharePoint REST API
         print("\n" + "="*50)
@@ -544,53 +466,27 @@ def main():
         all_sites_data = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "tenant": tenant_name,
-            "all_sites": [],
-            "sharepoint_sites": [],
-            "personal_sites": []
+            'all_sites': [],
+            'sharepoint_sites': [],
+            'personal_sites': []
         }
         
-        # Method 1: Use @odata.nextLink pagination (RECOMMENDED)
-        try:
-            print("Method 1: Using @odata.nextLink pagination (RECOMMENDED)...")
-            sites_result = get_all_sites_with_nextlink_pagination(sharepoint_token)
-            all_sites_data["all_sites"] = sites_result["all_sites"]
-            all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
-            all_sites_data["personal_sites"] = sites_result["personal_sites"]
-            
-            if len(all_sites_data["all_sites"]) > 0:
-                print(f"Successfully retrieved {len(all_sites_data['all_sites'])} sites using @odata.nextLink pagination")
-            else:
-                raise Exception("No sites retrieved with @odata.nextLink method")
-                
-        except Exception as e:
-            print(f"Error with Method 1 (@odata.nextLink): {str(e)}")
-            
-            # Method 2: Try single request
-            try:
-                print("Method 2: Single request fallback...")
-                sites_result = get_all_sites_from_sharepoint(sharepoint_token)
-                all_sites_data["all_sites"] = sites_result["all_sites"]
-                all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
-                all_sites_data["personal_sites"] = sites_result["personal_sites"]
-            except Exception as e2:
-                print(f"Error with Method 2 (single request): {str(e2)}")
-                
-                # Method 3: Try $top/$skip pagination
-                try:
-                    print("Method 3: $top/$skip pagination fallback...")
-                    sites_result = get_sites_with_pagination(sharepoint_token, page_size=50)
-                    all_sites_data["all_sites"] = sites_result["all_sites"]
-                    all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
-                    all_sites_data["personal_sites"] = sites_result["personal_sites"]
-                except Exception as e3:
-                    print(f"Error with Method 3 ($top/$skip): {str(e3)}")
+        # Use the pagination method to get all sites
+        sites_result = get_all_sites_with_pagination(sharepoint_token, sharepoint_url, page_size)
+        all_sites_data["all_sites"] = sites_result["all_sites"]
+        all_sites_data["sharepoint_sites"] = sites_result["sharepoint_sites"]
+        all_sites_data["personal_sites"] = sites_result["personal_sites"]
         
         # Save all data to files
-        save_sites_to_file(all_sites_data)  # JSON backup
-        save_sites_to_csv(all_sites_data)   # Main CSV report
+        save_sites_to_file(all_sites_data, f"{output_prefix}_backup.json")  # JSON backup
+        save_sites_to_csv(all_sites_data, f"{output_prefix}_report.csv")   # Main CSV report
+        
+        # Also create separate CSV files for SharePoint and Personal sites
+        save_filtered_csv(all_sites_data, False, f"{output_prefix}_sharepoint_only.csv")
+        save_filtered_csv(all_sites_data, True, f"{output_prefix}_personal_only.csv")
         
         # Print CSV preview
-        print_csv_preview(all_sites_data, preview_count=10)
+        print_csv_preview(all_sites_data, preview_count)
         
         # Generate detailed summary
         generate_summary_report(all_sites_data)
