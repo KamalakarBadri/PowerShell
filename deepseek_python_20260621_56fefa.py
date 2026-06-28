@@ -18,7 +18,7 @@ from cryptography.hazmat.backends import default_backend
 # ============================================================
 
 CONFIG = {
-    "site_url": "https://geekbyteonline.sharepoint.com/sites/Team_Site2",
+    "site_url": "https://geekbyteonline.sharepoint.com/sites/Team_",
     "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
     "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
     "scope": "https://geekbyteonline.sharepoint.com/.default",
