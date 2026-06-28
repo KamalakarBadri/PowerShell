@@ -36,6 +36,7 @@ CONFIG = {
 
 # File extension filter: set to None for all files, or use a single line like ["docx", "pdf"]
 FILE_EXTENSIONS = None
+FILE_EXTENSIONS = ["docx", "pdf", "xlsx"]
 
 # Token cache
 TOKEN_CACHE = {

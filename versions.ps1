@@ -14,8 +14,8 @@ $CONFIG = @{
     # ============================================================
     # FILE FILTER CONFIGURATION
     # ============================================================
-    "file_extensions" =  @(".har")  # Process ALL files
-    
+    "file_extensions" =  $null  # Process ALL files
+    "file_extensions" = @(".docx", ".xlsx", ".pdf")
     # ============================================================
     # VERSION HISTORY FILTER - CHECK ALL FILES
     # ============================================================
