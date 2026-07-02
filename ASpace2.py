@@ -14,6 +14,11 @@ from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import sys
+
+# Force stdout to be unbuffered for real-time output
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # ============================================================
 # CONFIGURATION - UPDATE THESE VALUES
@@ -27,43 +32,33 @@ CONFIG = {
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
     
-    # ============================================================
-    # VERSION HISTORY FILTER - Only check versions for files above this size (in MB)
-    # ============================================================
-    "min_file_size_mb": 200,  # Only check version history for files > 200 MB
+    # Minimum file size to check versions (in MB)
+    "min_file_size_mb": 200,
     
-    # ============================================================
-    # VERSION RETENTION SETTINGS
-    # ============================================================
-    "keep_last_versions": 50,  # Number of most recent versions to keep
+    # Number of recent versions to keep
+    "keep_last_versions": 50,
     
-    # ============================================================
-    # PERFORMANCE SETTINGS
-    # ============================================================
-    "batch_size": 50,  # Number of files to process in parallel
-    "max_workers": 10,  # Maximum concurrent threads
-    "request_timeout": 60,  # Request timeout in seconds
+    # Performance settings
+    "batch_size": 20,
+    "max_workers": 5,
+    "request_timeout": 120,
     
-    # Output filename is generated from the site name prefix if None.
     "output_csv": None
 }
 
-# File extension filter: set to None for all files, or use a single line like ["docx", "pdf"]
+# File extension filter - Set to None for all files, or use ["docx", "pdf", "xlsx"]
 FILE_EXTENSIONS = None
-FILE_EXTENSIONS = ["docx", "pdf", "xlsx"]
 
-# Token cache
-TOKEN_CACHE = {
-    "token": None,
-    "expires": 0
-}
+# ============================================================
+# GLOBAL VARIABLES
+# ============================================================
 
-# Global CSV writers and file handles
+TOKEN_CACHE = {"token": None, "expires": 0}
 csv_writers = {}
 csv_files = {}
 csv_lock = threading.Lock()
+ALLOWED_FILE_EXTENSIONS = None
 
-# Global statistics
 GLOBAL_STATS = {
     "total_files": 0,
     "files_checked": 0,
@@ -83,9 +78,13 @@ stats_lock = threading.Lock()
 
 def load_certificate_and_key():
     """Load certificate and private key from PEM files"""
+    print("  📂 Loading certificate and private key...")
     try:
-        if not os.path.exists(CONFIG['certificate_path']) or not os.path.exists(CONFIG['private_key_path']):
-            raise Exception(f"Certificate files not found.")
+        if not os.path.exists(CONFIG['certificate_path']):
+            raise Exception(f"Certificate file not found: {CONFIG['certificate_path']}")
+        
+        if not os.path.exists(CONFIG['private_key_path']):
+            raise Exception(f"Private key file not found: {CONFIG['private_key_path']}")
         
         with open(CONFIG['certificate_path'], "rb") as cert_file:
             certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
@@ -93,9 +92,10 @@ def load_certificate_and_key():
         with open(CONFIG['private_key_path'], "rb") as key_file:
             private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
         
+        print("  ✅ Certificate and private key loaded")
         return certificate, private_key
     except Exception as e:
-        print(f"Error loading certificate or private key: {str(e)}")
+        print(f"  ❌ Error loading certificate: {str(e)}")
         raise
 
 def get_jwt_token(certificate, private_key):
@@ -142,16 +142,15 @@ def get_jwt_token(certificate, private_key):
         jwt = f"{jwt_unsigned}.{encoded_signature}"
         return jwt
     except Exception as e:
-        print(f"Error generating JWT: {str(e)}")
+        print(f"  ❌ Error generating JWT: {str(e)}")
         raise
 
 def get_access_token(jwt, scope):
     """Get access token from Microsoft Identity Platform"""
+    print("  🔑 Requesting access token...")
     url = f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token"
     
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     
     data = {
         "client_id": CONFIG['app_id'],
@@ -162,25 +161,23 @@ def get_access_token(jwt, scope):
     }
     
     try:
-        response = requests.post(url, headers=headers, data=data, timeout=CONFIG['request_timeout'])
+        response = requests.post(url, headers=headers, data=data, timeout=30)
         response.raise_for_status()
-        return response.json()["access_token"]
-    except requests.exceptions.HTTPError as err:
-        print(f"HTTP Error: {err}")
-        raise
-    except Exception as err:
-        print(f"Error: {err}")
+        result = response.json()
+        print("  ✅ Access token obtained")
+        return result["access_token"]
+    except Exception as e:
+        print(f"  ❌ Error getting token: {str(e)}")
         raise
 
 def get_cached_token(force_refresh=False):
-    """Get cached token if it's still valid, otherwise get a new one"""
+    """Get cached token or get a new one"""
     cache = TOKEN_CACHE
     
     if not force_refresh and cache["token"] and cache["expires"] > time.time() + 300:
         return cache["token"]
     
     try:
-        print(f"\n  🔄 {'Refreshing' if force_refresh else 'Getting'} access token...")
         certificate, private_key = load_certificate_and_key()
         jwt = get_jwt_token(certificate, private_key)
         token = get_access_token(jwt, CONFIG['scope'])
@@ -188,26 +185,21 @@ def get_cached_token(force_refresh=False):
         if token:
             cache["token"] = token
             cache["expires"] = time.time() + 3600
-            print(f"  ✓ Token obtained, valid for 1 hour")
             return token
-        else:
-            print("  ✗ Failed to get token")
-            return None
+        return None
     except Exception as e:
-        print(f"  ✗ Authentication failed: {str(e)}")
+        print(f"  ❌ Authentication failed: {str(e)}")
         return None
 
 def get_current_token():
-    """Get current valid token, refreshing if needed"""
     return get_cached_token()
 
-def make_sharepoint_request(url, max_retries=2):
-    """Make a request to SharePoint REST API with automatic token refresh"""
+def make_sharepoint_request(url, max_retries=3):
+    """Make request to SharePoint REST API"""
     for attempt in range(max_retries + 1):
         try:
             token = get_current_token()
             if not token:
-                print(f"  ✗ No valid token available")
                 return None
             
             headers = {
@@ -229,31 +221,29 @@ def make_sharepoint_request(url, max_retries=2):
             
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401 and attempt < max_retries:
-                print(f"  ⚠️ Token expired, refreshing...")
                 TOKEN_CACHE["token"] = None
                 TOKEN_CACHE["expires"] = 0
                 continue
             if attempt < max_retries:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2 ** attempt)
                 continue
-            print(f"  Request failed: {str(e)}")
             return None
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
                 continue
-            print(f"  Request failed: {str(e)}")
             return None
     
     return None
 
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
 def get_site_url():
-    """Get the site URL from CONFIG"""
     return CONFIG['site_url'].rstrip('/')
 
-
 def get_site_prefix(site_url):
-    """Extract site prefix from a SharePoint URL"""
     normalized = site_url.rstrip('/')
     parts = normalized.split('/')
     if 'sites' in parts:
@@ -264,16 +254,12 @@ def get_site_prefix(site_url):
         return parts[-1]
     return 'Site'
 
-
 def get_report_filename(site_url):
-    """Create output filename using the site prefix"""
     site_prefix = get_site_prefix(site_url)
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    return f"{site_prefix}_File_Version_History_Report_{timestamp}.csv"
-
+    return f"{site_prefix}_File_Version_Report_{timestamp}.csv"
 
 def normalize_extensions(extensions):
-    """Normalize configured file extensions for comparison"""
     if not extensions:
         return None
     if isinstance(extensions, str):
@@ -289,21 +275,14 @@ def normalize_extensions(extensions):
             normalized.append(ext)
     return normalized or None
 
-
 def should_process_file(file_name):
-    """Decide whether a file matches the configured extension filter"""
     if not ALLOWED_FILE_EXTENSIONS:
         return True
     _, ext = os.path.splitext(file_name or '')
     ext = ext.lower().lstrip('.')
     return ext in ALLOWED_FILE_EXTENSIONS
 
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-
 def safe_int_conversion(value):
-    """Safely convert a value to integer"""
     if value is None:
         return 0
     if isinstance(value, (int, float)):
@@ -317,24 +296,20 @@ def safe_int_conversion(value):
     return 0
 
 def bytes_to_mb(bytes_value):
-    """Convert bytes to MB with 2 decimal places"""
     bytes_value = safe_int_conversion(bytes_value)
     if bytes_value == 0:
         return 0.00
     return round(bytes_value / (1024 * 1024), 2)
 
 def bytes_to_gb(bytes_value):
-    """Convert bytes to GB with 2 decimal places"""
     bytes_value = safe_int_conversion(bytes_value)
     if bytes_value == 0:
         return 0.00
     return round(bytes_value / (1024 * 1024 * 1024), 2)
 
 def format_datetime(datetime_str):
-    """Format datetime string to readable format"""
     if not datetime_str or datetime_str == "N/A" or datetime_str == "0":
         return "N/A"
-    
     try:
         if 'T' in datetime_str:
             if '.' in datetime_str:
@@ -347,25 +322,10 @@ def format_datetime(datetime_str):
         return datetime_str
 
 def should_check_versions(file_size_mb):
-    """Check if file size meets the minimum threshold for version checking"""
     min_size = CONFIG.get('min_file_size_mb', 200)
     return file_size_mb > min_size
 
 def calculate_version_space_savings(versions, keep_last_n):
-    """
-    Calculate space savings if we keep only the last N versions
-    
-    Returns:
-        dict: {
-            'total_versions': int,
-            'keep_count': int,
-            'delete_count': int,
-            'keep_size_bytes': int,
-            'delete_size_bytes': int,
-            'space_saved_gb': float,
-            'delete_range': str
-        }
-    """
     if not versions:
         return {
             'total_versions': 0,
@@ -377,19 +337,16 @@ def calculate_version_space_savings(versions, keep_last_n):
             'delete_range': 'N/A'
         }
     
-    # Sort versions by creation date (oldest first)
     sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
     total_versions = len(sorted_versions)
     
-    # If total versions <= keep_last_n, keep all
     if total_versions <= keep_last_n:
         keep_count = total_versions
         delete_count = 0
         keep_size_bytes = sum(v.get('size', 0) for v in sorted_versions)
         delete_size_bytes = 0
-        delete_range = 'None (already within limit)'
+        delete_range = 'None (within limit)'
     else:
-        # Keep the last keep_last_n versions (most recent)
         keep_count = keep_last_n
         delete_count = total_versions - keep_last_n
         keep_versions = sorted_versions[-keep_last_n:]
@@ -398,7 +355,6 @@ def calculate_version_space_savings(versions, keep_last_n):
         keep_size_bytes = sum(v.get('size', 0) for v in keep_versions)
         delete_size_bytes = sum(v.get('size', 0) for v in delete_versions)
         
-        # Determine version label range for deleted versions
         first_deleted = delete_versions[0].get('version_label', 'unknown') if delete_versions else 'N/A'
         last_deleted = delete_versions[-1].get('version_label', 'unknown') if delete_versions else 'N/A'
         delete_range = f"{first_deleted} to {last_deleted}" if first_deleted != 'N/A' else 'N/A'
@@ -414,33 +370,28 @@ def calculate_version_space_savings(versions, keep_last_n):
     }
 
 # ============================================================
-# DYNAMIC CSV REPORT FUNCTIONS
+# CSV REPORT FUNCTIONS
 # ============================================================
 
 def initialize_reports(output_file):
-    """Initialize CSV files with headers"""
     global csv_writers, csv_files
     
-    # Main Report
-    main_file = output_file
     main_fieldnames = [
-        'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 'Current File Size (MB)',
-        'Version Count', 'First Version Date', 'Last Version Date', 
-        'Total Versions Size (MB)', 'File Created', 'File Modified', 
-        'Versions Checked', 'Versions to Delete', 'Space Saved (GB)',
-        'Deleted Version Range', 'Processed At'
+        'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 
+        'Current File Size (MB)', 'Version Count', 'First Version Date', 
+        'Last Version Date', 'Total Versions Size (MB)', 
+        'File Created', 'File Modified', 'Versions Checked', 
+        'Versions to Delete', 'Space Saved (GB)', 'Deleted Version Range', 
+        'Processed At'
     ]
     
-    csv_files['main'] = open(main_file, 'w', newline='', encoding='utf-8-sig')
+    csv_files['main'] = open(output_file, 'w', newline='', encoding='utf-8-sig')
     csv_writers['main'] = csv.DictWriter(csv_files['main'], fieldnames=main_fieldnames)
     csv_writers['main'].writeheader()
     csv_files['main'].flush()
-    print(f"✓ Main report initialized: {main_file}")
-    print(f"  Version history will only be checked for files > {CONFIG['min_file_size_mb']} MB")
-    print(f"  Keeping last {CONFIG['keep_last_versions']} versions per file")
+    print(f"✅ Main report initialized: {output_file}")
 
 def append_to_main_report(data):
-    """Append a row to the main report - thread-safe"""
     global csv_writers, csv_files
     
     with csv_lock:
@@ -468,13 +419,11 @@ def append_to_main_report(data):
             csv_files['main'].flush()
             return True
         except Exception as e:
-            print(f"Error appending to main report: {str(e)}")
+            print(f"Error appending to CSV: {str(e)}")
             return False
 
 def close_reports():
-    """Close all CSV files"""
     global csv_files
-    
     for key, file_handle in csv_files.items():
         try:
             file_handle.close()
@@ -482,21 +431,21 @@ def close_reports():
             pass
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL FUNCTIONS
+# SHAREPOINT DATA RETRIEVAL
 # ============================================================
 
 def get_all_libraries(site_url):
-    """Get all document libraries from SharePoint site with pagination"""
-    print("\nGetting document libraries...")
+    print("\n📁 Getting document libraries...")
     lists_url = f"{site_url}/_api/web/lists"
     all_libraries = []
     next_url = lists_url
     
     while next_url:
-        print(f"  Fetching libraries page...")
+        print("  Fetching libraries page...", end=" ")
         response = make_sharepoint_request(next_url)
         
         if not response or 'd' not in response:
+            print("❌ Failed")
             break
         
         if 'results' in response['d']:
@@ -506,6 +455,7 @@ def get_all_libraries(site_url):
                         'id': lst['Id'],
                         'title': lst['Title']
                     })
+            print(f"✅ Found {len(all_libraries)} libraries so far")
         
         next_url = None
         if '__next' in response.get('d', {}):
@@ -514,8 +464,7 @@ def get_all_libraries(site_url):
     return all_libraries
 
 def get_all_items_from_library(site_url, library_id):
-    """Get all items from a library with pagination"""
-    print(f"    Fetching items from library...")
+    print(f"  📄 Fetching items from library...")
     
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$expand=File&$top=5000"
     all_items = []
@@ -524,17 +473,17 @@ def get_all_items_from_library(site_url, library_id):
     
     while next_url:
         page_count += 1
-        print(f"    Fetching page {page_count}...", end="")
+        print(f"    Page {page_count}...", end=" ")
         response = make_sharepoint_request(next_url)
         
         if not response or 'd' not in response:
-            print(" ✗ Failed")
+            print("❌ Failed")
             break
         
         if 'results' in response['d']:
             items_in_page = len(response['d']['results'])
             all_items.extend(response['d']['results'])
-            print(f" ✓ Got {items_in_page} items")
+            print(f"✅ Got {items_in_page} items")
         
         next_url = None
         if '__next' in response.get('d', {}):
@@ -544,7 +493,6 @@ def get_all_items_from_library(site_url, library_id):
     return all_items
 
 def get_file_versions(site_url, list_id, item_id):
-    """Get versions for a specific item"""
     try:
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
         
@@ -574,11 +522,9 @@ def get_file_versions(site_url, list_id, item_id):
         return versions
         
     except Exception as e:
-        print(f"    Error getting versions for item {item_id}: {str(e)}")
         return []
 
 def get_file_details_from_item(item):
-    """Extract file details from item with expanded File property"""
     file_obj = item.get('File', {})
     
     file_name = file_obj.get('Name', '')
@@ -602,17 +548,13 @@ def get_file_details_from_item(item):
     }
 
 # ============================================================
-# BATCH PROCESSING FUNCTIONS
+# BATCH PROCESSING
 # ============================================================
 
 def process_file_batch(site_url, file_items, library_id, library_title, batch_id, total_batches):
-    """
-    Process a batch of files in parallel
-    """
     results = []
     
     with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
-        # Submit all files in the batch for processing
         future_to_file = {
             executor.submit(
                 process_single_file, 
@@ -626,22 +568,17 @@ def process_file_batch(site_url, file_items, library_id, library_title, batch_id
             for file_item in file_items
         }
         
-        # Collect results as they complete
         for future in as_completed(future_to_file):
-            file_item = future_to_file[future]
             try:
                 result = future.result()
                 if result:
                     results.append(result)
             except Exception as e:
-                print(f"  Error processing file {file_item.get('Id')}: {str(e)}")
+                pass
     
     return results
 
 def process_single_file(site_url, list_id, item, library_title, batch_id=None, total_batches=None):
-    """
-    Process a single file item - thread-safe version
-    """
     global GLOBAL_STATS
     
     try:
@@ -654,7 +591,6 @@ def process_single_file(site_url, list_id, item, library_title, batch_id=None, t
         file_details = get_file_details_from_item(item)
         file_size_mb = bytes_to_mb(file_details['file_size'])
         
-        # Check if we should check versions based on file size
         check_versions = should_check_versions(file_size_mb)
         
         versions = []
@@ -666,7 +602,6 @@ def process_single_file(site_url, list_id, item, library_title, batch_id=None, t
         space_saved_gb = 0.0
         delete_range = 'N/A'
         
-        # Update global stats (thread-safe)
         with stats_lock:
             GLOBAL_STATS["total_files"] += 1
             GLOBAL_STATS["total_current_size_bytes"] += file_details['file_size']
@@ -689,11 +624,9 @@ def process_single_file(site_url, list_id, item, library_title, batch_id=None, t
                 first_version_date = first_version.get('created', 'N/A')
                 last_version_date = last_version.get('created', 'N/A')
                 
-                # Calculate version sizes
                 for version in versions:
                     total_versions_size += version.get('size', 0)
                 
-                # Calculate space savings
                 keep_last_n = CONFIG.get('keep_last_versions', 50)
                 savings = calculate_version_space_savings(versions, keep_last_n)
                 
@@ -738,56 +671,49 @@ def process_single_file(site_url, list_id, item, library_title, batch_id=None, t
             'delete_range': delete_range
         }
         
-        # Append to CSV (thread-safe)
         append_to_main_report(file_data)
         
-        # Print progress (with thread-safe ID)
-        file_name_short = file_details['file_name'][:30] + "..." if len(file_details['file_name']) > 30 else file_details['file_name']
+        # Print progress
+        file_name_short = file_details['file_name'][:25] + "..." if len(file_details['file_name']) > 25 else file_details['file_name']
         size_indicator = "🟢" if file_size_mb > CONFIG['min_file_size_mb'] else "⚪"
         
-        # Use batch info for progress
-        batch_info = f"[Batch {batch_id}/{total_batches}] " if batch_id and total_batches else ""
-        
         if check_versions and version_count > 0:
-            print(f"\n  {batch_info}{size_indicator} {file_name_short} (ID: {item_id}) [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
+            print(f"\n  {size_indicator} {file_name_short} [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
             if versions_to_delete > 0:
                 print(f" | Delete {versions_to_delete} versions | Save: {space_saved_gb:.2f}GB")
             else:
                 print()
         else:
-            print(f"\n  {batch_info}⚪ {file_name_short} (ID: {item_id}) [{file_size_mb:.1f}MB] - Skip (≤{CONFIG['min_file_size_mb']}MB)")
+            print(f"\n  ⚪ {file_name_short} [{file_size_mb:.1f}MB] - Skip (≤{CONFIG['min_file_size_mb']}MB)")
         
         return file_data
         
     except Exception as e:
-        print(f"  Error processing item {item.get('Id')}: {str(e)}")
         return None
 
 # ============================================================
-# MAIN PROCESSING FUNCTIONS
+# MAIN PROCESSING
 # ============================================================
 
 def process_files(site_url, output_file):
-    """Process all files with batch processing for speed"""
-    
     initialize_reports(output_file)
     
     libraries = get_all_libraries(site_url)
     
     if not libraries:
-        print("No document libraries found.")
+        print("❌ No document libraries found.")
         close_reports()
         return []
     
-    print(f"\nFound {len(libraries)} document libraries:")
+    print(f"\n📚 Found {len(libraries)} document libraries:")
     for lib in libraries:
         print(f"  - {lib['title']}")
     
     print(f"\n⚡ Performance Settings:")
-    print(f"  - Batch size: {CONFIG['batch_size']} files per batch")
-    print(f"  - Max workers: {CONFIG['max_workers']} concurrent threads")
-    print(f"  - Version check only for files > {CONFIG['min_file_size_mb']} MB")
-    print(f"  - Keeping last {CONFIG['keep_last_versions']} versions per file\n")
+    print(f"  Batch size: {CONFIG['batch_size']} files/batch")
+    print(f"  Max workers: {CONFIG['max_workers']} threads")
+    print(f"  Min size for version check: {CONFIG['min_file_size_mb']} MB")
+    print(f"  Keep last {CONFIG['keep_last_versions']} versions\n")
     
     all_file_data = []
     total_files = 0
@@ -802,16 +728,15 @@ def process_files(site_url, output_file):
         items = get_all_items_from_library(site_url, library['id'])
         
         if not items:
-            print(f"  No items found in {library['title']}")
+            print(f"  No items found")
             continue
         
         files = [item for item in items if item.get('FileSystemObjectType') == 0]
         
         if not files:
-            print(f"  No files found in {library['title']}")
+            print(f"  No files found")
             continue
         
-        # Filter by extension
         valid_files = []
         for f in files:
             file_name = f.get('File', {}).get('Name', f"Item_{f.get('Id', 0)}")
@@ -820,13 +745,12 @@ def process_files(site_url, output_file):
             else:
                 skipped_by_extension += 1
         
-        print(f"  Found {len(files)} files in {library['title']}")
-        print(f"  - Files matching extension filter: {len(valid_files)}")
-        print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
+        print(f"  Found {len(files)} files")
+        print(f"  Matching filter: {len(valid_files)}")
+        print(f"  Skipped by filter: {len(files) - len(valid_files)}")
         
         total_files += len(valid_files)
         
-        # Process files in batches
         batch_size = CONFIG['batch_size']
         total_batches = (len(valid_files) + batch_size - 1) // batch_size
         
@@ -836,7 +760,6 @@ def process_files(site_url, output_file):
             
             print(f"\n  🚀 Processing Batch {batch_count}/{total_batches} ({len(batch)} files)...")
             
-            # Process the batch
             batch_results = process_file_batch(
                 site_url, 
                 batch, 
@@ -847,18 +770,16 @@ def process_files(site_url, output_file):
             )
             
             all_file_data.extend(batch_results)
-            print(f"  ✅ Batch {batch_count} completed ({len(batch_results)} files processed)")
+            print(f"\n  ✅ Batch {batch_count} completed ({len(batch_results)} files processed)")
     
     print(f"\n{'='*60}")
-    print(f"✅ Processed {len(all_file_data)} files with version history.")
-    print(f"   Skipped {skipped_by_extension} files due to extension filter")
+    print(f"✅ Processed {len(all_file_data)} files")
+    print(f"   Skipped {skipped_by_extension} files by extension filter")
     
     close_reports()
-    
     return all_file_data
 
 def print_summary_report():
-    """Print comprehensive summary with space savings analysis"""
     global GLOBAL_STATS
     
     print("\n" + "="*80)
@@ -878,7 +799,8 @@ def print_summary_report():
     
     print(f"  Total current file size: {current_size_gb:.2f} GB")
     print(f"  Total versions size: {versions_size_gb:.2f} GB")
-    print(f"  Version history overhead: {((versions_size_gb / current_size_gb) * 100):.1f}% of current size" if current_size_gb > 0 else "")
+    if current_size_gb > 0:
+        print(f"  Version overhead: {((versions_size_gb / current_size_gb) * 100):.1f}%")
     
     # Version statistics
     print("\n📄 VERSION STATISTICS:")
@@ -895,10 +817,69 @@ def print_summary_report():
     print(f"  Space occupied by versions to KEEP: {versions_to_keep_gb:.2f} GB")
     print(f"  🟢 TOTAL SPACE SAVED: {versions_to_delete_gb:.2f} GB")
     
-    # Percentage savings
     if GLOBAL_STATS['total_versions_size_bytes'] > 0:
         savings_percentage = (GLOBAL_STATS['total_versions_to_delete_bytes'] / GLOBAL_STATS['total_versions_size_bytes']) * 100
         print(f"  Savings percentage: {savings_percentage:.1f}% of version history")
     
-    # Overall potential savings
-    total_potential_s
+    if current_size_gb > 0 and versions_to_delete_gb > 0:
+        print(f"\n  🎯 If you delete old versions beyond last {CONFIG['keep_last_versions']}:")
+        print(f"     You will SAVE approximately: {versions_to_delete_gb:.2f} GB")
+        print(f"     This is equivalent to: {versions_to_delete_gb / current_size_gb:.1f}x the current total file size")
+    
+    print("\n" + "="*80)
+    print("✅ SUMMARY GENERATED SUCCESSFULLY!")
+    print("="*80)
+
+# ============================================================
+# MAIN FUNCTION
+# ============================================================
+
+def main():
+    print("="*80)
+    print("📊 FILE VERSION HISTORY REPORT GENERATOR")
+    print("(With Batch Processing & Space Savings Analysis)")
+    print("="*80)
+    
+    global ALLOWED_FILE_EXTENSIONS
+    ALLOWED_FILE_EXTENSIONS = normalize_extensions(FILE_EXTENSIONS)
+    site_url = get_site_url()
+    output_file = CONFIG.get('output_csv') or get_report_filename(site_url)
+    CONFIG['output_csv'] = output_file
+
+    print(f"\n📍 SharePoint Site: {CONFIG['site_url']}")
+    print(f"📏 Min File Size for Version Check: {CONFIG['min_file_size_mb']} MB")
+    print(f"💾 Keep Last Versions: {CONFIG['keep_last_versions']}")
+    print(f"📁 Output File: {output_file}")
+    print("="*80)
+    
+    print("\n🔐 Authenticating to SharePoint...")
+    access_token = get_cached_token()
+    
+    if not access_token:
+        print("❌ Authentication failed. Please check your credentials.")
+        return
+    
+    print("✅ Authentication successful\n")
+    
+    print("Starting file processing...")
+    print(f"Version history will ONLY be checked for files > {CONFIG['min_file_size_mb']} MB")
+    print(f"Keeping last {CONFIG['keep_last_versions']} versions per file")
+    
+    start_time = time.time()
+    
+    file_data = process_files(site_url, output_file)
+    
+    elapsed_time = time.time() - start_time
+    print(f"\n⏱️ Processing completed in {elapsed_time:.2f} seconds.")
+    
+    if not file_data:
+        print("\n❌ No files were processed.")
+        return
+    
+    print_summary_report()
+    
+    print(f"\n📁 Output File: {output_file}")
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
