@@ -292,8 +292,8 @@ class AuditLogCollector:
         return None
     
     def find_existing_search_in_graph(self, site):
-        """Find if a search already exists in Microsoft Graph for this site and date range"""
-        self.log(f"Checking for existing search for {site}...", Fore.YELLOW)
+        """Find the BEST existing search in Microsoft Graph - prioritize completed ones"""
+        self.log(f"🔍 Checking for existing searches for {site}...", Fore.YELLOW)
         
         response = self.make_api_request(
             "GET",
@@ -304,11 +304,12 @@ class AuditLogCollector:
             self.log("Failed to get list of searches from Graph", Fore.RED)
             return None
             
-        searches = response.json().get('value', [])
-        self.log(f"Found {len(searches)} total searches in Graph", Fore.CYAN)
+        all_searches = response.json().get('value', [])
+        self.log(f"Found {len(all_searches)} total searches in Graph", Fore.CYAN)
         
-        # Look for matching search
-        for search in searches:
+        # Filter searches that match our criteria
+        matching_searches = []
+        for search in all_searches:
             search_start = search.get('filterStartDateTime', '')
             search_end = search.get('filterEndDateTime', '')
             object_filters = search.get('objectIdFilters', [])
@@ -318,32 +319,87 @@ class AuditLogCollector:
                 search_end == self.END_DATE and
                 f"{site}/*" in object_filters):
                 
-                search_id = search.get('id')
-                status = search.get('status', 'unknown')
-                self.log(f"✅ Found existing search: {search_id} (status: {status})", Fore.GREEN)
-                return search_id
+                matching_searches.append({
+                    'id': search.get('id'),
+                    'status': search.get('status', 'unknown'),
+                    'displayName': search.get('displayName', ''),
+                    'createdDateTime': search.get('createdDateTime', ''),
+                    'search': search
+                })
         
-        self.log(f"No existing search found for {site} with this date range", Fore.YELLOW)
-        return None
+        if not matching_searches:
+            self.log(f"No existing search found for {site} with this date range", Fore.YELLOW)
+            return None
+        
+        # Log all matching searches
+        self.log(f"Found {len(matching_searches)} matching searches for {site}:", Fore.CYAN)
+        for idx, s in enumerate(matching_searches, 1):
+            status_color = Fore.GREEN if s['status'] == 'succeeded' else Fore.YELLOW
+            self.log(f"  {idx}. ID: {s['id'][:20]}... Status: {status_color}{s['status']}{Style.RESET_ALL}", Fore.CYAN)
+        
+        # PRIORITY ORDER for selecting search:
+        # 1. Succeeded/Completed searches (best)
+        # 2. In-progress searches (still processing)
+        # 3. Any other status
+        
+        # First, look for succeeded/completed
+        for s in matching_searches:
+            if s['status'] in ['succeeded', 'completed', 'partiallysucceeded']:
+                self.log(f"✅ Found COMPLETED search: {s['id']} (status: {s['status']})", Fore.GREEN)
+                self.log(f"   Display Name: {s['displayName']}", Fore.CYAN)
+                return s['id']
+        
+        # If no completed, look for in-progress
+        for s in matching_searches:
+            if s['status'] not in ['failed', 'cancelled', 'timeout']:
+                self.log(f"🔄 Found IN-PROGRESS search: {s['id']} (status: {s['status']})", Fore.YELLOW)
+                self.log(f"   Display Name: {s['displayName']}", Fore.CYAN)
+                return s['id']
+        
+        # Last resort - take any search (but log warning)
+        last_resort = matching_searches[0]
+        self.log(f"⚠️ Using last resort search: {last_resort['id']} (status: {last_resort['status']})", Fore.YELLOW)
+        return last_resort['id']
 
     def get_or_create_search(self, site):
-        """Get existing search or create a new one"""
-        # FIRST: Check if we already have this site in our state
+        """Get existing search (prioritizing completed) or create a new one"""
+        
+        # FIRST: Check if we already have this site in our completed state
+        if site in self.completed_searches:
+            search_id = self.completed_searches[site].get("SearchId")
+            if search_id:
+                # Verify it's still valid
+                status = self.get_search_status(search_id)
+                if status in ['succeeded', 'completed']:
+                    self.log(f"✅ Using completed search from state: {search_id}", Fore.GREEN)
+                    return search_id
+        
+        # SECOND: Check if we have it in our existing searches state
         if site in self.existing_searches:
             search_id = self.existing_searches[site]["SearchId"]
             self.log(f"Found search ID in local state: {search_id}", Fore.CYAN)
             
-            # Verify it still exists in Graph
+            # Verify it still exists in Graph and get its status
             status = self.get_search_status(search_id)
-            if status and status not in ["failed", "cancelled", "timeout"]:
+            if status in ['succeeded', 'completed']:
+                self.log(f"✅ Search already completed: {search_id}", Fore.GREEN)
+                # Mark as completed
+                self.completed_searches[site] = {
+                    "CompletedTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                    "RecordCount": 0,  # Will be updated if we download
+                    "SearchId": search_id
+                }
+                self.save_completed_state()
+                return search_id
+            elif status and status not in ['failed', 'cancelled', 'timeout']:
                 return search_id
             else:
-                self.log(f"Search {search_id} no longer valid (status: {status}), will find/create new", Fore.YELLOW)
+                self.log(f"Search {search_id} invalid (status: {status}), will find better one", Fore.YELLOW)
         
-        # SECOND: Check Graph for existing searches
+        # THIRD: Check Graph for existing searches (prioritizing completed)
         existing_id = self.find_existing_search_in_graph(site)
         if existing_id:
-            self.log(f"✅ Found existing search in Graph: {existing_id}", Fore.GREEN)
+            self.log(f"✅ Using existing search from Graph: {existing_id}", Fore.GREEN)
             # Store in state
             self.existing_searches[site] = {
                 "SearchId": existing_id,
@@ -352,8 +408,8 @@ class AuditLogCollector:
             self.save_search_state()
             return existing_id
         
-        # THIRD: Create new search if none exists
-        self.log(f"Creating new search for {site}...", Fore.YELLOW)
+        # FOURTH: Create new search if none exists
+        self.log(f"🆕 Creating new search for {site}...", Fore.YELLOW)
         search_params = {
             "displayName": f"Audit_{site.split('/')[-1]}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}",
             "filterStartDateTime": self.START_DATE,
@@ -398,11 +454,15 @@ class AuditLogCollector:
         status = (search_status.get("status") or "").strip().lower()
         
         # Log status changes
-        if status in ["succeeded", "failed", "cancelled"]:
-            color = Fore.GREEN if status == "succeeded" else Fore.RED
-            self.log(f"Search {search_id} status: {status}", color)
+        if status in ["succeeded", "completed", "partiallysucceeded"]:
+            color = Fore.GREEN
+            self.log(f"✅ Search {search_id} status: {status}", color)
+        elif status in ["failed", "cancelled"]:
+            color = Fore.RED
+            self.log(f"❌ Search {search_id} status: {status}", color)
         elif status:
-            self.log(f"Search {search_id} status: {status} (in progress)", Fore.YELLOW)
+            color = Fore.YELLOW
+            self.log(f"⏳ Search {search_id} status: {status} (in progress)", color)
         
         return status
 
@@ -784,14 +844,12 @@ class AuditLogCollector:
     def process_pending_searches(self):
         """Process all searches"""
         total_searches = len(SITES)
-        terminal_success_statuses = {"succeeded", "completed", "partiallysucceeded", "noresults", "nodata"}
-        terminal_failure_statuses = {"failed", "cancelled", "canceled", "timeout"}
-
+        
         # First, get or create searches for all sites
         self.log("Getting or creating searches for all sites...", Fore.CYAN)
         for site in SITES:
             if site in self.completed_searches:
-                self.log(f"Site {site} already completed, skipping", Fore.GREEN)
+                self.log(f"✅ Site {site} already completed, skipping", Fore.GREEN)
                 continue
                 
             search_id = self.get_or_create_search(site)
@@ -802,6 +860,9 @@ class AuditLogCollector:
             self.log(f"✅ Using search {search_id} for {site}", Fore.GREEN)
 
         # Now process each search
+        terminal_success_statuses = {"succeeded", "completed", "partiallysucceeded", "noresults", "nodata"}
+        terminal_failure_statuses = {"failed", "cancelled", "canceled", "timeout"}
+
         while len(self.completed_searches) < total_searches:
             self.log(f"Processing searches ({len(self.completed_searches)}/{total_searches} completed)...", Fore.YELLOW)
             
