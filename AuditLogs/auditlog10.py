@@ -314,52 +314,96 @@ class AuditLogCollector:
             search_end = search.get('filterEndDateTime', '')
             object_filters = search.get('objectIdFilters', [])
             
-            # Check if this search matches our criteria
-            if (search_start == self.START_DATE and 
-                search_end == self.END_DATE and
-                f"{site}/*" in object_filters):
+            # Skip if date range doesn't match
+            if search_start != self.START_DATE or search_end != self.END_DATE:
+                continue
+            
+            # Check if this search matches our site
+            site_match = False
+            clean_site = site.rstrip('/')
+            
+            for filter_item in object_filters:
+                # Remove trailing /* for comparison
+                clean_filter = filter_item.rstrip('/*')
                 
+                # Check various matching patterns
+                if filter_item == "*":
+                    site_match = True  # Wildcard matches everything
+                    break
+                elif clean_filter == clean_site:
+                    site_match = True  # Exact site match without /*
+                    break
+                elif filter_item == f"{clean_site}/*":
+                    site_match = True  # Exact match with /*
+                    break
+                elif clean_site in filter_item:
+                    site_match = True  # Partial match (site is contained)
+                    break
+            
+            if site_match:
                 matching_searches.append({
                     'id': search.get('id'),
                     'status': search.get('status', 'unknown'),
                     'displayName': search.get('displayName', ''),
                     'createdDateTime': search.get('createdDateTime', ''),
-                    'search': search
+                    'search': search,
+                    'object_filters': object_filters,
+                    'search_start': search_start,
+                    'search_end': search_end
                 })
         
         if not matching_searches:
             self.log(f"No existing search found for {site} with this date range", Fore.YELLOW)
             return None
         
-        # Log all matching searches
+        # Log all matching searches with details
         self.log(f"Found {len(matching_searches)} matching searches for {site}:", Fore.CYAN)
         for idx, s in enumerate(matching_searches, 1):
-            status_color = Fore.GREEN if s['status'] == 'succeeded' else Fore.YELLOW
+            status_color = Fore.GREEN if s['status'] in ['succeeded', 'completed'] else Fore.YELLOW
             self.log(f"  {idx}. ID: {s['id'][:20]}... Status: {status_color}{s['status']}{Style.RESET_ALL}", Fore.CYAN)
+            self.log(f"     Created: {s['createdDateTime']}", Fore.CYAN)
+            self.log(f"     Filters: {s['object_filters']}", Fore.CYAN)
         
         # PRIORITY ORDER for selecting search:
-        # 1. Succeeded/Completed searches (best)
-        # 2. In-progress searches (still processing)
-        # 3. Any other status
+        # 1. Succeeded/Completed searches (best) - MOST RECENT FIRST
+        # 2. In-progress searches (still processing) - MOST RECENT FIRST
+        # 3. Any other status - MOST RECENT FIRST
         
-        # First, look for succeeded/completed
+        succeeded = []
+        in_progress = []
+        others = []
+        
         for s in matching_searches:
             if s['status'] in ['succeeded', 'completed', 'partiallysucceeded']:
-                self.log(f"✅ Found COMPLETED search: {s['id']} (status: {s['status']})", Fore.GREEN)
-                self.log(f"   Display Name: {s['displayName']}", Fore.CYAN)
-                return s['id']
+                succeeded.append(s)
+            elif s['status'] not in ['failed', 'cancelled', 'canceled', 'timeout']:
+                in_progress.append(s)
+            else:
+                others.append(s)
         
-        # If no completed, look for in-progress
-        for s in matching_searches:
-            if s['status'] not in ['failed', 'cancelled', 'timeout']:
-                self.log(f"🔄 Found IN-PROGRESS search: {s['id']} (status: {s['status']})", Fore.YELLOW)
-                self.log(f"   Display Name: {s['displayName']}", Fore.CYAN)
-                return s['id']
+        # Sort by createdDateTime (most recent first)
+        succeeded.sort(key=lambda x: x['createdDateTime'], reverse=True)
+        in_progress.sort(key=lambda x: x['createdDateTime'], reverse=True)
+        others.sort(key=lambda x: x['createdDateTime'], reverse=True)
         
-        # Last resort - take any search (but log warning)
-        last_resort = matching_searches[0]
-        self.log(f"⚠️ Using last resort search: {last_resort['id']} (status: {last_resort['status']})", Fore.YELLOW)
-        return last_resort['id']
+        # Select based on priority
+        if succeeded:
+            selected = succeeded[0]
+            self.log(f"✅ Found COMPLETED search: {selected['id'][:20]}... (status: {selected['status']}, created: {selected['createdDateTime']})", Fore.GREEN)
+            self.log(f"   Using this completed search instead of waiting for in-progress ones", Fore.GREEN)
+            return selected['id']
+        
+        if in_progress:
+            selected = in_progress[0]
+            self.log(f"🔄 Found IN-PROGRESS search: {selected['id'][:20]}... (status: {selected['status']}, created: {selected['createdDateTime']})", Fore.YELLOW)
+            return selected['id']
+        
+        if others:
+            selected = others[0]
+            self.log(f"⚠️ Using last resort search: {selected['id'][:20]}... (status: {selected['status']}, created: {selected['createdDateTime']})", Fore.YELLOW)
+            return selected['id']
+        
+        return None
 
     def get_or_create_search(self, site):
         """Get existing search (prioritizing completed) or create a new one"""
@@ -456,13 +500,13 @@ class AuditLogCollector:
         # Log status changes
         if status in ["succeeded", "completed", "partiallysucceeded"]:
             color = Fore.GREEN
-            self.log(f"✅ Search {search_id} status: {status}", color)
+            self.log(f"✅ Search {search_id[:20]}... status: {status}", color)
         elif status in ["failed", "cancelled"]:
             color = Fore.RED
-            self.log(f"❌ Search {search_id} status: {status}", color)
+            self.log(f"❌ Search {search_id[:20]}... status: {status}", color)
         elif status:
             color = Fore.YELLOW
-            self.log(f"⏳ Search {search_id} status: {status} (in progress)", color)
+            self.log(f"⏳ Search {search_id[:20]}... status: {status} (in progress)", color)
         
         return status
 
