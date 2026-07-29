@@ -198,6 +198,42 @@ def make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
+def safe_float_conversion(value, default=0.0):
+    """Safely convert a value to float, handling errors"""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Remove any non-numeric characters except decimal point
+        cleaned = value.strip()
+        # Check if it's an error message
+        if 'error' in cleaned.lower() or '#' in cleaned:
+            return default
+        try:
+            return float(cleaned)
+        except ValueError:
+            return default
+    return default
+
+def safe_int_conversion(value, default=0):
+    """Safely convert a value to int, handling errors"""
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if 'error' in cleaned.lower() or '#' in cleaned:
+            return default
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return default
+    return default
+
 def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=5000):
     """
     Get all sites from the Tenant Admin Aggregated Sites List with proper pagination
@@ -212,6 +248,7 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
     has_more_pages = True
     failed_pages = 0
     max_failures = 3
+    error_items = []  # Track items with errors
     
     # First, get the total count of items in the list
     try:
@@ -250,86 +287,102 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                 if total_sites % 100 == 0 or total_sites == 1:
                     print(f"  [{total_sites}] Processing: {item.get('Title', 'Unknown')[:50]}...")
                 
-                # Extract all important fields from the list item
-                site_info = {
-                    # Core identifiers
-                    'id': item.get('Id', ''),
-                    'item_id': item.get('ID', ''),  # Sometimes ID is capitalized
-                    'guid': item.get('GUID', ''),
+                try:
+                    # Safe conversion for storage percentage
+                    storage_percentage_str = item.get('StorageUsedPercentage', '0')
+                    storage_percentage = safe_float_conversion(storage_percentage_str, 0.0) * 100
                     
-                    # Site information
-                    'title': item.get('Title', ''),
-                    'site_url': item.get('SiteUrl', ''),
-                    'site_id': item.get('SiteId', ''),
-                    'template_name': item.get('TemplateName', ''),
-                    'site_creation_source': item.get('SiteCreationSource', ''),
-                    'site_flags': item.get('SiteFlags', 0),
+                    # Extract all important fields from the list item with safe conversions
+                    site_info = {
+                        # Core identifiers
+                        'id': safe_int_conversion(item.get('Id', 0)),
+                        'item_id': safe_int_conversion(item.get('ID', 0)),
+                        'guid': item.get('GUID', ''),
+                        
+                        # Site information
+                        'title': item.get('Title', ''),
+                        'site_url': item.get('SiteUrl', ''),
+                        'site_id': item.get('SiteId', ''),
+                        'template_name': item.get('TemplateName', ''),
+                        'site_creation_source': item.get('SiteCreationSource', ''),
+                        'site_flags': safe_int_conversion(item.get('SiteFlags', 0)),
+                        
+                        # Storage information - safe conversions
+                        'storage_quota_bytes': safe_float_conversion(item.get('StorageQuota', 0)),
+                        'storage_quota_gb': round(safe_float_conversion(item.get('StorageQuota', 0)) / (1024**3), 2) if safe_float_conversion(item.get('StorageQuota', 0)) else 0,
+                        'storage_used_bytes': safe_float_conversion(item.get('StorageUsed', 0)),
+                        'storage_used_gb': round(safe_float_conversion(item.get('StorageUsed', 0)) / (1024**3), 2) if safe_float_conversion(item.get('StorageUsed', 0)) else 0,
+                        'storage_used_percentage': storage_percentage,
+                        
+                        # Dates
+                        'created': item.get('Created', ''),
+                        'modified': item.get('Modified', ''),
+                        'time_created': item.get('TimeCreated', ''),
+                        'time_deleted': item.get('TimeDeleted', ''),
+                        'last_activity': item.get('LastActivityOn', ''),
+                        'operation_start_time': item.get('OperationStartTime', ''),
+                        
+                        # Users and ownership
+                        'created_by': item.get('CreatedBy', ''),
+                        'created_by_email': item.get('CreatedByEmail', ''),
+                        'deleted_by': item.get('DeletedBy', ''),
+                        'site_owner_name': item.get('SiteOwnerName', ''),
+                        'site_owner_email': item.get('SiteOwnerEmail', ''),
+                        
+                        # Groups and hubs
+                        'group_id': item.get('GroupId', ''),
+                        'related_group_id': item.get('RelatedGroupId', ''),
+                        'hub_site_id': item.get('HubSiteId', ''),
+                        
+                        # File and usage statistics - safe conversions
+                        'num_of_files': safe_int_conversion(item.get('NumOfFiles', 0)),
+                        'page_views': safe_int_conversion(item.get('PageViews', 0)),
+                        'pages_visited': safe_int_conversion(item.get('PagesVisited', 0)),
+                        'file_viewed_or_edited': safe_int_conversion(item.get('FileViewedOrEdited', 0)),
+                        
+                        # Sharing and permissions
+                        'external_sharing': item.get('ExternalSharing', ''),
+                        'allow_guest_signin': item.get('AllowGuestUserSignIn', False),
+                        'anonymous_link_count': safe_int_conversion(item.get('AnonymousLinkCount', 0)),
+                        'company_link_count': safe_int_conversion(item.get('CompanyLinkCount', 0)),
+                        'sensitivity_label': item.get('SensitivityLabel', ''),
+                        
+                        # State and status
+                        'state': safe_int_conversion(item.get('State', 0)),
+                        'archive_status': item.get('ArchiveStatus', ''),
+                        'block_download_policy': item.get('BlockDownloadPolicy', False),
+                        'conditional_access_policy': safe_int_conversion(item.get('ConditionalAccessPolicy', 0)),
+                        'ib_mode': item.get('IBMode', ''),
+                        
+                        # Channel information
+                        'channel_type': safe_int_conversion(item.get('ChannelType', 0)),
+                        'channel_sites_count': safe_int_conversion(item.get('ChannelSitesCount', 0)),
+                        'was_segment_applied': item.get('WasSegmentApplied', False),
+                        
+                        # Locale and timezone
+                        'locale_id': safe_int_conversion(item.get('LocaleId', 0)),
+                        'timezone_id': safe_int_conversion(item.get('TimeZoneId', 0)),
+                        
+                        # Other metadata
+                        'content_type_id': item.get('ContentTypeId', ''),
+                        'compliance_asset_id': item.get('ComplianceAssetId', ''),
+                        'is_authoritative': item.get('IsAuthoritative', False),
+                        'initiator': item.get('Initiator', ''),
+                        'color_tag': item.get('OData__ColorTag', '')
+                    }
                     
-                    # Storage information
-                    'storage_quota_bytes': item.get('StorageQuota', 0),
-                    'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
-                    'storage_used_bytes': item.get('StorageUsed', 0),
-                    'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
-                    'storage_used_percentage': float(item.get('StorageUsedPercentage', '0')) * 100 if item.get('StorageUsedPercentage') else 0,
+                    all_sites.append(site_info)
                     
-                    # Dates
-                    'created': item.get('Created', ''),
-                    'modified': item.get('Modified', ''),
-                    'time_created': item.get('TimeCreated', ''),
-                    'time_deleted': item.get('TimeDeleted', ''),
-                    'last_activity': item.get('LastActivityOn', ''),
-                    'operation_start_time': item.get('OperationStartTime', ''),
-                    
-                    # Users and ownership
-                    'created_by': item.get('CreatedBy', ''),
-                    'created_by_email': item.get('CreatedByEmail', ''),
-                    'deleted_by': item.get('DeletedBy', ''),
-                    'site_owner_name': item.get('SiteOwnerName', ''),
-                    'site_owner_email': item.get('SiteOwnerEmail', ''),
-                    
-                    # Groups and hubs
-                    'group_id': item.get('GroupId', ''),
-                    'related_group_id': item.get('RelatedGroupId', ''),
-                    'hub_site_id': item.get('HubSiteId', ''),
-                    
-                    # File and usage statistics
-                    'num_of_files': item.get('NumOfFiles', 0),
-                    'page_views': item.get('PageViews', 0),
-                    'pages_visited': item.get('PagesVisited', 0),
-                    'file_viewed_or_edited': item.get('FileViewedOrEdited', 0),
-                    
-                    # Sharing and permissions
-                    'external_sharing': item.get('ExternalSharing', ''),
-                    'allow_guest_signin': item.get('AllowGuestUserSignIn', False),
-                    'anonymous_link_count': item.get('AnonymousLinkCount', 0),
-                    'company_link_count': item.get('CompanyLinkCount', 0),
-                    'sensitivity_label': item.get('SensitivityLabel', ''),
-                    
-                    # State and status
-                    'state': item.get('State', 0),
-                    'archive_status': item.get('ArchiveStatus', ''),
-                    'block_download_policy': item.get('BlockDownloadPolicy', False),
-                    'conditional_access_policy': item.get('ConditionalAccessPolicy', 0),
-                    'ib_mode': item.get('IBMode', ''),
-                    
-                    # Channel information
-                    'channel_type': item.get('ChannelType', 0),
-                    'channel_sites_count': item.get('ChannelSitesCount', 0),
-                    'was_segment_applied': item.get('WasSegmentApplied', False),
-                    
-                    # Locale and timezone
-                    'locale_id': item.get('LocaleId', 0),
-                    'timezone_id': item.get('TimeZoneId', 0),
-                    
-                    # Other metadata
-                    'content_type_id': item.get('ContentTypeId', ''),
-                    'compliance_asset_id': item.get('ComplianceAssetId', ''),
-                    'is_authoritative': item.get('IsAuthoritative', False),
-                    'initiator': item.get('Initiator', ''),
-                    'color_tag': item.get('OData__ColorTag', '')
-                }
-                
-                all_sites.append(site_info)
+                except Exception as e:
+                    print(f"  ⚠️ Error processing item {total_sites} (ID: {item.get('Id', 'Unknown')}): {str(e)[:100]}")
+                    error_items.append({
+                        'index': total_sites,
+                        'id': item.get('Id', 'Unknown'),
+                        'title': item.get('Title', 'Unknown'),
+                        'error': str(e)
+                    })
+                    # Continue with next item instead of failing the whole batch
+                    continue
             
             # Check for next link for pagination
             next_link = data.get('odata.nextLink')
@@ -383,6 +436,14 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
     print(f"\n{'='*50}")
     print(f"Total sites retrieved: {len(all_sites)}")
     print(f"Total batches processed: {batch_count}")
+    
+    if error_items:
+        print(f"⚠️ Items with errors: {len(error_items)}")
+        print(f"  First 5 errors:")
+        for err in error_items[:5]:
+            print(f"    • Item {err['index']} (ID: {err['id']}): {err['title']} - {err['error'][:50]}")
+        if len(error_items) > 5:
+            print(f"    ... and {len(error_items) - 5} more")
     
     # Count deleted sites
     deleted_sites = [s for s in all_sites if s.get('time_deleted')]
@@ -444,8 +505,8 @@ def save_to_csv(sites, filename):
             
             for site in sites:
                 writer.writerow({
-                    'ID': site.get('id', ''),
-                    'Item ID': site.get('item_id', ''),
+                    'ID': site.get('id', 0),
+                    'Item ID': site.get('item_id', 0),
                     'GUID': site.get('guid', ''),
                     
                     'Title': site.get('title', ''),
