@@ -52,9 +52,9 @@ def load_config(config_file="config.json"):
         with open(config_file, 'r') as f:
             config = json.load(f)
         
-        config.setdefault('page_size', 100)
+        config.setdefault('page_size', 5000)
         config.setdefault('max_retries', 3)
-        config.setdefault('max_concurrent_requests', 10)  # New setting for concurrent requests
+        config.setdefault('max_concurrent_requests', 10)
         
         return config
     except FileNotFoundError:
@@ -68,7 +68,7 @@ def load_config(config_file="config.json"):
     "key_path": "key.pem",
     "sharepoint_admin_url": "https://yourtenant-admin.sharepoint.com",
     "list_id": "317f59e4-b925-4d1c-884c-c758bf067a6c",
-    "page_size": 100,
+    "page_size": 5000,
     "max_retries": 3,
     "max_concurrent_requests": 10
 }
@@ -215,32 +215,49 @@ def get_site_metadata(token_manager, site_url):
             'last_item_user_modified_date': 'Error'
         }
 
-def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=100, max_concurrent=10):
-    """Get all sites from the Tenant Admin Aggregated Sites List with additional metadata"""
+def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=5000):
+    """
+    Get all sites from the Tenant Admin Aggregated Sites List with proper pagination
+    Using $skiptoken to handle large lists beyond the 5000 item view threshold
+    """
     print(f"\n=== Retrieving SharePoint Sites from Admin List ===")
+    print(f"Using page size: {page_size}")
     
     all_sites = []
-    
-    # Base endpoint for the list items
-    base_endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items"
-    
-    # Initial request with top parameter
-    endpoint = f"{base_endpoint}?$top={page_size}"
     batch_count = 0
     total_sites = 0
+    has_more_pages = True
+    failed_pages = 0
+    max_failures = 3
     
-    while endpoint:
+    # First, get the total count of items in the list
+    try:
+        count_endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/ItemCount"
+        count_data = make_sharepoint_request_with_retry(token_manager, count_endpoint, max_retries=2)
+        total_items = count_data.get('value', 0)
+        print(f"Total items in list: {total_items}")
+    except Exception as e:
+        print(f"Warning: Could not get total item count: {e}")
+        total_items = "Unknown"
+    
+    # Start with the first page using $skiptoken=0 (no orderby)
+    endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
+    
+    while has_more_pages:
         batch_count += 1
         try:
-            print(f"Processing batch {batch_count}...")
-            data = make_sharepoint_request_with_retry(token_manager, endpoint)
+            print(f"\nProcessing batch {batch_count}...")
+            
+            data = make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3)
             
             current_batch = data.get('value', [])
+            batch_size = len(current_batch)
             
-            if not current_batch:
+            print(f"  Found {batch_size} sites in this batch")
+            
+            if batch_size == 0:
+                print("  No items in this batch, stopping pagination")
                 break
-            
-            print(f"  Found {len(current_batch)} sites in this batch")
             
             # Process each site in the batch
             for idx, item in enumerate(current_batch, 1):
@@ -249,15 +266,17 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                 # Extract basic site info
                 site_url = item.get('SiteUrl', '')
                 
-                print(f"  [{total_sites}] Fetching metadata for: {item.get('Title', 'Unknown')}")
+                # Show progress every 100 sites
+                if total_sites % 100 == 0 or total_sites == 1:
+                    print(f"  [{total_sites}] Processing: {item.get('Title', 'Unknown')[:50]}...")
                 
                 # Get additional metadata from the site
                 site_metadata = get_site_metadata(token_manager, site_url)
                 
                 site_info = {
                     # New columns from list item
-                    'id': item.get('Id', ''),  # Added Id field
-                    'time_deleted': item.get('TimeDeleted', ''),  # Added TimeDeleted field
+                    'id': item.get('Id', ''),
+                    'time_deleted': item.get('TimeDeleted', ''),
                     
                     # Existing fields
                     'title': item.get('Title', ''),
@@ -291,32 +310,66 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                 }
                 
                 all_sites.append(site_info)
-                
-                # Print progress with new fields
-                print(f"    ✓ ID: {site_info['id']}")
-                if site_info['time_deleted']:
-                    print(f"    ⚠️ Time Deleted: {site_info['time_deleted']}")
-                print(f"    ✓ Storage: {site_info['storage_used_gb']} GB / {site_info['storage_quota_gb']} GB")
-                if site_info['last_item_user_modified_date'] and site_info['last_item_user_modified_date'] != 'Error':
-                    print(f"    ✓ Last modified: {site_info['last_item_user_modified_date']}")
             
             # Check for next link for pagination
-            endpoint = data.get('odata.nextLink')
-            if endpoint:
-                print(f"  Next page available")
+            next_link = data.get('odata.nextLink')
+            if next_link:
+                print(f"  ✓ Batch {batch_count} complete. Next page available.")
+                endpoint = next_link
+                # Small delay to avoid rate limiting
+                time.sleep(0.5)
+                failed_pages = 0  # Reset failure counter on success
             else:
-                print("  No more pages")
+                print(f"  ✓ No more pages available. All items retrieved.")
+                has_more_pages = False
                 
         except Exception as e:
-            print(f"Error processing batch {batch_count}: {str(e)}")
-            break
+            print(f"❌ Error processing batch {batch_count}: {str(e)}")
+            failed_pages += 1
+            
+            # Check if it's a view threshold error
+            if "view threshold" in str(e).lower() or "5000" in str(e) or "throttle" in str(e).lower():
+                print("  ⚠️ List view threshold or throttling issue detected!")
+                
+                # Try with smaller page size
+                if page_size > 1000:
+                    page_size = 1000
+                    # Rebuild endpoint with smaller page size
+                    endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
+                    print(f"  Retrying with page size: {page_size}")
+                    continue
+                elif page_size > 500:
+                    page_size = 500
+                    endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
+                    print(f"  Retrying with page size: {page_size}")
+                    continue
+                elif page_size > 100:
+                    page_size = 100
+                    endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
+                    print(f"  Retrying with page size: {page_size}")
+                    continue
+            
+            # If too many failures, break
+            if failed_pages >= max_failures:
+                print(f"  Too many failures ({failed_pages}). Stopping pagination.")
+                has_more_pages = False
+            elif all_sites:
+                print(f"  Continuing with next page...")
+                # Try to get next link from the last successful response
+                if 'next_link' in locals() and next_link:
+                    endpoint = next_link
+                    continue
+                else:
+                    has_more_pages = False
     
-    print(f"\nTotal sites retrieved: {len(all_sites)}")
+    print(f"\n{'='*50}")
+    print(f"Total sites retrieved: {len(all_sites)}")
+    print(f"Total batches processed: {batch_count}")
     
     # Count deleted sites
     deleted_sites = [s for s in all_sites if s.get('time_deleted')]
     if deleted_sites:
-        print(f"\n⚠️ Found {len(deleted_sites)} sites with TimeDeleted value (soft-deleted sites)")
+        print(f"⚠️ Found {len(deleted_sites)} sites with TimeDeleted value (soft-deleted sites)")
     
     return all_sites
 
@@ -395,7 +448,7 @@ def main():
     private_key_path = config.get('key_path')
     sharepoint_admin_url = config.get('sharepoint_admin_url')
     list_id = config.get('list_id')
-    page_size = config.get('page_size', 100)
+    page_size = config.get('page_size', 5000)
     max_retries = config.get('max_retries', 3)
     
     print(f"Configuration loaded:")
@@ -452,17 +505,34 @@ def main():
         # Count deleted sites
         deleted_sites = [s for s in all_sites if s.get('time_deleted')]
         
-        print(f"\n=== SUMMARY ===")
+        print(f"\n{'='*50}")
+        print(f"SUMMARY")
+        print(f"{'='*50}")
         print(f"Total Sites: {len(all_sites)}")
         print(f"  - Active sites: {len(all_sites) - len(deleted_sites)}")
         print(f"  - Soft-deleted sites: {len(deleted_sites)}")
         print(f"Total Storage Used: {total_storage:.2f} GB")
         print(f"Total Storage Quota: {total_quota:.2f} GB")
-        print(f"Total Files: {total_files}")
+        print(f"Total Files: {total_files:,}")
         print(f"Sites with activity data: {sites_with_recent_activity}/{len(all_sites)}")
         
         if total_quota > 0:
             print(f"Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
+        
+        # Show sites created after 2026-01-15 to verify we got them
+        sites_after_jan15 = [s for s in all_sites if s.get('created', '') > '2026-01-15']
+        if sites_after_jan15:
+            print(f"\n✅ Sites created after 2026-01-15: {len(sites_after_jan15)}")
+            print(f"  Latest 5:")
+            for site in sorted(sites_after_jan15, key=lambda x: x.get('created', ''), reverse=True)[:5]:
+                print(f"    • {site['title']} - Created: {site.get('created', 'Unknown')}")
+        else:
+            print(f"\n⚠️ No sites found created after 2026-01-15")
+            # Show the latest created date
+            created_dates = [s.get('created', '') for s in all_sites if s.get('created')]
+            if created_dates:
+                latest_date = sorted(created_dates, reverse=True)[0]
+                print(f"  Latest created date in retrieved data: {latest_date}")
         
         # Show top 5 largest sites
         largest_sites = sorted(all_sites, key=lambda x: x['storage_used_gb'], reverse=True)[:5]
@@ -474,7 +544,7 @@ def main():
         # Show recently modified sites
         recently_modified = [s for s in all_sites 
                             if s.get('last_item_user_modified_date') and 
-                            s.get('last_item_user_modified_date') != 'Error'][:5]
+                            s.get('last_item_user_modified_date') != 'Error']
         recently_modified.sort(key=lambda x: x.get('last_item_user_modified_date', ''), reverse=True)
         
         if recently_modified:
@@ -491,10 +561,14 @@ def main():
             if len(deleted_sites) > 5:
                 print(f"  ... and {len(deleted_sites) - 5} more")
         
-        print(f"\n✅ Script completed successfully!")
+        print(f"\n{'='*50}")
+        print(f"✅ Script completed successfully!")
+        print(f"{'='*50}")
         
     except Exception as e:
         print(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 if __name__ == "__main__":
