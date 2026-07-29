@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-SharePoint Site Admin Report Generator
-Generates a CSV report of site administrators for a list of SharePoint sites
-Detects groups from LoginName pattern (xxxxx|xxxxxxx|<groupid>_o) and expands group owners via Graph API
+SharePoint Site Admin Report Generator (Multi-Threaded)
+Generates CSV report with separate columns for Direct Users and Group Owners
+Includes group titles and supports multi-threading for faster processing
 """
 
 import requests
@@ -20,10 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import queue
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Configuration - Update these values
@@ -37,11 +40,24 @@ CONFIG = {
     "scopes": {
         "graph": "https://graph.microsoft.com/.default",
         "sharepoint": "https://geekbyteonline.sharepoint.com/.default"
-    }
+    },
+    "max_workers": 5  # Number of threads for parallel processing
 }
 
 # Cache for group owners to avoid repeated API calls
 group_owner_cache = {}
+cache_lock = Lock()
+stats_lock = Lock()
+
+# Statistics tracking
+stats = {
+    'total_sites': 0,
+    'processed': 0,
+    'failed': 0,
+    'total_direct_users': 0,
+    'total_group_owners': 0,
+    'total_groups': 0
+}
 
 def get_token_with_certificate(scope: str) -> Optional[str]:
     """Get access token using certificate-based authentication"""
@@ -139,32 +155,18 @@ def get_sharepoint_token() -> Optional[str]:
     return token
 
 def extract_group_id_from_loginname(login_name: str) -> Optional[str]:
-    """
-    Extract Group ID from LoginName.
-    
-    Format: "xxxxx|xxxxxxx|<groupid>_o"
-    
-    Examples:
-    - "c:0o.c|tenant|a1b2c3d4-e5f6-7890-abcd-ef1234567890_o" → "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-    - "i:0#.f|membership|group123_o" → "group123"
-    - "c:0o.c|system|xyz_o" → "xyz"
-    """
+    """Extract Group ID from LoginName format: xxxxx|xxxxxxx|<groupid>_o"""
     if not login_name:
         return None
     
     try:
-        # Split by '|' and get the last part
         parts = login_name.split('|')
         if len(parts) >= 1:
-            last_part = parts[-1]  # Gets "<groupid>_o" or just "<groupid>"
-            
-            # Remove the "_o" suffix if present
+            last_part = parts[-1]
             if last_part.endswith('_o'):
-                group_id = last_part[:-2]  # Remove "_o"
+                group_id = last_part[:-2]
             else:
                 group_id = last_part
-            
-            # Clean up any extra characters
             if group_id:
                 group_id = group_id.strip()
                 return group_id
@@ -174,23 +176,37 @@ def extract_group_id_from_loginname(login_name: str) -> Optional[str]:
     
     return None
 
-def get_group_owners(group_id: str) -> List[Dict[str, Any]]:
+def get_group_owners(group_id: str) -> Tuple[List[Dict[str, Any]], str]:
     """Get owners of a Microsoft 365 group using Graph API"""
     try:
         # Check cache first
-        if group_id in group_owner_cache:
-            logger.info(f"Using cached group owners for {group_id}")
-            return group_owner_cache[group_id]
+        with cache_lock:
+            if group_id in group_owner_cache:
+                logger.info(f"Using cached group owners for {group_id}")
+                return group_owner_cache[group_id]
         
         token = get_graph_token()
         if not token:
             logger.error("Failed to get Graph API token")
-            return []
+            return [], ""
         
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
+        
+        # First get group details to get the display name
+        group_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}"
+        logger.info(f"Fetching group details: {group_id}")
+        group_response = requests.get(group_url, headers=headers)
+        group_title = group_id  # Default to ID if title not found
+        
+        if group_response.status_code == 200:
+            group_data = group_response.json()
+            group_title = group_data.get('displayName', group_id)
+            logger.info(f"Group title: {group_title}")
+        else:
+            logger.warning(f"Could not get group title: {group_response.text}")
         
         # Get group owners
         url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/owners"
@@ -200,13 +216,12 @@ def get_group_owners(group_id: str) -> List[Dict[str, Any]]:
         
         if response.status_code != 200:
             logger.error(f"Failed to get group owners: {response.text}")
-            return []
+            return [], group_title
         
         data = response.json()
         owners = []
         
         for owner in data.get('value', []):
-            # Get user details including email
             user_details = {
                 'user_id': owner.get('id'),
                 'title': owner.get('displayName', ''),
@@ -214,22 +229,24 @@ def get_group_owners(group_id: str) -> List[Dict[str, Any]]:
                 'login_name': owner.get('userPrincipalName', ''),
                 'is_site_admin': True,
                 'is_group_member': True,
-                'group_id': group_id
+                'group_id': group_id,
+                'group_title': group_title
             }
             owners.append(user_details)
         
         # Cache the results
-        group_owner_cache[group_id] = owners
-        logger.info(f"Found {len(owners)} owners for group {group_id}")
+        with cache_lock:
+            group_owner_cache[group_id] = (owners, group_title)
         
-        return owners
+        logger.info(f"Found {len(owners)} owners for group {group_id} ({group_title})")
+        return owners, group_title
         
     except Exception as e:
         logger.exception(f"Failed to get owners for group {group_id}")
-        return []
+        return [], group_id if 'group_id' in locals() else "Unknown"
 
-def parse_site_users_xml(xml_content: str) -> List[Dict[str, Any]]:
-    """Parse SharePoint site users XML and return all admins with group expansion"""
+def parse_site_users_xml(xml_content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Parse SharePoint site users XML and return direct users and group owners separately"""
     try:
         root = ET.fromstring(xml_content)
         
@@ -242,15 +259,15 @@ def parse_site_users_xml(xml_content: str) -> List[Dict[str, Any]]:
         entries = root.findall('.//atom:entry', namespaces)
         logger.debug(f"Found {len(entries)} entries in XML")
         
-        admins = []
+        direct_users = []
         group_ids_to_expand = []
+        group_titles_by_id = {}
         
         for entry in entries:
             content = entry.find('atom:content', namespaces)
             if content is not None:
                 properties = content.find('m:properties', namespaces)
                 if properties is not None:
-                    # Extract user details
                     user_id_elem = properties.find('d:Id', namespaces)
                     title_elem = properties.find('d:Title', namespaces)  
                     email_elem = properties.find('d:Email', namespaces)
@@ -266,92 +283,85 @@ def parse_site_users_xml(xml_content: str) -> List[Dict[str, Any]]:
                     principal_type = int(principal_type_elem.text) if principal_type_elem is not None else None
                     
                     if is_site_admin:
-                        # Check if this is a group using multiple methods
-                        is_group = False
-                        group_id = None
-                        detection_method = ""
-                        
-                        # Method 1: Check PrincipalType = 4 (Microsoft 365 Group)
+                        # GROUP: PrincipalType = 4
                         if principal_type == 4:
-                            is_group = True
-                            detection_method = "PrincipalType=4"
-                            # Try to extract group ID from login_name
-                            if login_name:
-                                group_id = extract_group_id_from_loginname(login_name)
+                            logger.info(f"Found group: {title} (ID: {user_id})")
+                            if user_id:
+                                group_ids_to_expand.append({
+                                    'group_id': user_id,
+                                    'group_name': title,
+                                    'group_title': title
+                                })
+                                group_titles_by_id[user_id] = title
                         
-                        # Method 2: Check if title contains "owners" or "owner"
-                        if not is_group and title:
-                            title_lower = title.lower()
-                            if 'owners' in title_lower or 'owner' in title_lower:
-                                is_group = True
-                                detection_method = "Title contains 'owners'"
-                                if login_name:
-                                    group_id = extract_group_id_from_loginname(login_name)
-                        
-                        # Method 3: Check if login_name ends with "_o"
-                        if not is_group and login_name and login_name.endswith('_o'):
-                            is_group = True
-                            detection_method = "LoginName ends with '_o'"
-                            group_id = extract_group_id_from_loginname(login_name)
-                        
-                        # Method 4: Check if login_name has group ID pattern
-                        if not is_group and login_name:
-                            extracted_id = extract_group_id_from_loginname(login_name)
-                            if extracted_id:
-                                is_group = True
-                                detection_method = "LoginName pattern matched"
-                                group_id = extracted_id
-                        
-                        admin_entry = {
-                            'user_id': user_id,
-                            'title': title,
-                            'email': email,
-                            'login_name': login_name,
-                            'is_site_admin': is_site_admin,
-                            'principal_type': principal_type,
-                            'is_group': is_group,
-                            'group_id': group_id,
-                            'detection_method': detection_method
-                        }
-                        
-                        if is_group and group_id:
-                            logger.info(f"Found group: {title} (ID: {group_id}) - Detected by: {detection_method}")
-                            group_ids_to_expand.append({
-                                'group_id': group_id,
-                                'group_name': title,
-                                'admin_entry': admin_entry
-                            })
+                        # USER: PrincipalType = 1 (or any other value that's not 4)
                         else:
-                            admins.append(admin_entry)
+                            logger.info(f"Found direct user: {title} ({email})")
+                            direct_users.append({
+                                'user_id': user_id,
+                                'title': title,
+                                'email': email,
+                                'login_name': login_name,
+                                'is_site_admin': is_site_admin,
+                                'principal_type': principal_type,
+                                'is_group_member': False,
+                                'group_title': ''
+                            })
         
-        # Expand groups and add their owners
+        # Expand groups and get all owners
+        group_owners = []
+        groups_info = []
+        
         for group_info in group_ids_to_expand:
             group_id = group_info['group_id']
             group_name = group_info['group_name']
             logger.info(f"Expanding group: {group_name} ({group_id})")
             
-            owners = get_group_owners(group_id)
+            owners, actual_group_title = get_group_owners(group_id)
+            
+            # Use the actual group title from Graph API if available, otherwise use SharePoint title
+            group_display_title = actual_group_title if actual_group_title and actual_group_title != group_id else group_name
             
             if owners:
-                logger.info(f"Added {len(owners)} owners from group {group_name}")
+                logger.info(f"Added {len(owners)} owners from group {group_display_title}")
+                # Add group title to each owner
                 for owner in owners:
-                    # Check if owner is already in the list (avoid duplicates)
-                    if not any(a.get('email') == owner.get('email') for a in admins):
-                        admins.append(owner)
+                    owner['group_title'] = group_display_title
+                group_owners.extend(owners)
+                groups_info.append({
+                    'group_id': group_id,
+                    'group_title': group_display_title,
+                    'member_count': len(owners)
+                })
             else:
-                logger.warning(f"No owners found for group {group_name}")
-                # If no owners found, keep the group itself in the list
-                admins.append(group_info['admin_entry'])
+                logger.warning(f"No owners found for group {group_display_title}")
+                # Keep the group itself as an entry
+                group_owners.append({
+                    'user_id': group_id,
+                    'title': group_display_title,
+                    'email': '',
+                    'login_name': '',
+                    'is_site_admin': True,
+                    'is_group_member': False,
+                    'is_group_itself': True,
+                    'group_id': group_id,
+                    'group_title': group_display_title
+                })
+                groups_info.append({
+                    'group_id': group_id,
+                    'group_title': group_display_title,
+                    'member_count': 0
+                })
         
-        logger.info(f"Final admin list has {len(admins)} users (including expanded groups)")
-        return admins
+        logger.info(f"Final - Direct Users: {len(direct_users)}, Group Owners: {len(group_owners)}")
+        return direct_users, group_owners, groups_info
         
     except Exception as e:
         logger.exception("Failed to parse site users XML")
-        return []
+        return [], [], []
 
-def get_site_admins(site_url: str) -> List[Dict[str, Any]]:
-    """Get all site administrators for a SharePoint site, expanding groups"""
+def get_site_admins(site_url: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Get site administrators, separating direct users and group owners"""
     try:
         if not site_url.endswith('/'):
             site_url += '/'
@@ -372,14 +382,14 @@ def get_site_admins(site_url: str) -> List[Dict[str, Any]]:
         
         if response.status_code != 200:
             logger.error(f"SharePoint API failed: {response.status_code} - {response.text}")
-            return []
+            return [], [], []
         
-        admins = parse_site_users_xml(response.text)
-        return admins
+        direct_users, group_owners, groups_info = parse_site_users_xml(response.text)
+        return direct_users, group_owners, groups_info
         
     except Exception as e:
         logger.exception(f"Failed to get site admins from {site_url}")
-        return []
+        return [], [], []
 
 def normalize_site_url(site_input: str) -> str:
     """Normalize site URL from various input formats"""
@@ -394,117 +404,175 @@ def normalize_site_url(site_input: str) -> str:
     tenant_name = CONFIG['tenant_name'].split('.')[0]
     return f"https://{tenant_name}.sharepoint.com/{site_input}"
 
+def process_site(site_entry: Dict[str, str]) -> Dict[str, Any]:
+    """Process a single site - used by thread pool"""
+    site_input = site_entry.get('site_url') or site_entry.get('Site URL') or site_entry.get('Site') or site_entry.get('site')
+    site_name = site_entry.get('site_name') or site_entry.get('Site Name') or site_entry.get('Name') or site_input
+    
+    result = {
+        'site_input': site_input,
+        'site_name': site_name,
+        'success': False,
+        'data': None,
+        'error': None,
+        'additional_info': site_entry.get('additional_info', '')
+    }
+    
+    if not site_input:
+        result['error'] = "No site URL provided"
+        return result
+    
+    try:
+        site_url = normalize_site_url(site_input)
+        logger.info(f"Processing site: {site_url}")
+        
+        direct_users, group_owners, groups_info = get_site_admins(site_url)
+        
+        # Extract direct user details
+        direct_emails = [u.get('email', u.get('login_name', '')) for u in direct_users 
+                       if u.get('email') or u.get('login_name')]
+        direct_names = [u.get('title', u.get('login_name', '')) for u in direct_users 
+                      if u.get('title') or u.get('login_name')]
+        
+        # Extract group owner details
+        owner_emails = [o.get('email', o.get('login_name', '')) for o in group_owners 
+                      if o.get('email') or o.get('login_name')]
+        owner_names = [o.get('title', o.get('login_name', '')) for o in group_owners 
+                     if o.get('title') or o.get('login_name')]
+        
+        # Get group titles and their member counts
+        group_titles = [g.get('group_title', '') for g in groups_info if g.get('group_title')]
+        group_member_counts = [str(g.get('member_count', 0)) for g in groups_info]
+        
+        total_count = len(direct_users) + len(group_owners)
+        
+        result['success'] = True
+        result['data'] = {
+            'Site URL': site_url,
+            'Site Name': site_name,
+            'Direct Admin Emails': ', '.join(direct_emails) if direct_emails else '',
+            'Direct Admin Names': ', '.join(direct_names) if direct_names else '',
+            'Direct Admin Count': len(direct_users),
+            'Group Owners Emails': ', '.join(owner_emails) if owner_emails else '',
+            'Group Owners Names': ', '.join(owner_names) if owner_names else '',
+            'Group Owners Count': len(group_owners),
+            'Total Admin Count': total_count,
+            'Group Titles': ' | '.join(group_titles) if group_titles else 'None',
+            'Group Members Count': ' | '.join(group_member_counts) if group_member_counts else '0',
+            'Error': '',
+            'Additional Info': site_entry.get('additional_info', '')
+        }
+        
+        # Update statistics
+        with stats_lock:
+            stats['processed'] += 1
+            stats['total_direct_users'] += len(direct_users)
+            stats['total_group_owners'] += len(group_owners)
+            stats['total_groups'] += len(groups_info)
+        
+        logger.info(f"✅ Completed: {site_url} - Direct: {len(direct_users)}, Group Owners: {len(group_owners)}, Groups: {len(groups_info)}")
+        
+    except Exception as e:
+        logger.error(f"Error processing {site_input}: {str(e)}")
+        result['error'] = str(e)
+        with stats_lock:
+            stats['failed'] += 1
+        
+        result['data'] = {
+            'Site URL': site_input,
+            'Site Name': site_name,
+            'Direct Admin Emails': '',
+            'Direct Admin Names': '',
+            'Direct Admin Count': 0,
+            'Group Owners Emails': '',
+            'Group Owners Names': '',
+            'Group Owners Count': 0,
+            'Total Admin Count': 0,
+            'Group Titles': '',
+            'Group Members Count': '',
+            'Error': str(e),
+            'Additional Info': site_entry.get('additional_info', '')
+        }
+    
+    return result
+
 def generate_report(site_list: List[Dict[str, str]], output_file: str = "sharepoint_admin_report.csv"):
-    """Generate CSV report for a list of SharePoint sites with group expansion"""
+    """Generate CSV report using multi-threading"""
     
-    report_data = []
+    # Update total sites
+    stats['total_sites'] = len(site_list)
     
-    for site_entry in site_list:
-        site_input = site_entry.get('site_url') or site_entry.get('Site URL') or site_entry.get('Site') or site_entry.get('site')
-        site_name = site_entry.get('site_name') or site_entry.get('Site Name') or site_entry.get('Name') or site_input
+    print(f"\n🚀 Starting processing with {CONFIG['max_workers']} threads...")
+    print(f"📋 Total sites to process: {len(site_list)}")
+    print()
+    
+    results = []
+    start_time = time.time()
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
+        # Submit all tasks
+        future_to_site = {executor.submit(process_site, site): site for site in site_list}
         
-        if not site_input:
-            logger.warning(f"Skipping entry with no site URL: {site_entry}")
-            continue
-        
-        try:
-            site_url = normalize_site_url(site_input)
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing site: {site_url}")
-            logger.info(f"{'='*60}")
+        # Process completed tasks
+        completed = 0
+        for future in as_completed(future_to_site):
+            completed += 1
+            result = future.result()
+            results.append(result)
             
-            admins = get_site_admins(site_url)
-            
-            if not admins:
-                report_data.append({
-                    'Site URL': site_url,
-                    'Site Name': site_name,
-                    'Admin Emails': '',
-                    'Admin Names': '',
-                    'Admin Count': 0,
-                    'Groups Found': '',
-                    'Group Members Expanded': 0,
-                    'Error': 'No admins found or site inaccessible',
-                    'Additional Info': site_entry.get('additional_info', '')
-                })
-            else:
-                # Separate users and groups for reporting
-                users = [a for a in admins if a.get('principal_type') != 4 and not a.get('is_group_member')]
-                group_members = [a for a in admins if a.get('is_group_member', False)]
-                groups = [a for a in admins if a.get('is_group') and not a.get('is_group_member')]
-                
-                # Extract admin emails and names
-                admin_emails = [a.get('email', a.get('login_name', '')) for a in admins 
-                              if a.get('email') or a.get('login_name')]
-                admin_names = [a.get('title', a.get('login_name', '')) for a in admins 
-                             if a.get('title') or a.get('login_name')]
-                
-                # Extract group names
-                group_names = [g.get('title', g.get('login_name', '')) for g in groups if g.get('title') or g.get('login_name')]
-                
-                report_data.append({
-                    'Site URL': site_url,
-                    'Site Name': site_name,
-                    'Admin Emails': ', '.join(admin_emails) if admin_emails else '',
-                    'Admin Names': ', '.join(admin_names) if admin_names else '',
-                    'Admin Count': len(admins),
-                    'Groups Found': ', '.join(group_names) if group_names else 'None',
-                    'Group Members Expanded': len(group_members),
-                    'Error': '',
-                    'Additional Info': site_entry.get('additional_info', '')
-                })
-                
-                logger.info(f"  ✅ Found {len(admins)} admins:")
-                logger.info(f"     - Direct users: {len(users)}")
-                logger.info(f"     - Groups: {len(groups)}")
-                logger.info(f"     - Group members expanded: {len(group_members)}")
-                
-        except Exception as e:
-            logger.error(f"Error processing {site_input}: {str(e)}")
-            report_data.append({
-                'Site URL': site_input,
-                'Site Name': site_name,
-                'Admin Emails': '',
-                'Admin Names': '',
-                'Admin Count': 0,
-                'Groups Found': '',
-                'Group Members Expanded': 0,
-                'Error': str(e),
-                'Additional Info': site_entry.get('additional_info', '')
-            })
+            # Show progress
+            status = "✅" if result['success'] else "❌"
+            print(f"[{completed}/{len(site_list)}] {status} {result.get('site_input', 'Unknown')}")
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    # Sort results by site name for consistent output
+    results.sort(key=lambda x: x.get('site_name', ''))
     
     # Write to CSV
     try:
         output_headers = [
-            'Site URL', 
-            'Site Name', 
-            'Admin Emails', 
-            'Admin Names', 
-            'Admin Count',
-            'Groups Found',
-            'Group Members Expanded',
-            'Error', 
+            'Site URL',
+            'Site Name',
+            'Direct Admin Emails',
+            'Direct Admin Names',
+            'Direct Admin Count',
+            'Group Owners Emails',
+            'Group Owners Names',
+            'Group Owners Count',
+            'Total Admin Count',
+            'Group Titles',
+            'Group Members Count',
+            'Error',
             'Additional Info'
         ]
         
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=output_headers)
             writer.writeheader()
-            for row in report_data:
-                writer.writerow(row)
+            for result in results:
+                if result.get('data'):
+                    writer.writerow(result['data'])
         
         logger.info(f"Report generated successfully: {output_file}")
-        print(f"\n✅ Report generated: {output_file}")
-        print(f"📊 Processed {len(site_list)} sites")
         
-        successful = sum(1 for row in report_data if not row['Error'])
-        print(f"✅ Successful: {successful}")
-        print(f"❌ Failed: {len(site_list) - successful}")
-        
-        # Print group expansion summary
-        total_groups = sum(1 for row in report_data if row.get('Groups Found') and row['Groups Found'] != 'None')
-        if total_groups > 0:
-            print(f"👥 Groups found: {total_groups}")
+        # Print summary
+        print(f"\n{'='*80}")
+        print("📊 PROCESSING SUMMARY")
+        print(f"{'='*80}")
+        print(f"✅ Report generated: {output_file}")
+        print(f"⏱️  Time taken: {elapsed_time:.2f} seconds")
+        print(f"\n📈 Statistics:")
+        print(f"   Total sites: {stats['total_sites']}")
+        print(f"   ✅ Successful: {stats['processed']}")
+        print(f"   ❌ Failed: {stats['failed']}")
+        print(f"   👤 Direct Users: {stats['total_direct_users']}")
+        print(f"   👥 Group Owners: {stats['total_group_owners']}")
+        print(f"   📁 Groups Found: {stats['total_groups']}")
+        print(f"   📊 Total Admins: {stats['total_direct_users'] + stats['total_group_owners']}")
+        print(f"{'='*80}")
         
     except Exception as e:
         logger.error(f"Failed to write CSV report: {str(e)}")
@@ -523,11 +591,9 @@ def read_sites_from_csv(csv_file: str) -> List[Dict[str, str]]:
                 return []
             
             print(f"\n📋 Found headers: {', '.join(reader.fieldnames)}")
-            print(f"   Expected headers: 'Site URL', 'Site Name' (or variations)")
             print()
             
             for row in reader:
-                # Try to find site URL column
                 site_url = None
                 for col in ['Site URL', 'Site', 'site_url', 'site', 'URL', 'url']:
                     if col in row and row[col]:
@@ -537,13 +603,11 @@ def read_sites_from_csv(csv_file: str) -> List[Dict[str, str]]:
                 if site_url:
                     site_entry = {'site_url': site_url}
                     
-                    # Try to find site name column
                     for col in ['Site Name', 'Name', 'site_name', 'name']:
                         if col in row and row[col]:
                             site_entry['site_name'] = row[col]
                             break
                     
-                    # Store any additional columns as additional_info
                     additional_info = []
                     for key, value in row.items():
                         if key not in ['Site URL', 'Site', 'site_url', 'site', 'URL', 'url', 
@@ -568,18 +632,18 @@ def read_sites_from_csv(csv_file: str) -> List[Dict[str, str]]:
 def main():
     """Main function to run the report generator"""
     
-    print("=" * 70)
-    print("SharePoint Site Admin Report Generator (with Group Expansion)")
-    print("=" * 70)
+    print("=" * 80)
+    print("🚀 SharePoint Site Admin Report Generator (Multi-Threaded)")
+    print("=" * 80)
     print()
     print("🔍 This tool will:")
-    print("   - Find all site administrators")
-    print("   - Detect groups using:")
-    print("     • PrincipalType = 4")
-    print("     • Title containing 'owners'")
-    print("     • LoginName pattern: xxxxx|xxxxxxx|<groupid>_o")
-    print("   - Expand groups to show all group owners")
-    print("   - Generate a comprehensive CSV report")
+    print("   - Find direct site administrators (PrincipalType=1)")
+    print("   - Find groups with admin rights (PrincipalType=4)")
+    print("   - Expand groups to get all owners")
+    print("   - Include group titles in the report")
+    print("   - Process multiple sites in parallel for speed")
+    print()
+    print(f"⚙️  Using {CONFIG['max_workers']} threads for parallel processing")
     print()
     
     print("Choose input method:")
@@ -608,7 +672,6 @@ def main():
         print(f"\n✅ Found {len(site_list)} sites in CSV file")
         
     else:
-        # Interactive input
         print("\nEnter SharePoint sites (one per line, press Enter twice to finish):")
         print("Examples:")
         print("  - Full URL: https://tenant.sharepoint.com/sites/projectx")
@@ -630,9 +693,6 @@ def main():
     if not site_list:
         print("No sites provided. Exiting.")
         return
-    
-    print(f"\n📋 Processing {len(site_list)} sites...")
-    print()
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = f"sharepoint_admin_report_{timestamp}.csv"
