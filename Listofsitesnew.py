@@ -198,23 +198,6 @@ def make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=3):
     
     raise Exception(f"Failed after {max_retries} attempts")
 
-def get_site_metadata(token_manager, site_url):
-    """Get site metadata including LastItemModifiedDate and LastItemUserModifiedDate"""
-    try:
-        endpoint = f"{site_url.rstrip('/')}/_api/web"
-        data = make_sharepoint_request_with_retry(token_manager, endpoint, max_retries=2)
-        
-        return {
-            'last_item_modified_date': data.get('LastItemModifiedDate', ''),
-            'last_item_user_modified_date': data.get('LastItemUserModifiedDate', '')
-        }
-    except Exception as e:
-        print(f"  ⚠️ Error getting metadata for {site_url}: {str(e)[:100]}")
-        return {
-            'last_item_modified_date': 'Error',
-            'last_item_user_modified_date': 'Error'
-        }
-
 def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=5000):
     """
     Get all sites from the Tenant Admin Aggregated Sites List with proper pagination
@@ -240,7 +223,7 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
         print(f"Warning: Could not get total item count: {e}")
         total_items = "Unknown"
     
-    # Start with the first page using $skiptoken=0 (no orderby)
+    # Start with the first page using $skiptoken=0
     endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
     
     while has_more_pages:
@@ -263,50 +246,87 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
             for idx, item in enumerate(current_batch, 1):
                 total_sites += 1
                 
-                # Extract basic site info
-                site_url = item.get('SiteUrl', '')
-                
                 # Show progress every 100 sites
                 if total_sites % 100 == 0 or total_sites == 1:
                     print(f"  [{total_sites}] Processing: {item.get('Title', 'Unknown')[:50]}...")
                 
-                # Get additional metadata from the site
-                site_metadata = get_site_metadata(token_manager, site_url)
-                
+                # Extract all important fields from the list item
                 site_info = {
-                    # New columns from list item
+                    # Core identifiers
                     'id': item.get('Id', ''),
-                    'time_deleted': item.get('TimeDeleted', ''),
+                    'item_id': item.get('ID', ''),  # Sometimes ID is capitalized
+                    'guid': item.get('GUID', ''),
                     
-                    # Existing fields
+                    # Site information
                     'title': item.get('Title', ''),
-                    'site_url': site_url,
+                    'site_url': item.get('SiteUrl', ''),
                     'site_id': item.get('SiteId', ''),
                     'template_name': item.get('TemplateName', ''),
+                    'site_creation_source': item.get('SiteCreationSource', ''),
+                    'site_flags': item.get('SiteFlags', 0),
+                    
+                    # Storage information
                     'storage_quota_bytes': item.get('StorageQuota', 0),
                     'storage_quota_gb': round(item.get('StorageQuota', 0) / (1024**3), 2) if item.get('StorageQuota') else 0,
                     'storage_used_bytes': item.get('StorageUsed', 0),
                     'storage_used_gb': round(item.get('StorageUsed', 0) / (1024**3), 2) if item.get('StorageUsed') else 0,
                     'storage_used_percentage': float(item.get('StorageUsedPercentage', '0')) * 100 if item.get('StorageUsedPercentage') else 0,
+                    
+                    # Dates
                     'created': item.get('Created', ''),
+                    'modified': item.get('Modified', ''),
+                    'time_created': item.get('TimeCreated', ''),
+                    'time_deleted': item.get('TimeDeleted', ''),
+                    'last_activity': item.get('LastActivityOn', ''),
+                    'operation_start_time': item.get('OperationStartTime', ''),
+                    
+                    # Users and ownership
                     'created_by': item.get('CreatedBy', ''),
                     'created_by_email': item.get('CreatedByEmail', ''),
-                    'modified': item.get('Modified', ''),
-                    'last_activity': item.get('LastActivityOn', ''),
+                    'deleted_by': item.get('DeletedBy', ''),
+                    'site_owner_name': item.get('SiteOwnerName', ''),
+                    'site_owner_email': item.get('SiteOwnerEmail', ''),
+                    
+                    # Groups and hubs
+                    'group_id': item.get('GroupId', ''),
+                    'related_group_id': item.get('RelatedGroupId', ''),
+                    'hub_site_id': item.get('HubSiteId', ''),
+                    
+                    # File and usage statistics
                     'num_of_files': item.get('NumOfFiles', 0),
                     'page_views': item.get('PageViews', 0),
                     'pages_visited': item.get('PagesVisited', 0),
+                    'file_viewed_or_edited': item.get('FileViewedOrEdited', 0),
+                    
+                    # Sharing and permissions
                     'external_sharing': item.get('ExternalSharing', ''),
                     'allow_guest_signin': item.get('AllowGuestUserSignIn', False),
-                    'group_id': item.get('GroupId', ''),
-                    'hub_site_id': item.get('HubSiteId', ''),
-                    'state': item.get('State', 0),
-                    'time_created': item.get('TimeCreated', ''),
-                    'archive_status': item.get('ArchiveStatus', ''),
+                    'anonymous_link_count': item.get('AnonymousLinkCount', 0),
+                    'company_link_count': item.get('CompanyLinkCount', 0),
+                    'sensitivity_label': item.get('SensitivityLabel', ''),
                     
-                    # Fields from site metadata
-                    'last_item_modified_date': site_metadata.get('last_item_modified_date', ''),
-                    'last_item_user_modified_date': site_metadata.get('last_item_user_modified_date', '')
+                    # State and status
+                    'state': item.get('State', 0),
+                    'archive_status': item.get('ArchiveStatus', ''),
+                    'block_download_policy': item.get('BlockDownloadPolicy', False),
+                    'conditional_access_policy': item.get('ConditionalAccessPolicy', 0),
+                    'ib_mode': item.get('IBMode', ''),
+                    
+                    # Channel information
+                    'channel_type': item.get('ChannelType', 0),
+                    'channel_sites_count': item.get('ChannelSitesCount', 0),
+                    'was_segment_applied': item.get('WasSegmentApplied', False),
+                    
+                    # Locale and timezone
+                    'locale_id': item.get('LocaleId', 0),
+                    'timezone_id': item.get('TimeZoneId', 0),
+                    
+                    # Other metadata
+                    'content_type_id': item.get('ContentTypeId', ''),
+                    'compliance_asset_id': item.get('ComplianceAssetId', ''),
+                    'is_authoritative': item.get('IsAuthoritative', False),
+                    'initiator': item.get('Initiator', ''),
+                    'color_tag': item.get('OData__ColorTag', '')
                 }
                 
                 all_sites.append(site_info)
@@ -334,7 +354,6 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                 # Try with smaller page size
                 if page_size > 1000:
                     page_size = 1000
-                    # Rebuild endpoint with smaller page size
                     endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items?$skiptoken=0&$top={page_size}"
                     print(f"  Retrying with page size: {page_size}")
                     continue
@@ -355,7 +374,6 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                 has_more_pages = False
             elif all_sites:
                 print(f"  Continuing with next page...")
-                # Try to get next link from the last successful response
                 if 'next_link' in locals() and next_link:
                     endpoint = next_link
                     continue
@@ -378,53 +396,117 @@ def save_to_csv(sites, filename):
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                # New columns
-                'ID', 'Time Deleted',
+                # IDs
+                'ID', 'Item ID', 'GUID',
                 
-                # Existing columns
-                'Title', 'Site URL', 'Site ID', 'Template Name',
+                # Site Information
+                'Title', 'Site URL', 'Site ID', 'Template Name', 'Site Creation Source',
+                
+                # Storage
                 'Storage Used (GB)', 'Storage Quota (GB)', 'Storage Used (%)',
-                'Created', 'Created By', 'Created By Email', 'Modified', 'Last Activity',
-                'Number of Files', 'Page Views', 'Pages Visited',
-                'External Sharing', 'Allow Guest SignIn', 'Group ID', 'Hub Site ID',
-                'State', 'Time Created', 'Archive Status',
-                'Last Item Modified Date', 'Last Item User Modified Date'
+                'Storage Used (Bytes)', 'Storage Quota (Bytes)',
+                
+                # Dates
+                'Created', 'Modified', 'Time Created', 'Time Deleted', 
+                'Last Activity', 'Operation Start Time',
+                
+                # Users
+                'Created By', 'Created By Email', 'Deleted By',
+                'Site Owner Name', 'Site Owner Email',
+                
+                # Groups and Hubs
+                'Group ID', 'Related Group ID', 'Hub Site ID',
+                
+                # Usage Statistics
+                'Number of Files', 'Page Views', 'Pages Visited', 'File Viewed or Edited',
+                
+                # Sharing
+                'External Sharing', 'Allow Guest SignIn', 'Anonymous Link Count',
+                'Company Link Count', 'Sensitivity Label',
+                
+                # State and Status
+                'State', 'Archive Status', 'Block Download Policy',
+                'Conditional Access Policy', 'IB Mode',
+                
+                # Channel
+                'Channel Type', 'Channel Sites Count', 'Was Segment Applied',
+                
+                # Locale and Timezone
+                'Locale ID', 'Timezone ID',
+                
+                # Other
+                'Content Type ID', 'Compliance Asset ID', 'Is Authoritative',
+                'Initiator', 'Color Tag', 'Site Flags'
             ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
             for site in sites:
                 writer.writerow({
-                    # New columns
                     'ID': site.get('id', ''),
-                    'Time Deleted': site.get('time_deleted', ''),
+                    'Item ID': site.get('item_id', ''),
+                    'GUID': site.get('guid', ''),
                     
-                    # Existing columns
-                    'Title': site['title'],
-                    'Site URL': site['site_url'],
-                    'Site ID': site['site_id'],
-                    'Template Name': site['template_name'],
-                    'Storage Used (GB)': site['storage_used_gb'],
-                    'Storage Quota (GB)': site['storage_quota_gb'],
-                    'Storage Used (%)': round(site['storage_used_percentage'], 4),
-                    'Created': site['created'],
-                    'Created By': site['created_by'],
-                    'Created By Email': site['created_by_email'],
-                    'Modified': site['modified'],
-                    'Last Activity': site['last_activity'],
-                    'Number of Files': site['num_of_files'],
-                    'Page Views': site['page_views'],
-                    'Pages Visited': site['pages_visited'],
-                    'External Sharing': site['external_sharing'],
-                    'Allow Guest SignIn': 'Yes' if site['allow_guest_signin'] else 'No',
-                    'Group ID': site['group_id'],
-                    'Hub Site ID': site['hub_site_id'],
-                    'State': site['state'],
-                    'Time Created': site['time_created'],
-                    'Archive Status': site['archive_status'],
-                    'Last Item Modified Date': site.get('last_item_modified_date', ''),
-                    'Last Item User Modified Date': site.get('last_item_user_modified_date', '')
+                    'Title': site.get('title', ''),
+                    'Site URL': site.get('site_url', ''),
+                    'Site ID': site.get('site_id', ''),
+                    'Template Name': site.get('template_name', ''),
+                    'Site Creation Source': site.get('site_creation_source', ''),
+                    
+                    'Storage Used (GB)': site.get('storage_used_gb', 0),
+                    'Storage Quota (GB)': site.get('storage_quota_gb', 0),
+                    'Storage Used (%)': round(site.get('storage_used_percentage', 0), 4),
+                    'Storage Used (Bytes)': site.get('storage_used_bytes', 0),
+                    'Storage Quota (Bytes)': site.get('storage_quota_bytes', 0),
+                    
+                    'Created': site.get('created', ''),
+                    'Modified': site.get('modified', ''),
+                    'Time Created': site.get('time_created', ''),
+                    'Time Deleted': site.get('time_deleted', ''),
+                    'Last Activity': site.get('last_activity', ''),
+                    'Operation Start Time': site.get('operation_start_time', ''),
+                    
+                    'Created By': site.get('created_by', ''),
+                    'Created By Email': site.get('created_by_email', ''),
+                    'Deleted By': site.get('deleted_by', ''),
+                    'Site Owner Name': site.get('site_owner_name', ''),
+                    'Site Owner Email': site.get('site_owner_email', ''),
+                    
+                    'Group ID': site.get('group_id', ''),
+                    'Related Group ID': site.get('related_group_id', ''),
+                    'Hub Site ID': site.get('hub_site_id', ''),
+                    
+                    'Number of Files': site.get('num_of_files', 0),
+                    'Page Views': site.get('page_views', 0),
+                    'Pages Visited': site.get('pages_visited', 0),
+                    'File Viewed or Edited': site.get('file_viewed_or_edited', 0),
+                    
+                    'External Sharing': site.get('external_sharing', ''),
+                    'Allow Guest SignIn': 'Yes' if site.get('allow_guest_signin') else 'No',
+                    'Anonymous Link Count': site.get('anonymous_link_count', 0),
+                    'Company Link Count': site.get('company_link_count', 0),
+                    'Sensitivity Label': site.get('sensitivity_label', ''),
+                    
+                    'State': site.get('state', 0),
+                    'Archive Status': site.get('archive_status', ''),
+                    'Block Download Policy': 'Yes' if site.get('block_download_policy') else 'No',
+                    'Conditional Access Policy': site.get('conditional_access_policy', 0),
+                    'IB Mode': site.get('ib_mode', ''),
+                    
+                    'Channel Type': site.get('channel_type', 0),
+                    'Channel Sites Count': site.get('channel_sites_count', 0),
+                    'Was Segment Applied': 'Yes' if site.get('was_segment_applied') else 'No',
+                    
+                    'Locale ID': site.get('locale_id', 0),
+                    'Timezone ID': site.get('timezone_id', 0),
+                    
+                    'Content Type ID': site.get('content_type_id', ''),
+                    'Compliance Asset ID': site.get('compliance_asset_id', ''),
+                    'Is Authoritative': 'Yes' if site.get('is_authoritative') else 'No',
+                    'Initiator': site.get('initiator', ''),
+                    'Color Tag': site.get('color_tag', ''),
+                    'Site Flags': site.get('site_flags', 0)
                 })
         
         print(f"\n✅ CSV report saved to: {filename}")
@@ -481,7 +563,7 @@ def main():
         print(f"  Token expires at: {datetime.fromtimestamp(token_manager.token_expiry_time).strftime('%H:%M:%S')}")
         print(f"  Auto-renewal will happen if token expires during script execution")
         
-        # Get all sites from the admin list with additional metadata
+        # Get all sites from the admin list
         all_sites = get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size)
         
         if not all_sites:
@@ -497,13 +579,14 @@ def main():
         total_quota = sum(s['storage_quota_gb'] for s in all_sites)
         total_files = sum(s['num_of_files'] for s in all_sites)
         
-        # Count sites with recent activity
-        sites_with_recent_activity = sum(1 for s in all_sites 
-                                        if s.get('last_item_user_modified_date') and 
-                                        s.get('last_item_user_modified_date') != 'Error')
-        
         # Count deleted sites
         deleted_sites = [s for s in all_sites if s.get('time_deleted')]
+        
+        # Count sites by template
+        template_counts = {}
+        for site in all_sites:
+            template = site.get('template_name', 'Unknown')
+            template_counts[template] = template_counts.get(template, 0) + 1
         
         print(f"\n{'='*50}")
         print(f"SUMMARY")
@@ -514,10 +597,14 @@ def main():
         print(f"Total Storage Used: {total_storage:.2f} GB")
         print(f"Total Storage Quota: {total_quota:.2f} GB")
         print(f"Total Files: {total_files:,}")
-        print(f"Sites with activity data: {sites_with_recent_activity}/{len(all_sites)}")
         
         if total_quota > 0:
             print(f"Overall Usage: {(total_storage / total_quota) * 100:.2f}%")
+        
+        # Show template distribution
+        print(f"\nSite Templates:")
+        for template, count in sorted(template_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  {template}: {count} sites")
         
         # Show sites created after 2026-01-15 to verify we got them
         sites_after_jan15 = [s for s in all_sites if s.get('created', '') > '2026-01-15']
@@ -525,10 +612,9 @@ def main():
             print(f"\n✅ Sites created after 2026-01-15: {len(sites_after_jan15)}")
             print(f"  Latest 5:")
             for site in sorted(sites_after_jan15, key=lambda x: x.get('created', ''), reverse=True)[:5]:
-                print(f"    • {site['title']} - Created: {site.get('created', 'Unknown')}")
+                print(f"    • {site['title']} - Created: {site.get('created', 'Unknown')} (ID: {site.get('id', '')})")
         else:
             print(f"\n⚠️ No sites found created after 2026-01-15")
-            # Show the latest created date
             created_dates = [s.get('created', '') for s in all_sites if s.get('created')]
             if created_dates:
                 latest_date = sorted(created_dates, reverse=True)[0]
@@ -539,25 +625,13 @@ def main():
         if largest_sites:
             print(f"\nTop 5 Largest Sites by Storage:")
             for i, site in enumerate(largest_sites, 1):
-                print(f"  {i}. {site['title']}: {site['storage_used_gb']:.2f} GB")
-        
-        # Show recently modified sites
-        recently_modified = [s for s in all_sites 
-                            if s.get('last_item_user_modified_date') and 
-                            s.get('last_item_user_modified_date') != 'Error']
-        recently_modified.sort(key=lambda x: x.get('last_item_user_modified_date', ''), reverse=True)
-        
-        if recently_modified:
-            print(f"\nTop 5 Recently Modified Sites:")
-            for i, site in enumerate(recently_modified[:5], 1):
-                modified_date = site.get('last_item_user_modified_date', 'Unknown')
-                print(f"  {i}. {site['title']}: {modified_date}")
+                print(f"  {i}. {site['title']}: {site['storage_used_gb']:.2f} GB (ID: {site.get('id', '')})")
         
         # Show deleted sites if any
         if deleted_sites:
             print(f"\n⚠️ Soft-Deleted Sites (with TimeDeleted value):")
             for site in deleted_sites[:5]:
-                print(f"  • {site['title']} - Deleted: {site.get('time_deleted', 'Unknown')}")
+                print(f"  • {site['title']} - Deleted: {site.get('time_deleted', 'Unknown')} (ID: {site.get('id', '')})")
             if len(deleted_sites) > 5:
                 print(f"  ... and {len(deleted_sites) - 5} more")
         
