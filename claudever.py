@@ -101,6 +101,45 @@ SCOPE_APP = "https://graph.microsoft.com/.default"
 DEFAULT_RETENTION_THRESHOLDS = [50, 100]
 
 
+# ==========================================================================
+# ===== CONFIGURATION — EDIT THIS SECTION, THEN JUST RUN THE SCRIPT ======
+# ==========================================================================
+# Fill these in directly. Anything left as None/empty falls back to a
+# --command-line-flag if you pass one (flags always win over the values
+# below), but for normal day-to-day use you shouldn't need any flags at all —
+# just edit here and run: python graph_file_versions_report.py
+
+# --- Azure AD app registration (required) ---
+TENANT_ID = ""          # e.g. "72f988bf-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+CLIENT_ID = ""          # Application (client) ID
+CLIENT_SECRET = ""      # Client secret VALUE (not the secret ID)
+
+# --- Pick exactly ONE of these four target modes ---
+# 1) Bulk SharePoint sites, inline list:
+SITE_URLS = ""          # e.g. "https://contoso.sharepoint.com/sites/Marketing,https://contoso.sharepoint.com/sites/HR"
+# 2) Bulk SharePoint sites, from a text file (one URL per line, '#' comments ok):
+SITE_URLS_FILE = ""     # e.g. "sites.txt"
+# 3) A single specific drive id:
+DRIVE_ID = ""           # e.g. "b!abc123..."
+# 4) A single user's OneDrive:
+USER_ID = ""            # e.g. "someone@contoso.com"
+
+# --- Filters (leave blank / None to disable) ---
+EXTENSIONS = ""         # e.g. ".pdf,.docx,.xlsx"  (blank = no extension filter)
+MIN_SIZE = ""           # e.g. "5MB"               (blank = no minimum)
+MAX_SIZE = ""           # e.g. "2GB"                (blank = no maximum)
+
+# --- Version retention savings scenarios ---
+RETENTION_THRESHOLDS = "50,100"   # "keep only the N most recent old versions" scenarios
+
+# --- Where reports get written ---
+OUTPUT_DIR = "./reports"
+
+# ==========================================================================
+# ===== END CONFIGURATION — nothing below this needs editing ============
+# ==========================================================================
+
+
 # --------------------------------------------------------------------------
 # Auth (app-only / client credentials, raw REST — no msal)
 # --------------------------------------------------------------------------
@@ -380,28 +419,56 @@ def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_si
 # Main
 # --------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Report file version counts & storage via MS Graph (app-only auth)")
-    parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--client-id", required=True)
-    parser.add_argument("--client-secret", required=True)
+    parser = argparse.ArgumentParser(
+        description="Report file version counts & storage via MS Graph (app-only auth). "
+                     "Edit the CONFIGURATION block at the top of this file to avoid typing flags each run — "
+                     "any flag passed here overrides the corresponding value in that block."
+    )
+    parser.add_argument("--tenant-id", default=TENANT_ID or None)
+    parser.add_argument("--client-id", default=CLIENT_ID or None)
+    parser.add_argument("--client-secret", default=CLIENT_SECRET or None)
 
-    target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("--site-urls", help="Comma-separated list of SharePoint site URLs")
-    target_group.add_argument("--site-urls-file", help="Text file, one site URL per line ('#' comments allowed)")
-    target_group.add_argument("--drive-id", help="Explicit single drive id")
-    target_group.add_argument("--user-id", help="UPN or object id; uses that user's OneDrive")
+    parser.add_argument("--site-urls", default=SITE_URLS or None, help="Comma-separated list of SharePoint site URLs")
+    parser.add_argument("--site-urls-file", default=SITE_URLS_FILE or None, help="Text file, one site URL per line ('#' comments allowed)")
+    parser.add_argument("--drive-id", default=DRIVE_ID or None, help="Explicit single drive id")
+    parser.add_argument("--user-id", default=USER_ID or None, help="UPN or object id; uses that user's OneDrive")
 
-    parser.add_argument("--extensions", help="Comma-separated file extensions to include, e.g. '.pdf,.docx'")
-    parser.add_argument("--min-size", help="Minimum current file size, e.g. '5MB'")
-    parser.add_argument("--max-size", help="Maximum current file size, e.g. '2GB'")
+    parser.add_argument("--extensions", default=EXTENSIONS or None, help="Comma-separated file extensions to include, e.g. '.pdf,.docx'")
+    parser.add_argument("--min-size", default=MIN_SIZE or None, help="Minimum current file size, e.g. '5MB'")
+    parser.add_argument("--max-size", default=MAX_SIZE or None, help="Maximum current file size, e.g. '2GB'")
     parser.add_argument(
         "--retention-thresholds",
-        default=",".join(str(n) for n in DEFAULT_RETENTION_THRESHOLDS),
+        default=RETENTION_THRESHOLDS or ",".join(str(n) for n in DEFAULT_RETENTION_THRESHOLDS),
         help="Comma-separated list of 'keep most recent N old versions' scenarios to report savings for (default: 50,100)",
     )
-    parser.add_argument("--output-dir", default="./reports")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
 
     args = parser.parse_args()
+
+    # Validate required auth fields (may have come from the config block or a flag)
+    missing_auth = [name for name, val in [("--tenant-id", args.tenant_id), ("--client-id", args.client_id),
+                                            ("--client-secret", args.client_secret)] if not val]
+    if missing_auth:
+        parser.error(
+            f"Missing required auth value(s): {', '.join(missing_auth)}. "
+            f"Set them in the CONFIGURATION block at the top of the script, or pass them as flags."
+        )
+
+    # Validate exactly one target mode is set
+    target_modes = {
+        "--site-urls": args.site_urls,
+        "--site-urls-file": args.site_urls_file,
+        "--drive-id": args.drive_id,
+        "--user-id": args.user_id,
+    }
+    chosen = [name for name, val in target_modes.items() if val]
+    if len(chosen) == 0:
+        parser.error(
+            "No target specified. Set exactly ONE of SITE_URLS / SITE_URLS_FILE / DRIVE_ID / USER_ID "
+            "in the CONFIGURATION block (or pass one of --site-urls/--site-urls-file/--drive-id/--user-id)."
+        )
+    if len(chosen) > 1:
+        parser.error(f"Multiple target modes set ({', '.join(chosen)}) — set only ONE.")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
