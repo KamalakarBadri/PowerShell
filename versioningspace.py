@@ -25,7 +25,7 @@ TENANT_ID = "0e439a1f-a497-462b-9e6b-4e582e203607"
 APP_ID = "73efa35d-6188-42d4-b258-838a977eb149"
 SCOPE = "https://geekbyteonline.sharepoint.com/.default"
 
-# List of SharePoint sites to process (only site URLs needed)
+# List of SharePoint sites to process
 SITES = [
     "https://geekbyteonline.sharepoint.com/sites/Team_",
     # Add more sites here
@@ -38,35 +38,19 @@ CONFIG = {
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
     
-    # ============================================================
-    # VERSION HISTORY FILTER
-    # ============================================================
-    "min_file_size_mb": 200,  # Only check versions for files > 200 MB
+    # Version settings
+    "min_file_size_mb": 200,  # Only check files > 200 MB
+    "keep_versions_options": [20, 50, 100],  # Retention policies
     
-    # ============================================================
-    # VERSION RETENTION SETTINGS
-    # ============================================================
-    "keep_versions_options": [20, 50, 100],  # All policies in ONE report
-    
-    # ============================================================
-    # PERFORMANCE SETTINGS
-    # ============================================================
-    "batch_size": 50,
-    "max_workers": 10,
-    "request_timeout": 60,
-    
-    # ============================================================
-    # OPTIMIZATION SETTINGS - NO $expand!
-    # ============================================================
-    "use_expand": False,  # DISABLED - NO $expand
-    "filter_at_endpoint": True,  # Filter at API level
-    "limit_versions": True,
-    "max_versions_per_file": 150,
+    # Performance
+    "batch_size": 30,
+    "max_workers": 5,
+    "request_timeout": 120,
     
     "output_dir": "reports"
 }
 
-# File extension filter
+# File extensions to process
 FILE_EXTENSIONS = ["docx", "pdf", "xlsx"]
 
 # ============================================================
@@ -340,7 +324,9 @@ def should_check_versions(file_size_mb):
     return file_size_mb > min_size
 
 def calculate_version_space_savings(versions, keep_last_n):
-    """Calculate space savings if we keep only the last N versions"""
+    """
+    Calculate space savings if we keep only the last N versions
+    """
     if not versions:
         return {
             'total_versions': 0,
@@ -349,7 +335,6 @@ def calculate_version_space_savings(versions, keep_last_n):
             'keep_size_bytes': 0,
             'delete_size_bytes': 0,
             'space_saved_gb': 0.0,
-            'space_saved_mb': 0.0,
             'delete_range': 'N/A'
         }
     
@@ -382,16 +367,15 @@ def calculate_version_space_savings(versions, keep_last_n):
         'keep_size_bytes': keep_size_bytes,
         'delete_size_bytes': delete_size_bytes,
         'space_saved_gb': bytes_to_gb(delete_size_bytes),
-        'space_saved_mb': bytes_to_mb(delete_size_bytes),
         'delete_range': delete_range
     }
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL - NO $expand!
+# SHAREPOINT DATA RETRIEVAL - NO Expand, NO CAML
 # ============================================================
 
 def get_all_libraries(site_url):
-    """Get all document libraries from SharePoint site with pagination"""
+    """Get all document libraries from SharePoint site"""
     print("\nGetting document libraries...")
     lists_url = f"{site_url}/_api/web/lists"
     all_libraries = []
@@ -419,42 +403,11 @@ def get_all_libraries(site_url):
     return all_libraries
 
 def get_all_items_from_library(site_url, library_id):
-    """Get all items WITHOUT using $expand - uses direct fields only"""
-    print(f"    Fetching items without $expand...")
+    """Get all items from a library - NO expand, just basic fields"""
+    print(f"    Fetching items from library...")
     
-    # Select only needed fields (NO expand)
-    select_fields = [
-        'Id',
-        'Title',
-        'FileLeafRef',
-        'FileRef',
-        'File_x005f_x0020_x005f_Size',  # File size - direct field
-        'Created',
-        'Modified',
-        'FileSystemObjectType'
-    ]
-    
-    # Build URL with selected fields
-    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select={','.join(select_fields)}&$top=5000"
-    
-    # Add filters if enabled
-    if CONFIG.get('filter_at_endpoint', True):
-        filters = []
-        
-        # Filter by file size
-        min_size_bytes = CONFIG.get('min_file_size_mb', 200) * 1024 * 1024
-        filters.append(f"File_x005f_x0020_x005f_Size gt {min_size_bytes}")
-        
-        # Filter by extension
-        if ALLOWED_FILE_EXTENSIONS:
-            ext_conditions = []
-            for ext in ALLOWED_FILE_EXTENSIONS:
-                ext_conditions.append(f"substringof('.{ext}',FileLeafRef)")
-            if ext_conditions:
-                filters.append(f"({' or '.join(ext_conditions)})")
-        
-        if filters:
-            items_url += f"&$filter={' and '.join(filters)}"
+    # Only select basic fields - NO expand
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,Title,FileLeafRef,FileRef,Created,Modified,FileSystemObjectType&$top=5000"
     
     all_items = []
     next_url = items_url
@@ -482,14 +435,9 @@ def get_all_items_from_library(site_url, library_id):
     return all_items
 
 def get_file_versions(site_url, list_id, item_id):
-    """Get versions for a specific item"""
+    """Get ALL versions for a specific item"""
     try:
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
-        
-        # Add top parameter if limit is enabled
-        if CONFIG.get('limit_versions', True):
-            max_versions = CONFIG.get('max_versions_per_file', 150)
-            versions_url += f"?$top={max_versions}&$orderby=Created desc"
         
         response = make_sharepoint_request(site_url, versions_url)
         
@@ -501,19 +449,16 @@ def get_file_versions(site_url, list_id, item_id):
         
         versions = []
         for version in response['d']['results']:
-            # Get size from version - direct field
+            # Get size from version
             version_size = version.get('File_x005f_x0020_x005f_Size', 0)
             
             version_data = {
                 'version_id': version.get('VersionId', 0),
                 'version_label': version.get('VersionLabel', ''),
-                'ui_version_string': version.get('OData__x005f_UIVersionString', ''),
                 'created': version.get('Created', ''),
                 'is_current': version.get('IsCurrentVersion', False),
                 'size': safe_int_conversion(version_size),
-                'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
-                'author': version.get('Author', {}).get('LookupValue', '') if version.get('Author') else '',
-                'editor': version.get('Editor', {}).get('LookupValue', '') if version.get('Editor') else ''
+                'checkin_comment': version.get('OData__x005f_CheckinComment', '')
             }
             versions.append(version_data)
         
@@ -524,28 +469,18 @@ def get_file_versions(site_url, list_id, item_id):
         return []
 
 def get_file_details_from_item(item):
-    """Extract file details from item WITHOUT using $expand"""
-    # Get file name from multiple possible fields
+    """Extract file details from item - NO expand needed"""
+    # File name from direct fields
     file_name = item.get('FileLeafRef', '')
     if not file_name:
         file_name = item.get('Title', f"Item_{item.get('Id', 0)}")
     
-    # Get file path
+    # File path
     file_path = item.get('FileRef', '')
-    
-    # Get file size - direct field from items
-    file_size = item.get('File_x005f_x0020_x005f_Size', 0)
-    
-    # If not found, try other possible fields
-    if not file_size or file_size == 0:
-        file_size = item.get('FileSizeDisplay', 0)
-    if not file_size or file_size == 0:
-        file_size = item.get('FileSize', 0)
     
     return {
         'file_name': file_name,
         'file_path': file_path,
-        'file_size': safe_int_conversion(file_size),
         'created': item.get('Created', 'N/A'),
         'modified': item.get('Modified', 'N/A')
     }
@@ -582,54 +517,62 @@ def process_file_batch(site_url, file_items, library_id, library_title, batch_id
     return results
 
 def process_single_file(site_url, list_id, item, library_title, output_file):
-    """Process a single file item - calculates savings for ALL policies at once"""
+    """Process a single file item"""
     try:
         item_id = item.get('Id')
         fsob_type = item.get('FileSystemObjectType', 0)
         
-        # Check if it's a file (FSObjType = 0 means file)
+        # Check if it's a file
         if fsob_type != 0:
             return None
         
         file_details = get_file_details_from_item(item)
-        file_size_mb = bytes_to_mb(file_details['file_size'])
         
+        # Get ALL versions first
+        versions = get_file_versions(site_url, list_id, item_id)
+        version_count = len(versions)
+        
+        # Get current file size from the latest version
+        current_file_size = 0
+        if versions:
+            # Sort by created date to get latest
+            sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
+            latest_version = sorted_versions[-1]  # Last one is newest
+            current_file_size = latest_version.get('size', 0)
+        
+        file_size_mb = bytes_to_mb(current_file_size)
+        
+        # Check if we should process this file
         check_versions = should_check_versions(file_size_mb)
         
-        versions = []
-        version_count = 0
         total_versions_size = 0
         first_version_date = 'N/A'
         last_version_date = 'N/A'
-        
         savings_data = {}
         
-        if check_versions:
-            versions = get_file_versions(site_url, list_id, item_id)
-            version_count = len(versions)
+        if check_versions and versions:
+            # Sort versions for analysis
+            sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
+            first_version = sorted_versions[0]
+            last_version = sorted_versions[-1]
             
-            if versions:
-                sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
-                first_version = sorted_versions[0]
-                last_version = sorted_versions[-1]
-                
-                first_version_date = first_version.get('created', 'N/A')
-                last_version_date = last_version.get('created', 'N/A')
-                
-                # Calculate total versions size
-                for version in versions:
-                    total_versions_size += version.get('size', 0)
-                
-                # Calculate savings for each policy
-                for keep_versions in CONFIG['keep_versions_options']:
-                    savings = calculate_version_space_savings(versions, keep_versions)
-                    savings_data[f'Keep_{keep_versions}'] = {
-                        'delete_count': savings['delete_count'],
-                        'space_saved_gb': savings['space_saved_gb'],
-                        'delete_range': savings['delete_range']
-                    }
+            first_version_date = first_version.get('created', 'N/A')
+            last_version_date = last_version.get('created', 'N/A')
+            
+            # Calculate total versions size
+            for version in versions:
+                total_versions_size += version.get('size', 0)
+            
+            # Calculate savings for each policy
+            for keep_versions in CONFIG['keep_versions_options']:
+                savings = calculate_version_space_savings(versions, keep_versions)
+                savings_data[f'Keep_{keep_versions}'] = {
+                    'delete_count': savings['delete_count'],
+                    'space_saved_gb': savings['space_saved_gb'],
+                    'delete_range': savings['delete_range']
+                }
         
-        current_file_size = file_details['file_size']
+        # If no versions, use current file size as total
         if version_count == 0:
             total_versions_size = current_file_size
         
@@ -668,7 +611,7 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
             
             print(f"\n  {size_indicator} {file_name_short} [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
             if delete_count > 0:
-                print(f" | Keep {first_policy}: Delete {delete_count} versions | Save: {space_saved:.2f}GB")
+                print(f" | Delete {delete_count} versions | Save: {space_saved:.2f}GB")
             else:
                 print()
         else:
@@ -681,7 +624,7 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         return None
 
 # ============================================================
-# CSV REPORT FUNCTIONS - ONE FILE WITH ALL POLICIES
+# CSV REPORT FUNCTIONS
 # ============================================================
 
 def initialize_report(output_file):
@@ -764,19 +707,13 @@ def close_reports():
 # ============================================================
 
 def process_site(site_url):
-    """Process a single SharePoint site - ONE report with ALL policies"""
+    """Process a single SharePoint site"""
     site_prefix = get_site_prefix(site_url)
     
     print(f"\n{'='*80}")
     print(f"📊 Processing Site: {site_url}")
     print(f"📌 Version Retention Policies: {CONFIG['keep_versions_options']}")
     print(f"{'='*80}")
-    
-    print(f"\n🔍 Optimization Settings:")
-    print(f"  - Using $expand: {CONFIG.get('use_expand', False)} (DISABLED for speed)")
-    print(f"  - Getting size from: File_x005f_x0020_x005f_Size (direct field)")
-    print(f"  - Filtering at API: {CONFIG.get('filter_at_endpoint', True)}")
-    print(f"  - Max versions per file: {CONFIG.get('max_versions_per_file', 150)}")
     
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     output_file = os.path.join(CONFIG['output_dir'], get_report_filename(site_url))
@@ -837,29 +774,25 @@ def process_site(site_url):
             print(f"  No items found in {library['title']}")
             continue
         
-        # Filter out folders (FSObjType = 1) and keep only files
+        # Filter out folders
         files = [item for item in items if item.get('FileSystemObjectType') == 0]
         
         if not files:
             print(f"  No files found in {library['title']}")
             continue
         
-        # Additional filter by extension if not already filtered at API level
-        if not CONFIG.get('filter_at_endpoint', True) or not ALLOWED_FILE_EXTENSIONS:
-            valid_files = []
-            for f in files:
-                file_name = f.get('FileLeafRef', f"Item_{f.get('Id', 0)}")
-                if should_process_file(file_name):
-                    valid_files.append(f)
-                else:
-                    skipped_by_extension += 1
-        else:
-            valid_files = files
+        # Filter by extension
+        valid_files = []
+        for f in files:
+            file_name = f.get('FileLeafRef', f"Item_{f.get('Id', 0)}")
+            if should_process_file(file_name):
+                valid_files.append(f)
+            else:
+                skipped_by_extension += 1
         
         print(f"  Found {len(files)} files in {library['title']}")
         print(f"  - Files matching extension filter: {len(valid_files)}")
-        if not CONFIG.get('filter_at_endpoint', True) or not ALLOWED_FILE_EXTENSIONS:
-            print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
+        print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
         
         total_files += len(valid_files)
         
@@ -922,7 +855,6 @@ def create_summary_report(all_site_stats):
     """Create a comprehensive summary report for all sites"""
     summary_file = os.path.join(CONFIG['output_dir'], f"Summary_All_Sites_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
     
-    # Build dynamic fieldnames for summary
     base_fieldnames = ['Site URL', 'Site Prefix', 'Total Files', 'Files Checked', 'Current Size (GB)', 'Versions Size (GB)', 'Total Versions']
     
     policy_fieldnames = []
@@ -951,7 +883,6 @@ def create_summary_report(all_site_stats):
                 'Total Versions': stats['total_versions_count']
             }
             
-            # Add policy columns
             for keep in CONFIG['keep_versions_options']:
                 row[f'Keep_{keep}_Versions_To_Delete'] = stats['total_versions_to_delete_count'].get(keep, 0)
                 row[f'Keep_{keep}_Space_To_Save_(GB)'] = f"{bytes_to_gb(stats['total_versions_to_delete_bytes'].get(keep, 0)):.2f}"
@@ -968,12 +899,10 @@ def print_global_summary(all_site_stats):
     print("🌍 GLOBAL SUMMARY - ALL SITES")
     print("="*100)
     
-    # Group stats by site
     site_groups = defaultdict(list)
     for stats in all_site_stats:
         site_groups[stats['site_url']].append(stats)
     
-    # Calculate totals
     total_files = sum(s['total_files'] for s in all_site_stats)
     total_files_checked = sum(s['files_checked'] for s in all_site_stats)
     total_current_size = sum(s['total_current_size_bytes'] for s in all_site_stats)
@@ -995,7 +924,6 @@ def print_global_summary(all_site_stats):
     print(f"\n📄 VERSION STATISTICS:")
     print(f"  Total Versions Found: {total_versions}")
     
-    # Show savings per policy
     print(f"\n💰 SPACE SAVINGS BY POLICY:")
     print("-" * 80)
     print(f"{'Policy':<15} {'Versions To Delete':<20} {'Space To Save (GB)':<20} {'Files Affected':<15}")
@@ -1010,7 +938,6 @@ def print_global_summary(all_site_stats):
     
     print("-" * 80)
     
-    # Best policy recommendation
     print(f"\n🎯 RECOMMENDATION:")
     best_policy = max(
         CONFIG['keep_versions_options'],
@@ -1028,34 +955,30 @@ def print_global_summary(all_site_stats):
 # ============================================================
 
 def main():
-    """Main function to process all sites with multiple policies in ONE report"""
+    """Main function"""
     print("="*100)
     print("📊 BULK SITE VERSION HISTORY REPORT GENERATOR")
-    print("(NO $expand - Using Direct Fields for Maximum Performance)")
+    print("(Gets file size from versions - NO expand needed)")
     print("="*100)
     
     global ALLOWED_FILE_EXTENSIONS
     ALLOWED_FILE_EXTENSIONS = normalize_extensions(FILE_EXTENSIONS)
     
-    # Create output directory
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     
     print(f"\n📌 Configuration:")
     print(f"  Total Sites: {len(SITES)}")
-    print(f"  Version Policies: {CONFIG['keep_versions_options']} (in ONE report per site)")
-    print(f"  Min File Size for Version Check: {CONFIG['min_file_size_mb']} MB")
+    print(f"  Version Policies: {CONFIG['keep_versions_options']}")
+    print(f"  Min File Size: {CONFIG['min_file_size_mb']} MB")
     print(f"  File Extensions: {FILE_EXTENSIONS if FILE_EXTENSIONS else 'All files'}")
-    print(f"  $expand: DISABLED (faster performance)")
-    print(f"  File Size Source: File_x005f_x0020_x005f_Size (direct field)")
     print(f"  Output Directory: {CONFIG['output_dir']}")
     print("="*100)
     
-    # Authenticate once
     print("\n🔐 Authenticating to SharePoint...")
     access_token = get_cached_token()
     
     if not access_token:
-        print("❌ Authentication failed. Please check your credentials.")
+        print("❌ Authentication failed.")
         return
     
     print("✅ Authentication successful\n")
@@ -1063,7 +986,6 @@ def main():
     all_site_stats = []
     start_time = time.time()
     
-    # Process each site ONCE (with ALL policies in ONE report)
     for site_url in SITES:
         print(f"\n{'#'*100}")
         print(f"📍 SITE: {site_url}")
@@ -1074,7 +996,6 @@ def main():
         if site_stats:
             all_site_stats.append(site_stats)
         
-        # Small delay between sites
         time.sleep(1)
     
     elapsed_time = time.time() - start_time
@@ -1083,18 +1004,13 @@ def main():
         print("\n❌ No sites were processed successfully.")
         return
     
-    # Create summary report
     summary_file = create_summary_report(all_site_stats)
-    
-    # Print global summary
     print_global_summary(all_site_stats)
     
     print(f"\n⏱️ Total processing time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
     print(f"\n📁 Output Files:")
     print(f"  - Summary Report: {summary_file}")
-    
-    # List all generated reports
-    print(f"\n  - Individual Site Reports (with ALL policies):")
+    print(f"\n  - Individual Site Reports:")
     for stats in all_site_stats:
         if 'report_file' in stats:
             print(f"    • {os.path.basename(stats['report_file'])}")
