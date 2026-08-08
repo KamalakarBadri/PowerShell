@@ -87,10 +87,13 @@ python graph_file_versions_report.py \\
 
 import argparse
 import csv
+import itertools
 import os
 import re
+import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
@@ -134,6 +137,19 @@ RETENTION_THRESHOLDS = "50,100"   # "keep only the N most recent old versions" s
 
 # --- Where reports get written ---
 OUTPUT_DIR = "./reports"
+
+# --- Speed / concurrency ---
+# Fetching version history is 1 API call per file, which is the slow part on
+# large drives. Two things speed this up:
+#  1) Requests are bundled into Graph's $batch endpoint, GRAPH_BATCH_SIZE
+#     files per HTTP call (20 is Graph's hard maximum per batch — don't raise it).
+#  2) CONCURRENCY batch calls run in parallel via a thread pool, instead of
+#     one at a time, to overlap network latency.
+# Effective files "in flight" at once = CONCURRENCY * GRAPH_BATCH_SIZE.
+# Raise CONCURRENCY for more speed; lower it if you see a lot of throttling
+# (HTTP 429) messages in the output.
+CONCURRENCY = 5            # number of parallel $batch HTTP calls
+GRAPH_BATCH_SIZE = 20       # Graph's hard limit per $batch request — do not increase
 
 # ==========================================================================
 # ===== END CONFIGURATION — nothing below this needs editing ============
@@ -192,6 +208,24 @@ class GraphClient:
                 yield item
             next_url = data.get("@odata.nextLink")
             next_params = None  # nextLink already has query params baked in
+
+    def batch_post(self, requests_payload):
+        """POST to Graph's $batch endpoint. requests_payload is the list that
+        goes under the "requests" key (max 20 entries per Graph's limit)."""
+        url = f"{GRAPH_ROOT}/$batch"
+        while True:
+            resp = self.session.post(url, json={"requests": requests_payload})
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "5"))
+                print(f"  Throttled (batch), waiting {retry_after}s...", file=sys.stderr)
+                time.sleep(retry_after)
+                continue
+            if resp.status_code >= 500:
+                print(f"  Server error {resp.status_code} (batch), retrying in 5s...", file=sys.stderr)
+                time.sleep(5)
+                continue
+            resp.raise_for_status()
+            return resp.json()
 
 
 # --------------------------------------------------------------------------
@@ -256,40 +290,35 @@ def resolve_drive_id_for_user(client, user_id):
 # --------------------------------------------------------------------------
 # Core walk + version lookup
 # --------------------------------------------------------------------------
-def walk_drive_items(client, drive_id, item_id="root", path="", extensions=None, min_size=None, max_size=None):
-    """Recursively yield (item_dict, full_path) for every FILE in the drive
-    that passes the extension/size filters. Folders are always traversed
-    regardless of filters (filters only apply to files)."""
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/children"
-    params = {"$select": "id,name,file,folder,size,webUrl"}
-    for item in client.get_paged(url, params=params):
-        item_path = f"{path}/{item['name']}"
-        if "folder" in item:
-            yield from walk_drive_items(
-                client, drive_id, item["id"], item_path, extensions, min_size, max_size
-            )
-        elif "file" in item:
-            if extensions:
-                ext = os.path.splitext(item["name"])[1].lower()
-                if ext not in extensions:
+def walk_drive_items(client, drive_id, extensions=None, min_size=None, max_size=None):
+    """Iteratively (NOT recursively) walk every FILE in the drive that passes
+    the extension/size filters. Uses an explicit stack instead of function
+    recursion so it can't hit Python's recursion limit on deep folder trees,
+    and never holds more than one folder's listing in memory at a time."""
+    params = {"$select": "id,name,file,folder,size,webUrl,lastModifiedDateTime"}
+    stack = [("root", "")]
+    while stack:
+        item_id, path = stack.pop()
+        url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/children"
+        for item in client.get_paged(url, params=params):
+            item_path = f"{path}/{item['name']}"
+            if "folder" in item:
+                stack.append((item["id"], item_path))
+            elif "file" in item:
+                if extensions:
+                    ext = os.path.splitext(item["name"])[1].lower()
+                    if ext not in extensions:
+                        continue
+                size = item.get("size", 0)
+                if min_size is not None and size < min_size:
                     continue
-            size = item.get("size", 0)
-            if min_size is not None and size < min_size:
-                continue
-            if max_size is not None and size > max_size:
-                continue
-            yield item, item_path
+                if max_size is not None and size > max_size:
+                    continue
+                yield item, item_path
 
 
-def get_versions_sorted(client, drive_id, item_id):
-    """Return older versions (excludes current) sorted newest-first, with size."""
-    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/versions"
-    try:
-        versions = list(client.get_paged(url))
-    except requests.HTTPError as e:
-        print(f"  Warning: could not fetch versions for item {item_id}: {e}", file=sys.stderr)
-        return []
-
+def sort_versions(versions):
+    """Sort a list of Graph version objects newest-first by lastModifiedDateTime."""
     def sort_key(v):
         ts = v.get("lastModifiedDateTime")
         if ts:
@@ -300,6 +329,93 @@ def get_versions_sorted(client, drive_id, item_id):
         return datetime.min
 
     return sorted(versions, key=sort_key, reverse=True)
+
+
+def get_versions_sorted(client, drive_id, item_id):
+    """Fetch older versions (excludes current) for ONE item via a plain GET,
+    sorted newest-first. Used as: (a) a fallback when a batched sub-request
+    fails, and (b) to page past 200 versions on the rare file that has more
+    than a single page of history (batch responses only return one page)."""
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/versions"
+    try:
+        versions = list(client.get_paged(url))
+    except requests.HTTPError as e:
+        print(f"  Warning: could not fetch versions for item {item_id}: {e}", file=sys.stderr)
+        return []
+    return sort_versions(versions)
+
+
+def chunked(iterable, size):
+    """Yield lists of up to `size` items from iterable, pulling lazily so the
+    whole iterable is never materialized at once — keeps memory bounded even
+    when walking a drive with a huge number of files."""
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def fetch_versions_for_chunk(client, drive_id, chunk):
+    """chunk: list of (item, path) tuples, length <= GRAPH_BATCH_SIZE.
+    Fetches version history for all of them in a SINGLE Graph $batch HTTP
+    call instead of one call per file. Returns list of
+    (item, path, versions_sorted) in the same order as the input chunk."""
+    requests_payload = [
+        {"id": str(i), "method": "GET", "url": f"/drives/{drive_id}/items/{item['id']}/versions"}
+        for i, (item, _path) in enumerate(chunk)
+    ]
+
+    try:
+        batch_result = client.batch_post(requests_payload)
+    except requests.HTTPError as e:
+        # Whole batch failed outright (rare) — fall back to per-item calls
+        print(f"  Warning: batch request failed ({e}); falling back to individual calls for this chunk", file=sys.stderr)
+        return [(item, path, get_versions_sorted(client, drive_id, item["id"])) for item, path in chunk]
+
+    responses_by_id = {r["id"]: r for r in batch_result.get("responses", [])}
+
+    results = []
+    for i, (item, path) in enumerate(chunk):
+        r = responses_by_id.get(str(i))
+
+        if r is None:
+            print(f"  Warning: no batch response for {path}; retrying individually", file=sys.stderr)
+            results.append((item, path, get_versions_sorted(client, drive_id, item["id"])))
+            continue
+
+        status = r.get("status", 500)
+
+        if status == 429:
+            # Per-request throttling inside a batch — respect Retry-After if
+            # present, then retry just this one file on its own.
+            retry_after = int((r.get("headers") or {}).get("Retry-After", "5"))
+            time.sleep(retry_after)
+            results.append((item, path, get_versions_sorted(client, drive_id, item["id"])))
+            continue
+
+        if status >= 400:
+            print(f"  Warning: versions fetch failed for {path} (status {status}); retrying individually", file=sys.stderr)
+            results.append((item, path, get_versions_sorted(client, drive_id, item["id"])))
+            continue
+
+        body = r.get("body", {}) or {}
+        versions = body.get("value", [])
+
+        # Rare: a single file has more versions than fit in one page (~200).
+        # Batch responses don't auto-follow nextLink, so page the remainder
+        # with a normal (non-batched) call just for this one file.
+        next_link = body.get("@odata.nextLink")
+        if next_link:
+            try:
+                versions += list(client.get_paged(next_link))
+            except requests.HTTPError as e:
+                print(f"  Warning: could not page extra versions for {path}: {e}", file=sys.stderr)
+
+        results.append((item, path, sort_versions(versions)))
+
+    return results
 
 
 def compute_retention_savings(versions_sorted, thresholds):
@@ -317,12 +433,38 @@ def compute_retention_savings(versions_sorted, thresholds):
 # --------------------------------------------------------------------------
 # Per-drive report
 # --------------------------------------------------------------------------
-def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_size, max_size, thresholds):
-    """Walk one drive, write its own CSV, return a summary dict."""
-    filename = os.path.join(output_dir, f"{slugify(label)}.csv")
+def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_size, max_size, thresholds, concurrency):
+    """Walk one drive, write its own CSV, return a summary dict.
+
+    Speed for large drives: fetching version history is the slow part (it's
+    normally 1 API call per file). Files are processed in chunks of
+    GRAPH_BATCH_SIZE and each chunk's version history is fetched with a
+    SINGLE Graph $batch call instead of one call per file — up to a 20x cut
+    in HTTP round-trips. On top of that, `concurrency` chunks are fetched in
+    parallel via a thread pool to overlap network latency. Effective files
+    "in flight" at once = concurrency * GRAPH_BATCH_SIZE.
+
+    Memory safety for very large drives (tens/hundreds of thousands of items):
+    rows are NOT accumulated in a Python list. Each row is (a) written
+    immediately to the live CSV (so you always have an up-to-date, valid file
+    on disk even if the run is interrupted) and (b) inserted into a temporary
+    on-disk SQLite database. Only the SQLite file — not Python memory — grows
+    with item count. After the walk finishes, the final "sorted by version
+    overhead" CSV is produced by streaming an ORDER BY query out of SQLite
+    row-by-row, so peak memory stays roughly constant regardless of how many
+    files are in the drive.
+    """
+    slug = slugify(label)
+    filename = os.path.join(output_dir, f"{slug}.csv")
+    db_path = os.path.join(output_dir, f".{slug}_tmp.sqlite")
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
     print(f"\n=== {label} ===")
     print(f"Drive id: {drive_id}")
     print(f"Writing incrementally to: {filename}")
+    print(f"Fetching versions in batches of {GRAPH_BATCH_SIZE}, {concurrency} batch(es) in parallel "
+          f"(~{GRAPH_BATCH_SIZE * concurrency} files in flight at a time)")
 
     fieldnames = [
         "Path",
@@ -330,7 +472,10 @@ def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_si
         "Extension",
         "CurrentSize",
         "CurrentSizeHuman",
+        "CurrentModified",
         "VersionCount",
+        "FirstVersionDate",
+        "LastVersionDate",
         "VersionsSize",
         "VersionsSizeHuman",
         "TotalSize",
@@ -341,7 +486,17 @@ def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_si
         fieldnames.append(f"SavingsIfKeep{n}Human")
     fieldnames.append("WebUrl")
 
-    rows = []
+    # Text columns vs integer columns, for the SQLite schema
+    int_cols = {"CurrentSize", "VersionCount", "VersionsSize", "TotalSize"}
+    int_cols |= {f"SavingsIfKeep{n}" for n in thresholds}
+
+    db = sqlite3.connect(db_path)
+    db.execute("PRAGMA journal_mode=OFF")   # we don't need crash-safety on the temp db itself
+    db.execute("PRAGMA synchronous=OFF")
+    col_defs = ", ".join(f'"{c}" {"INTEGER" if c in int_cols else "TEXT"}' for c in fieldnames)
+    db.execute(f"CREATE TABLE rows ({col_defs})")
+    insert_sql = f'INSERT INTO rows ({", ".join(f"[{c}]" for c in fieldnames)}) VALUES ({", ".join("?" for _ in fieldnames)})'
+
     totals = {
         "file_count": 0,
         "current_size": 0,
@@ -349,56 +504,98 @@ def run_report_for_drive(client, drive_id, label, output_dir, extensions, min_si
         "savings": {n: 0 for n in thresholds},
     }
 
-    with open(filename, "w", newline="", encoding="utf-8") as f:
+    SQLITE_BATCH_SIZE = 200
+    sqlite_batch = []
+
+    file_iter = walk_drive_items(client, drive_id, extensions=extensions, min_size=min_size, max_size=max_size)
+    graph_chunks = chunked(file_iter, GRAPH_BATCH_SIZE)  # each is <= 20 (item, path) tuples
+
+    with open(filename, "w", newline="", encoding="utf-8") as f, \
+         ThreadPoolExecutor(max_workers=concurrency) as executor:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         f.flush()
 
-        for item, path in walk_drive_items(
-            client, drive_id, extensions=extensions, min_size=min_size, max_size=max_size
-        ):
-            totals["file_count"] += 1
-            current_size = item.get("size", 0)
-            versions_sorted = get_versions_sorted(client, drive_id, item["id"])
-            version_count = len(versions_sorted)
-            versions_size = sum(v.get("size", 0) for v in versions_sorted)
-            savings = compute_retention_savings(versions_sorted, thresholds)
+        # Process `concurrency` chunks (i.e. concurrency * GRAPH_BATCH_SIZE
+        # files) at a time: submit them all in parallel, wait for the group,
+        # write results, move on. This bounds memory to one group's worth of
+        # data while still overlapping network latency across the group.
+        for group in chunked(graph_chunks, concurrency):
+            futures = [executor.submit(fetch_versions_for_chunk, client, drive_id, chunk) for chunk in group]
 
-            row = {
-                "Path": path,
-                "Name": item["name"],
-                "Extension": os.path.splitext(item["name"])[1].lower(),
-                "CurrentSize": current_size,
-                "CurrentSizeHuman": human_size(current_size),
-                "VersionCount": version_count,
-                "VersionsSize": versions_size,
-                "VersionsSizeHuman": human_size(versions_size),
-                "TotalSize": current_size + versions_size,
-                "TotalSizeHuman": human_size(current_size + versions_size),
-                "WebUrl": item.get("webUrl", ""),
-            }
-            for n in thresholds:
-                row[f"SavingsIfKeep{n}"] = savings[n]
-                row[f"SavingsIfKeep{n}Human"] = human_size(savings[n])
+            for future in futures:
+                chunk_results = future.result()  # list of (item, path, versions_sorted)
 
-            writer.writerow(row)
+                for item, path, versions_sorted in chunk_results:
+                    totals["file_count"] += 1
+                    current_size = item.get("size", 0)
+                    version_count = len(versions_sorted)
+                    versions_size = sum(v.get("size", 0) for v in versions_sorted)
+                    savings = compute_retention_savings(versions_sorted, thresholds)
+
+                    # versions_sorted is newest-first: index 0 = most recent
+                    # old version, index -1 = oldest old version on record
+                    first_version_date = versions_sorted[-1].get("lastModifiedDateTime", "") if versions_sorted else ""
+                    last_version_date = versions_sorted[0].get("lastModifiedDateTime", "") if versions_sorted else ""
+
+                    row = {
+                        "Path": path,
+                        "Name": item["name"],
+                        "Extension": os.path.splitext(item["name"])[1].lower(),
+                        "CurrentSize": current_size,
+                        "CurrentSizeHuman": human_size(current_size),
+                        "CurrentModified": item.get("lastModifiedDateTime", ""),
+                        "VersionCount": version_count,
+                        "FirstVersionDate": first_version_date,
+                        "LastVersionDate": last_version_date,
+                        "VersionsSize": versions_size,
+                        "VersionsSizeHuman": human_size(versions_size),
+                        "TotalSize": current_size + versions_size,
+                        "TotalSizeHuman": human_size(current_size + versions_size),
+                        "WebUrl": item.get("webUrl", ""),
+                    }
+                    for n in thresholds:
+                        row[f"SavingsIfKeep{n}"] = savings[n]
+                        row[f"SavingsIfKeep{n}Human"] = human_size(savings[n])
+
+                    writer.writerow(row)
+
+                    sqlite_batch.append(tuple(row[c] for c in fieldnames))
+                    if len(sqlite_batch) >= SQLITE_BATCH_SIZE:
+                        db.executemany(insert_sql, sqlite_batch)
+                        db.commit()
+                        sqlite_batch.clear()
+
+                    totals["current_size"] += current_size
+                    totals["versions_size"] += versions_size
+                    for n in thresholds:
+                        totals["savings"][n] += savings[n]
+
             f.flush()
-            rows.append(row)
+            if totals["file_count"] and totals["file_count"] % 100 < GRAPH_BATCH_SIZE * concurrency:
+                print(f"  ...{totals['file_count']} files processed so far")
 
-            totals["current_size"] += current_size
-            totals["versions_size"] += versions_size
-            for n in thresholds:
-                totals["savings"][n] += savings[n]
+        if sqlite_batch:
+            db.executemany(insert_sql, sqlite_batch)
+            db.commit()
 
-            if totals["file_count"] % 25 == 0:
-                print(f"  ...{totals['file_count']} files processed so far (last: {path})")
-
-    # Final pass: rewrite sorted by version storage overhead, largest first
-    rows.sort(key=lambda r: r["VersionsSize"], reverse=True)
+    # Final pass: stream rows back out of SQLite sorted by version storage
+    # overhead (largest first). This never loads the full dataset into
+    # Python memory at once — the cursor yields one row at a time.
+    print("Sorting final report (streaming from disk, not memory)...")
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        cursor = db.execute(f'SELECT {", ".join(f"[{c}]" for c in fieldnames)} FROM rows ORDER BY "VersionsSize" DESC')
+        while True:
+            chunk = cursor.fetchmany(1000)
+            if not chunk:
+                break
+            for record in chunk:
+                writer.writerow(dict(zip(fieldnames, record)))
+
+    db.close()
+    os.remove(db_path)  # clean up the temp file
 
     print(f"Done: {totals['file_count']} files. "
           f"Current: {human_size(totals['current_size'])}, "
@@ -442,6 +639,9 @@ def main():
         help="Comma-separated list of 'keep most recent N old versions' scenarios to report savings for (default: 50,100)",
     )
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
+                         help=f"Parallel $batch HTTP calls for fetching version history (default: {CONCURRENCY}). "
+                              f"Lower this if you see throttling (429) messages.")
 
     args = parser.parse_args()
 
@@ -529,12 +729,13 @@ def main():
     if max_size is not None:
         print(f"Max size filter: {human_size(max_size)}")
     print(f"Retention savings thresholds: {thresholds}")
+    print(f"Concurrency: {args.concurrency} parallel batch call(s) of {GRAPH_BATCH_SIZE} files each")
 
     summaries = []
     for label, drive_id in targets:
         try:
             summary = run_report_for_drive(
-                client, drive_id, label, args.output_dir, extensions, min_size, max_size, thresholds
+                client, drive_id, label, args.output_dir, extensions, min_size, max_size, thresholds, args.concurrency
             )
             summaries.append(summary)
         except Exception as e:
