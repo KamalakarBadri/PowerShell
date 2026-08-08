@@ -46,9 +46,9 @@ CONFIG = {
     "min_file_size_mb": 200,  # Only check version history for files > 200 MB
     
     # ============================================================
-    # VERSION RETENTION SETTINGS - Multiple policies
+    # VERSION RETENTION SETTINGS - Multiple policies in ONE report
     # ============================================================
-    "keep_versions_options": [20, 50, 100],  # Different version retention policies
+    "keep_versions_options": [20, 50, 100],  # All policies in one CSV
     
     # ============================================================
     # PERFORMANCE SETTINGS
@@ -270,13 +270,11 @@ def get_site_prefix(site_url):
         return parts[-1]
     return 'Site'
 
-def get_report_filename(site_url, keep_versions=None):
-    """Create output filename using the site prefix and version policy"""
+def get_report_filename(site_url):
+    """Create output filename using the site prefix"""
     site_prefix = get_site_prefix(site_url)
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    if keep_versions:
-        return f"{site_prefix}_Keep{keep_versions}versions_Report_{timestamp}.csv"
-    return f"{site_prefix}_File_Version_Report_{timestamp}.csv"
+    return f"{site_prefix}_Version_Report_{timestamp}.csv"
 
 def normalize_extensions(extensions):
     """Normalize configured file extensions for comparison"""
@@ -525,7 +523,7 @@ def get_file_details_from_item(item):
 # BATCH PROCESSING FUNCTIONS
 # ============================================================
 
-def process_file_batch(site_url, file_items, library_id, library_title, batch_id, total_batches, keep_versions, output_file):
+def process_file_batch(site_url, file_items, library_id, library_title, batch_id, total_batches, output_file):
     """
     Process a batch of files in parallel
     """
@@ -539,7 +537,6 @@ def process_file_batch(site_url, file_items, library_id, library_title, batch_id
                 library_id, 
                 file_item, 
                 library_title,
-                keep_versions,
                 output_file
             ): file_item
             for file_item in file_items
@@ -555,9 +552,9 @@ def process_file_batch(site_url, file_items, library_id, library_title, batch_id
     
     return results
 
-def process_single_file(site_url, list_id, item, library_title, keep_versions, output_file):
+def process_single_file(site_url, list_id, item, library_title, output_file):
     """
-    Process a single file item - thread-safe version
+    Process a single file item - calculates savings for ALL policies at once
     """
     try:
         item_id = item.get('Id')
@@ -576,9 +573,9 @@ def process_single_file(site_url, list_id, item, library_title, keep_versions, o
         total_versions_size = 0
         first_version_date = 'N/A'
         last_version_date = 'N/A'
-        versions_to_delete = 0
-        space_saved_gb = 0.0
-        delete_range = 'N/A'
+        
+        # Initialize savings for all policies
+        savings_data = {}
         
         if check_versions:
             versions = get_file_versions(site_url, list_id, item_id)
@@ -595,16 +592,20 @@ def process_single_file(site_url, list_id, item, library_title, keep_versions, o
                 for version in versions:
                     total_versions_size += version.get('size', 0)
                 
-                savings = calculate_version_space_savings(versions, keep_versions)
-                
-                versions_to_delete = savings['delete_count']
-                space_saved_gb = savings['space_saved_gb']
-                delete_range = savings['delete_range']
+                # Calculate savings for EACH policy
+                for keep_versions in CONFIG['keep_versions_options']:
+                    savings = calculate_version_space_savings(versions, keep_versions)
+                    savings_data[f'Keep_{keep_versions}'] = {
+                        'delete_count': savings['delete_count'],
+                        'space_saved_gb': savings['space_saved_gb'],
+                        'delete_range': savings['delete_range']
+                    }
         
         current_file_size = file_details['file_size']
         if version_count == 0:
             total_versions_size = current_file_size
         
+        # Prepare file data with ALL policies
         file_data = {
             'library': library_title,
             'list_id': list_id,
@@ -618,20 +619,35 @@ def process_single_file(site_url, list_id, item, library_title, keep_versions, o
             'last_version_date': last_version_date,
             'total_versions_size': total_versions_size,
             'total_versions_size_mb': bytes_to_mb(total_versions_size),
-            'versions': versions,
             'versions_checked': check_versions,
             'created_formatted': format_datetime(file_details['created']),
             'modified_formatted': format_datetime(file_details['modified']),
             'first_version_formatted': format_datetime(first_version_date),
             'last_version_formatted': format_datetime(last_version_date),
-            'versions_to_delete': versions_to_delete,
-            'space_saved_gb': space_saved_gb,
-            'delete_range': delete_range,
-            'keep_versions': keep_versions
+            'savings_data': savings_data
         }
         
-        # Append to CSV
+        # Append to CSV with ALL policies
         append_to_report(output_file, file_data)
+        
+        # Print progress (only show first policy for brevity)
+        file_name_short = file_details['file_name'][:30] + "..." if len(file_details['file_name']) > 30 else file_details['file_name']
+        size_indicator = "🟢" if file_size_mb > CONFIG['min_file_size_mb'] else "⚪"
+        
+        if check_versions and version_count > 0:
+            # Show savings for first policy
+            first_policy = CONFIG['keep_versions_options'][0]
+            savings_first = savings_data.get(f'Keep_{first_policy}', {})
+            delete_count = savings_first.get('delete_count', 0)
+            space_saved = savings_first.get('space_saved_gb', 0)
+            
+            print(f"\n  {size_indicator} {file_name_short} [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
+            if delete_count > 0:
+                print(f" | Keep {first_policy}: Delete {delete_count} versions | Save: {space_saved:.2f}GB")
+            else:
+                print()
+        else:
+            print(f"\n  ⚪ {file_name_short} [{file_size_mb:.1f}MB] - Skip (≤{CONFIG['min_file_size_mb']}MB)")
         
         return file_data
         
@@ -639,23 +655,37 @@ def process_single_file(site_url, list_id, item, library_title, keep_versions, o
         return None
 
 # ============================================================
-# CSV REPORT FUNCTIONS
+# CSV REPORT FUNCTIONS - SINGLE FILE WITH ALL POLICIES
 # ============================================================
 
-def initialize_report(output_file, keep_versions):
-    """Initialize CSV file with headers"""
+def initialize_report(output_file):
+    """Initialize CSV file with headers for ALL policies"""
     global csv_writers, csv_files
     
-    fieldnames = [
-        'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 'Current File Size (MB)',
-        'Version Count', 'First Version Date', 'Last Version Date', 
-        'Total Versions Size (MB)', 'File Created', 'File Modified', 
-        'Versions Checked', 'Versions to Delete', 'Space Saved (GB)',
-        'Deleted Version Range', f'Keep Last {keep_versions} Versions', 'Processed At'
+    # Build dynamic fieldnames based on policies
+    base_fieldnames = [
+        'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 
+        'Current File Size (MB)', 'Version Count', 'First Version Date', 
+        'Last Version Date', 'Total Versions Size (MB)', 
+        'File Created', 'File Modified', 'Versions Checked'
     ]
     
+    # Add columns for each policy
+    policy_fieldnames = []
+    for keep in CONFIG['keep_versions_options']:
+        policy_fieldnames.extend([
+            f'Keep_{keep}_Versions_To_Delete',
+            f'Keep_{keep}_Space_Saved_(GB)',
+            f'Keep_{keep}_Deleted_Range'
+        ])
+    
+    # Add final columns
+    final_fieldnames = ['Processed At']
+    
+    all_fieldnames = base_fieldnames + policy_fieldnames + final_fieldnames
+    
     csv_files[output_file] = open(output_file, 'w', newline='', encoding='utf-8-sig')
-    csv_writers[output_file] = csv.DictWriter(csv_files[output_file], fieldnames=fieldnames)
+    csv_writers[output_file] = csv.DictWriter(csv_files[output_file], fieldnames=all_fieldnames)
     csv_writers[output_file].writeheader()
     csv_files[output_file].flush()
 
@@ -665,6 +695,7 @@ def append_to_report(output_file, data):
     
     with csv_lock:
         try:
+            # Start with base fields
             row = {
                 'Library': data.get('library', ''),
                 'List ID': data.get('list_id', ''),
@@ -678,13 +709,21 @@ def append_to_report(output_file, data):
                 'Total Versions Size (MB)': f"{data.get('total_versions_size_mb', 0.00):.2f}",
                 'File Created': data.get('created_formatted', 'N/A'),
                 'File Modified': data.get('modified_formatted', 'N/A'),
-                'Versions Checked': 'Yes' if data.get('versions_checked', False) else 'No',
-                'Versions to Delete': data.get('versions_to_delete', 0),
-                'Space Saved (GB)': f"{data.get('space_saved_gb', 0.00):.2f}",
-                'Deleted Version Range': data.get('delete_range', 'N/A'),
-                f'Keep Last {data.get("keep_versions", 50)} Versions': 'Applied',
-                'Processed At': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'Versions Checked': 'Yes' if data.get('versions_checked', False) else 'No'
             }
+            
+            # Add policy columns
+            savings_data = data.get('savings_data', {})
+            for keep in CONFIG['keep_versions_options']:
+                policy_key = f'Keep_{keep}'
+                policy_data = savings_data.get(policy_key, {})
+                row[f'{policy_key}_Versions_To_Delete'] = policy_data.get('delete_count', 0)
+                row[f'{policy_key}_Space_Saved_(GB)'] = f"{policy_data.get('space_saved_gb', 0.00):.2f}"
+                row[f'{policy_key}_Deleted_Range'] = policy_data.get('delete_range', 'N/A')
+            
+            # Add final fields
+            row['Processed At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
             csv_writers[output_file].writerow(row)
             csv_files[output_file].flush()
             return True
@@ -705,23 +744,23 @@ def close_reports():
 # SITE PROCESSING FUNCTIONS
 # ============================================================
 
-def process_site(site_url, keep_versions):
-    """Process a single SharePoint site with a specific version retention policy"""
+def process_site(site_url):
+    """Process a single SharePoint site - ONE report with ALL policies"""
     site_prefix = get_site_prefix(site_url)
     
     print(f"\n{'='*80}")
     print(f"📊 Processing Site: {site_url}")
-    print(f"📌 Version Retention Policy: Keep Last {keep_versions} Versions")
+    print(f"📌 Version Retention Policies: {CONFIG['keep_versions_options']}")
     print(f"{'='*80}")
     
     # Create output directory
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     
-    # Generate output filename
-    output_file = os.path.join(CONFIG['output_dir'], get_report_filename(site_url, keep_versions))
+    # Generate output filename (ONE file per site)
+    output_file = os.path.join(CONFIG['output_dir'], get_report_filename(site_url))
     
-    # Initialize report
-    initialize_report(output_file, keep_versions)
+    # Initialize report with ALL policies
+    initialize_report(output_file)
     
     # Get all libraries
     libraries = get_all_libraries(site_url)
@@ -739,7 +778,7 @@ def process_site(site_url, keep_versions):
     print(f"  - Batch size: {CONFIG['batch_size']} files per batch")
     print(f"  - Max workers: {CONFIG['max_workers']} concurrent threads")
     print(f"  - Version check only for files > {CONFIG['min_file_size_mb']} MB")
-    print(f"  - Keeping last {keep_versions} versions per file\n")
+    print(f"  - Policies: {CONFIG['keep_versions_options']} in ONE report\n")
     
     all_file_data = []
     total_files = 0
@@ -749,18 +788,23 @@ def process_site(site_url, keep_versions):
     site_stats = {
         'site_url': site_url,
         'site_prefix': site_prefix,
-        'keep_versions': keep_versions,
+        'keep_versions': CONFIG['keep_versions_options'],
         'total_files': 0,
         'files_checked': 0,
         'total_current_size_bytes': 0,
         'total_versions_size_bytes': 0,
-        'total_versions_to_delete_bytes': 0,
-        'total_versions_to_keep_bytes': 0,
         'total_versions_count': 0,
-        'total_versions_to_delete_count': 0,
-        'files_with_more_versions': 0,
+        'total_versions_to_delete_count': {},  # Per policy
+        'total_versions_to_delete_bytes': {},  # Per policy
+        'files_with_more_versions': {},
         'report_file': output_file
     }
+    
+    # Initialize policy stats
+    for keep in CONFIG['keep_versions_options']:
+        site_stats['total_versions_to_delete_count'][keep] = 0
+        site_stats['total_versions_to_delete_bytes'][keep] = 0
+        site_stats['files_with_more_versions'][keep] = 0
     
     for library in libraries:
         print(f"\n{'='*60}")
@@ -809,7 +853,6 @@ def process_site(site_url, keep_versions):
                 library['title'],
                 batch_count,
                 total_batches,
-                keep_versions,
                 output_file
             )
             
@@ -820,17 +863,17 @@ def process_site(site_url, keep_versions):
                     site_stats['total_current_size_bytes'] += result['current_file_size']
                     site_stats['total_versions_size_bytes'] += result['total_versions_size']
                     site_stats['total_versions_count'] += result['version_count']
-                    site_stats['total_versions_to_delete_count'] += result['versions_to_delete']
                     
                     if result['versions_checked']:
                         site_stats['files_checked'] += 1
                     
-                    # Calculate delete bytes from space_saved_gb
-                    delete_bytes = result['space_saved_gb'] * 1024 * 1024 * 1024
-                    site_stats['total_versions_to_delete_bytes'] += int(delete_bytes)
-                    
-                    if result['versions_to_delete'] > 0:
-                        site_stats['files_with_more_versions'] += 1
+                    # Update per-policy stats
+                    for keep, savings in result.get('savings_data', {}).items():
+                        keep_num = int(keep.split('_')[1])
+                        site_stats['total_versions_to_delete_count'][keep_num] += savings.get('delete_count', 0)
+                        site_stats['total_versions_to_delete_bytes'][keep_num] += int(savings.get('space_saved_gb', 0) * 1024 * 1024 * 1024)
+                        if savings.get('delete_count', 0) > 0:
+                            site_stats['files_with_more_versions'][keep_num] += 1
             
             all_file_data.extend(batch_results)
             print(f"  ✅ Batch {batch_count} completed ({len(batch_results)} files processed)")
@@ -853,33 +896,42 @@ def create_summary_report(all_site_stats):
     """Create a comprehensive summary report for all sites"""
     summary_file = os.path.join(CONFIG['output_dir'], f"Summary_All_Sites_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
     
-    fieldnames = [
-        'Site URL', 'Site Prefix', 'Keep Versions', 'Total Files', 'Files Checked',
-        'Current Size (GB)', 'Versions Size (GB)', 'Total Versions',
-        'Versions to Delete', 'Versions to Keep', 'Space to Save (GB)',
-        'Files with > Keep_Versions', 'Report File'
-    ]
+    # Build dynamic fieldnames for summary
+    base_fieldnames = ['Site URL', 'Site Prefix', 'Total Files', 'Files Checked', 'Current Size (GB)', 'Versions Size (GB)', 'Total Versions']
+    
+    policy_fieldnames = []
+    for keep in CONFIG['keep_versions_options']:
+        policy_fieldnames.extend([
+            f'Keep_{keep}_Versions_To_Delete',
+            f'Keep_{keep}_Space_To_Save_(GB)',
+            f'Keep_{keep}_Files_With_More_Versions'
+        ])
+    
+    final_fieldnames = ['Report File']
+    all_fieldnames = base_fieldnames + policy_fieldnames + final_fieldnames
     
     with open(summary_file, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=all_fieldnames)
         writer.writeheader()
         
         for stats in all_site_stats:
             row = {
                 'Site URL': stats['site_url'],
                 'Site Prefix': stats['site_prefix'],
-                'Keep Versions': stats['keep_versions'],
                 'Total Files': stats['total_files'],
                 'Files Checked': stats['files_checked'],
                 'Current Size (GB)': f"{bytes_to_gb(stats['total_current_size_bytes']):.2f}",
                 'Versions Size (GB)': f"{bytes_to_gb(stats['total_versions_size_bytes']):.2f}",
-                'Total Versions': stats['total_versions_count'],
-                'Versions to Delete': stats['total_versions_to_delete_count'],
-                'Versions to Keep': stats['total_versions_count'] - stats['total_versions_to_delete_count'],
-                'Space to Save (GB)': f"{bytes_to_gb(stats['total_versions_to_delete_bytes']):.2f}",
-                'Files with > Keep_Versions': stats['files_with_more_versions'],
-                'Report File': stats.get('report_file', '')
+                'Total Versions': stats['total_versions_count']
             }
+            
+            # Add policy columns
+            for keep in CONFIG['keep_versions_options']:
+                row[f'Keep_{keep}_Versions_To_Delete'] = stats['total_versions_to_delete_count'].get(keep, 0)
+                row[f'Keep_{keep}_Space_To_Save_(GB)'] = f"{bytes_to_gb(stats['total_versions_to_delete_bytes'].get(keep, 0)):.2f}"
+                row[f'Keep_{keep}_Files_With_More_Versions'] = stats['files_with_more_versions'].get(keep, 0)
+            
+            row['Report File'] = stats.get('report_file', '')
             writer.writerow(row)
     
     return summary_file
@@ -901,13 +953,10 @@ def print_global_summary(all_site_stats):
     total_current_size = sum(s['total_current_size_bytes'] for s in all_site_stats)
     total_versions_size = sum(s['total_versions_size_bytes'] for s in all_site_stats)
     total_versions = sum(s['total_versions_count'] for s in all_site_stats)
-    total_versions_to_delete = sum(s['total_versions_to_delete_count'] for s in all_site_stats)
-    total_space_to_save = sum(s['total_versions_to_delete_bytes'] for s in all_site_stats)
-    total_files_with_more_versions = sum(s['files_with_more_versions'] for s in all_site_stats)
     
     print(f"\n📊 OVERALL STATISTICS:")
     print(f"  Total Sites Processed: {len(site_groups)}")
-    print(f"  Total Version Policies: {len(CONFIG['keep_versions_options'])} per site")
+    print(f"  Version Policies: {CONFIG['keep_versions_options']}")
     print(f"  Total Files Processed: {total_files}")
     print(f"  Files with Version Check: {total_files_checked}")
     
@@ -919,37 +968,32 @@ def print_global_summary(all_site_stats):
     
     print(f"\n📄 VERSION STATISTICS:")
     print(f"  Total Versions Found: {total_versions}")
-    print(f"  Versions to Delete: {total_versions_to_delete}")
-    print(f"  Versions to Keep: {total_versions - total_versions_to_delete}")
     
-    print(f"\n💰 SPACE SAVINGS ANALYSIS:")
-    print(f"  Total Space to Save: {bytes_to_gb(total_space_to_save):.2f} GB")
-    if total_versions_size > 0:
-        savings_percentage = (total_space_to_save / total_versions_size) * 100
-        print(f"  Savings Percentage: {savings_percentage:.1f}% of version history")
+    # Show savings per policy
+    print(f"\n💰 SPACE SAVINGS BY POLICY:")
+    print("-" * 80)
+    print(f"{'Policy':<15} {'Versions To Delete':<20} {'Space To Save (GB)':<20} {'Files Affected':<15}")
+    print("-" * 80)
     
-    if total_current_size > 0 and total_space_to_save > 0:
-        print(f"\n  🎯 POTENTIAL SAVINGS:")
-        print(f"     Total Space to Save: {bytes_to_gb(total_space_to_save):.2f} GB")
-        print(f"     Equivalent to: {bytes_to_gb(total_space_to_save) / bytes_to_gb(total_current_size):.1f}x current total size")
+    for keep in CONFIG['keep_versions_options']:
+        total_delete_count = sum(s['total_versions_to_delete_count'].get(keep, 0) for s in all_site_stats)
+        total_delete_bytes = sum(s['total_versions_to_delete_bytes'].get(keep, 0) for s in all_site_stats)
+        total_files_affected = sum(s['files_with_more_versions'].get(keep, 0) for s in all_site_stats)
+        
+        print(f"Keep {keep:<10} {total_delete_count:<20} {bytes_to_gb(total_delete_bytes):<20.2f} {total_files_affected:<15}")
     
-    # Print per-site summary
-    print(f"\n📋 PER-SITE SUMMARY:")
-    print("-" * 100)
-    print(f"{'Site':<30} {'Policy':<10} {'Files':<10} {'Current (GB)':<15} {'Versions':<12} {'To Delete':<12} {'Save (GB)':<12}")
-    print("-" * 100)
+    print("-" * 80)
     
-    for site_url, site_stats_list in site_groups.items():
-        site_prefix = get_site_prefix(site_url)
-        for stats in site_stats_list:
-            print(f"{site_prefix[:25]:<30} {stats['keep_versions']:<10} "
-                  f"{stats['total_files']:<10} {bytes_to_gb(stats['total_current_size_bytes']):<15.2f} "
-                  f"{stats['total_versions_count']:<12} {stats['total_versions_to_delete_count']:<12} "
-                  f"{bytes_to_gb(stats['total_versions_to_delete_bytes']):<12.2f}")
+    # Best policy recommendation
+    print(f"\n🎯 RECOMMENDATION:")
+    best_policy = max(
+        CONFIG['keep_versions_options'],
+        key=lambda k: sum(s['total_versions_to_delete_bytes'].get(k, 0) for s in all_site_stats)
+    )
+    best_savings = sum(s['total_versions_to_delete_bytes'].get(best_policy, 0) for s in all_site_stats)
     
-    print("-" * 100)
-    print(f"{'TOTAL':<30} {'':<10} {total_files:<10} {bytes_to_gb(total_current_size):<15.2f} "
-          f"{total_versions:<12} {total_versions_to_delete:<12} {bytes_to_gb(total_space_to_save):<12.2f}")
+    print(f"  Best policy for maximum space savings: Keep {best_policy} versions")
+    print(f"  Total space to save: {bytes_to_gb(best_savings):.2f} GB")
     
     print("="*100)
 
@@ -958,10 +1002,10 @@ def print_global_summary(all_site_stats):
 # ============================================================
 
 def main():
-    """Main function to process all sites with multiple version policies"""
+    """Main function to process all sites with multiple policies in ONE report"""
     print("="*100)
     print("📊 BULK SITE VERSION HISTORY REPORT GENERATOR")
-    print("(Multiple Sites & Multiple Version Retention Policies)")
+    print("(Multiple Policies in ONE Report)")
     print("="*100)
     
     global ALLOWED_FILE_EXTENSIONS
@@ -972,7 +1016,7 @@ def main():
     
     print(f"\n📌 Configuration:")
     print(f"  Total Sites: {len(SITES)}")
-    print(f"  Version Policies: {CONFIG['keep_versions_options']}")
+    print(f"  Version Policies: {CONFIG['keep_versions_options']} (in ONE report per site)")
     print(f"  Min File Size for Version Check: {CONFIG['min_file_size_mb']} MB")
     print(f"  Output Directory: {CONFIG['output_dir']}")
     print("="*100)
@@ -988,28 +1032,21 @@ def main():
     print("✅ Authentication successful\n")
     
     all_site_stats = []
-    total_combinations = len(SITES) * len(CONFIG['keep_versions_options'])
-    current_combination = 0
-    
     start_time = time.time()
     
-    # Process each site with each version policy
+    # Process each site ONCE (with ALL policies in ONE report)
     for site_url in SITES:
         print(f"\n{'#'*100}")
         print(f"📍 SITE: {site_url}")
         print(f"{'#'*100}")
         
-        for keep_versions in CONFIG['keep_versions_options']:
-            current_combination += 1
-            print(f"\n▶️  Processing combination {current_combination}/{total_combinations}")
-            
-            site_stats = process_site(site_url, keep_versions)
-            
-            if site_stats:
-                all_site_stats.append(site_stats)
-            
-            # Small delay between policies
-            time.sleep(1)
+        site_stats = process_site(site_url)
+        
+        if site_stats:
+            all_site_stats.append(site_stats)
+        
+        # Small delay between sites
+        time.sleep(1)
     
     elapsed_time = time.time() - start_time
     
@@ -1028,7 +1065,7 @@ def main():
     print(f"  - Summary Report: {summary_file}")
     
     # List all generated reports
-    print(f"\n  - Individual Site Reports:")
+    print(f"\n  - Individual Site Reports (with ALL policies):")
     for stats in all_site_stats:
         if 'report_file' in stats:
             print(f"    • {os.path.basename(stats['report_file'])}")
