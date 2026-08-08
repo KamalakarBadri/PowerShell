@@ -269,19 +269,40 @@ def main():
 
     print(f"Using drive: {drive_id}")
     print("Walking drive and collecting version info (this can take a while for large drives)...")
+    print(f"Writing incrementally to: {args.output}")
+
+    fieldnames = [
+        "Path",
+        "Name",
+        "CurrentSize",
+        "CurrentSizeHuman",
+        "VersionCount",
+        "VersionsSize",
+        "VersionsSizeHuman",
+        "TotalSize",
+        "TotalSizeHuman",
+        "WebUrl",
+    ]
 
     rows = []
     grand_total_current = 0
     grand_total_versions = 0
     file_count = 0
 
-    for item, path in walk_drive_items(client, drive_id):
-        file_count += 1
-        current_size = item.get("size", 0)
-        version_count, versions_size = get_versions_info(client, drive_id, item["id"])
+    # Open once, write each row as soon as it's computed, flush immediately.
+    # This means a killed/interrupted run still leaves a valid, usable
+    # partial CSV instead of losing all progress.
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        f.flush()
 
-        rows.append(
-            {
+        for item, path in walk_drive_items(client, drive_id):
+            file_count += 1
+            current_size = item.get("size", 0)
+            version_count, versions_size = get_versions_info(client, drive_id, item["id"])
+
+            row = {
                 "Path": path,
                 "Name": item["name"],
                 "CurrentSize": current_size,
@@ -293,32 +314,22 @@ def main():
                 "TotalSizeHuman": human_size(current_size + versions_size),
                 "WebUrl": item.get("webUrl", ""),
             }
-        )
-        grand_total_current += current_size
-        grand_total_versions += versions_size
 
-        if file_count % 25 == 0:
-            print(f"  ...{file_count} files processed so far")
+            writer.writerow(row)
+            f.flush()  # push to OS immediately so the file is up to date on disk
 
-    # sort largest version overhead first — usually what people care about
+            rows.append(row)
+            grand_total_current += current_size
+            grand_total_versions += versions_size
+
+            if file_count % 25 == 0:
+                print(f"  ...{file_count} files processed so far (last: {path})")
+
+    # Re-sort the completed file by version-storage overhead (largest first),
+    # now that we have the full picture. Only runs if the walk finished cleanly.
     rows.sort(key=lambda r: r["VersionsSize"], reverse=True)
-
     with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "Path",
-                "Name",
-                "CurrentSize",
-                "CurrentSizeHuman",
-                "VersionCount",
-                "VersionsSize",
-                "VersionsSizeHuman",
-                "TotalSize",
-                "TotalSizeHuman",
-                "WebUrl",
-            ],
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
