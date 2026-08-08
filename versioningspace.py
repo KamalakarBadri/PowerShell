@@ -28,8 +28,6 @@ SCOPE = "https://geekbyteonline.sharepoint.com/.default"
 # List of SharePoint sites to process (only site URLs needed)
 SITES = [
     "https://geekbyteonline.sharepoint.com/sites/Team_",
-    "https://geekbyteonline.sharepoint.com/sites/Site1",
-    "https://geekbyteonline.sharepoint.com/sites/Site2",
     # Add more sites here
 ]
 
@@ -41,27 +39,34 @@ CONFIG = {
     "private_key_path": "private_key.pem",
     
     # ============================================================
-    # VERSION HISTORY FILTER - Only check versions for files above this size (in MB)
+    # VERSION HISTORY FILTER
     # ============================================================
-    "min_file_size_mb": 200,  # Only check version history for files > 200 MB
+    "min_file_size_mb": 200,  # Only check versions for files > 200 MB
     
     # ============================================================
-    # VERSION RETENTION SETTINGS - Multiple policies in ONE report
+    # VERSION RETENTION SETTINGS
     # ============================================================
-    "keep_versions_options": [20, 50, 100],  # All policies in one CSV
+    "keep_versions_options": [20, 50, 100],  # All policies in ONE report
     
     # ============================================================
     # PERFORMANCE SETTINGS
     # ============================================================
-    "batch_size": 50,  # Number of files to process in parallel
-    "max_workers": 10,  # Maximum concurrent threads
-    "request_timeout": 60,  # Request timeout in seconds
+    "batch_size": 50,
+    "max_workers": 10,
+    "request_timeout": 60,
     
-    # Output directory for reports
+    # ============================================================
+    # OPTIMIZATION SETTINGS - NO $expand!
+    # ============================================================
+    "use_expand": False,  # DISABLED - NO $expand
+    "filter_at_endpoint": True,  # Filter at API level
+    "limit_versions": True,
+    "max_versions_per_file": 150,
+    
     "output_dir": "reports"
 }
 
-# File extension filter: set to None for all files, or use a list like ["docx", "pdf", "xlsx"]
+# File extension filter
 FILE_EXTENSIONS = ["docx", "pdf", "xlsx"]
 
 # ============================================================
@@ -73,22 +78,6 @@ csv_writers = {}
 csv_files = {}
 csv_lock = threading.Lock()
 ALLOWED_FILE_EXTENSIONS = None
-
-# Global summary statistics for all sites
-GLOBAL_SUMMARY = {
-    "total_sites": 0,
-    "total_files": 0,
-    "total_files_checked": 0,
-    "total_current_size_gb": 0.0,
-    "total_versions_size_gb": 0.0,
-    "total_versions_count": 0,
-    "total_versions_to_delete_count": 0,
-    "total_versions_to_delete_gb": 0.0,
-    "total_versions_to_keep_gb": 0.0,
-    "sites_data": []
-}
-
-summary_lock = threading.Lock()
 
 # ============================================================
 # AUTHENTICATION FUNCTIONS
@@ -351,9 +340,7 @@ def should_check_versions(file_size_mb):
     return file_size_mb > min_size
 
 def calculate_version_space_savings(versions, keep_last_n):
-    """
-    Calculate space savings if we keep only the last N versions
-    """
+    """Calculate space savings if we keep only the last N versions"""
     if not versions:
         return {
             'total_versions': 0,
@@ -400,7 +387,7 @@ def calculate_version_space_savings(versions, keep_last_n):
     }
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL FUNCTIONS
+# SHAREPOINT DATA RETRIEVAL - NO $expand!
 # ============================================================
 
 def get_all_libraries(site_url):
@@ -432,10 +419,43 @@ def get_all_libraries(site_url):
     return all_libraries
 
 def get_all_items_from_library(site_url, library_id):
-    """Get all items from a library with pagination"""
-    print(f"    Fetching items from library...")
+    """Get all items WITHOUT using $expand - uses direct fields only"""
+    print(f"    Fetching items without $expand...")
     
-    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$expand=File&$top=5000"
+    # Select only needed fields (NO expand)
+    select_fields = [
+        'Id',
+        'Title',
+        'FileLeafRef',
+        'FileRef',
+        'File_x005f_x0020_x005f_Size',  # File size - direct field
+        'Created',
+        'Modified',
+        'FileSystemObjectType'
+    ]
+    
+    # Build URL with selected fields
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select={','.join(select_fields)}&$top=5000"
+    
+    # Add filters if enabled
+    if CONFIG.get('filter_at_endpoint', True):
+        filters = []
+        
+        # Filter by file size
+        min_size_bytes = CONFIG.get('min_file_size_mb', 200) * 1024 * 1024
+        filters.append(f"File_x005f_x0020_x005f_Size gt {min_size_bytes}")
+        
+        # Filter by extension
+        if ALLOWED_FILE_EXTENSIONS:
+            ext_conditions = []
+            for ext in ALLOWED_FILE_EXTENSIONS:
+                ext_conditions.append(f"substringof('.{ext}',FileLeafRef)")
+            if ext_conditions:
+                filters.append(f"({' or '.join(ext_conditions)})")
+        
+        if filters:
+            items_url += f"&$filter={' and '.join(filters)}"
+    
     all_items = []
     next_url = items_url
     page_count = 0
@@ -466,6 +486,11 @@ def get_file_versions(site_url, list_id, item_id):
     try:
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
         
+        # Add top parameter if limit is enabled
+        if CONFIG.get('limit_versions', True):
+            max_versions = CONFIG.get('max_versions_per_file', 150)
+            versions_url += f"?$top={max_versions}&$orderby=Created desc"
+        
         response = make_sharepoint_request(site_url, versions_url)
         
         if not response or 'd' not in response:
@@ -476,13 +501,16 @@ def get_file_versions(site_url, list_id, item_id):
         
         versions = []
         for version in response['d']['results']:
+            # Get size from version - direct field
+            version_size = version.get('File_x005f_x0020_x005f_Size', 0)
+            
             version_data = {
                 'version_id': version.get('VersionId', 0),
                 'version_label': version.get('VersionLabel', ''),
                 'ui_version_string': version.get('OData__x005f_UIVersionString', ''),
                 'created': version.get('Created', ''),
                 'is_current': version.get('IsCurrentVersion', False),
-                'size': safe_int_conversion(version.get('File_x005f_x0020_x005f_Size', '0')),
+                'size': safe_int_conversion(version_size),
                 'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
                 'author': version.get('Author', {}).get('LookupValue', '') if version.get('Author') else '',
                 'editor': version.get('Editor', {}).get('LookupValue', '') if version.get('Editor') else ''
@@ -496,20 +524,23 @@ def get_file_versions(site_url, list_id, item_id):
         return []
 
 def get_file_details_from_item(item):
-    """Extract file details from item with expanded File property"""
-    file_obj = item.get('File', {})
-    
-    file_name = file_obj.get('Name', '')
+    """Extract file details from item WITHOUT using $expand"""
+    # Get file name from multiple possible fields
+    file_name = item.get('FileLeafRef', '')
     if not file_name:
         file_name = item.get('Title', f"Item_{item.get('Id', 0)}")
     
-    file_path = file_obj.get('ServerRelativeUrl', '')
-    if not file_path:
-        file_path = item.get('FileRef', '')
+    # Get file path
+    file_path = item.get('FileRef', '')
     
-    file_size = file_obj.get('Length', 0)
-    if not file_size:
-        file_size = item.get('File_x005f_x0020_x005f_Size', '0')
+    # Get file size - direct field from items
+    file_size = item.get('File_x005f_x0020_x005f_Size', 0)
+    
+    # If not found, try other possible fields
+    if not file_size or file_size == 0:
+        file_size = item.get('FileSizeDisplay', 0)
+    if not file_size or file_size == 0:
+        file_size = item.get('FileSize', 0)
     
     return {
         'file_name': file_name,
@@ -524,9 +555,7 @@ def get_file_details_from_item(item):
 # ============================================================
 
 def process_file_batch(site_url, file_items, library_id, library_title, batch_id, total_batches, output_file):
-    """
-    Process a batch of files in parallel
-    """
+    """Process a batch of files in parallel"""
     results = []
     
     with ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor:
@@ -553,14 +582,13 @@ def process_file_batch(site_url, file_items, library_id, library_title, batch_id
     return results
 
 def process_single_file(site_url, list_id, item, library_title, output_file):
-    """
-    Process a single file item - calculates savings for ALL policies at once
-    """
+    """Process a single file item - calculates savings for ALL policies at once"""
     try:
         item_id = item.get('Id')
-        fsob_type = item.get('FileSystemObjectType', 1)
+        fsob_type = item.get('FileSystemObjectType', 0)
         
-        if fsob_type == 1:
+        # Check if it's a file (FSObjType = 0 means file)
+        if fsob_type != 0:
             return None
         
         file_details = get_file_details_from_item(item)
@@ -574,7 +602,6 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         first_version_date = 'N/A'
         last_version_date = 'N/A'
         
-        # Initialize savings for all policies
         savings_data = {}
         
         if check_versions:
@@ -589,10 +616,11 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
                 first_version_date = first_version.get('created', 'N/A')
                 last_version_date = last_version.get('created', 'N/A')
                 
+                # Calculate total versions size
                 for version in versions:
                     total_versions_size += version.get('size', 0)
                 
-                # Calculate savings for EACH policy
+                # Calculate savings for each policy
                 for keep_versions in CONFIG['keep_versions_options']:
                     savings = calculate_version_space_savings(versions, keep_versions)
                     savings_data[f'Keep_{keep_versions}'] = {
@@ -605,7 +633,6 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         if version_count == 0:
             total_versions_size = current_file_size
         
-        # Prepare file data with ALL policies
         file_data = {
             'library': library_title,
             'list_id': list_id,
@@ -627,15 +654,13 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
             'savings_data': savings_data
         }
         
-        # Append to CSV with ALL policies
         append_to_report(output_file, file_data)
         
-        # Print progress (only show first policy for brevity)
+        # Print progress
         file_name_short = file_details['file_name'][:30] + "..." if len(file_details['file_name']) > 30 else file_details['file_name']
         size_indicator = "🟢" if file_size_mb > CONFIG['min_file_size_mb'] else "⚪"
         
         if check_versions and version_count > 0:
-            # Show savings for first policy
             first_policy = CONFIG['keep_versions_options'][0]
             savings_first = savings_data.get(f'Keep_{first_policy}', {})
             delete_count = savings_first.get('delete_count', 0)
@@ -652,17 +677,17 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         return file_data
         
     except Exception as e:
+        print(f"\n  ❌ Error processing item {item.get('Id')}: {str(e)}")
         return None
 
 # ============================================================
-# CSV REPORT FUNCTIONS - SINGLE FILE WITH ALL POLICIES
+# CSV REPORT FUNCTIONS - ONE FILE WITH ALL POLICIES
 # ============================================================
 
 def initialize_report(output_file):
     """Initialize CSV file with headers for ALL policies"""
     global csv_writers, csv_files
     
-    # Build dynamic fieldnames based on policies
     base_fieldnames = [
         'Library', 'List ID', 'Item ID', 'File Name', 'File Path', 
         'Current File Size (MB)', 'Version Count', 'First Version Date', 
@@ -670,7 +695,6 @@ def initialize_report(output_file):
         'File Created', 'File Modified', 'Versions Checked'
     ]
     
-    # Add columns for each policy
     policy_fieldnames = []
     for keep in CONFIG['keep_versions_options']:
         policy_fieldnames.extend([
@@ -679,9 +703,7 @@ def initialize_report(output_file):
             f'Keep_{keep}_Deleted_Range'
         ])
     
-    # Add final columns
     final_fieldnames = ['Processed At']
-    
     all_fieldnames = base_fieldnames + policy_fieldnames + final_fieldnames
     
     csv_files[output_file] = open(output_file, 'w', newline='', encoding='utf-8-sig')
@@ -695,7 +717,6 @@ def append_to_report(output_file, data):
     
     with csv_lock:
         try:
-            # Start with base fields
             row = {
                 'Library': data.get('library', ''),
                 'List ID': data.get('list_id', ''),
@@ -712,7 +733,6 @@ def append_to_report(output_file, data):
                 'Versions Checked': 'Yes' if data.get('versions_checked', False) else 'No'
             }
             
-            # Add policy columns
             savings_data = data.get('savings_data', {})
             for keep in CONFIG['keep_versions_options']:
                 policy_key = f'Keep_{keep}'
@@ -721,7 +741,6 @@ def append_to_report(output_file, data):
                 row[f'{policy_key}_Space_Saved_(GB)'] = f"{policy_data.get('space_saved_gb', 0.00):.2f}"
                 row[f'{policy_key}_Deleted_Range'] = policy_data.get('delete_range', 'N/A')
             
-            # Add final fields
             row['Processed At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
             csv_writers[output_file].writerow(row)
@@ -753,16 +772,17 @@ def process_site(site_url):
     print(f"📌 Version Retention Policies: {CONFIG['keep_versions_options']}")
     print(f"{'='*80}")
     
-    # Create output directory
-    os.makedirs(CONFIG['output_dir'], exist_ok=True)
+    print(f"\n🔍 Optimization Settings:")
+    print(f"  - Using $expand: {CONFIG.get('use_expand', False)} (DISABLED for speed)")
+    print(f"  - Getting size from: File_x005f_x0020_x005f_Size (direct field)")
+    print(f"  - Filtering at API: {CONFIG.get('filter_at_endpoint', True)}")
+    print(f"  - Max versions per file: {CONFIG.get('max_versions_per_file', 150)}")
     
-    # Generate output filename (ONE file per site)
+    os.makedirs(CONFIG['output_dir'], exist_ok=True)
     output_file = os.path.join(CONFIG['output_dir'], get_report_filename(site_url))
     
-    # Initialize report with ALL policies
     initialize_report(output_file)
     
-    # Get all libraries
     libraries = get_all_libraries(site_url)
     
     if not libraries:
@@ -777,7 +797,7 @@ def process_site(site_url):
     print(f"\n⚡ Performance Settings:")
     print(f"  - Batch size: {CONFIG['batch_size']} files per batch")
     print(f"  - Max workers: {CONFIG['max_workers']} concurrent threads")
-    print(f"  - Version check only for files > {CONFIG['min_file_size_mb']} MB")
+    print(f"  - Min size for version check: {CONFIG['min_file_size_mb']} MB")
     print(f"  - Policies: {CONFIG['keep_versions_options']} in ONE report\n")
     
     all_file_data = []
@@ -794,8 +814,8 @@ def process_site(site_url):
         'total_current_size_bytes': 0,
         'total_versions_size_bytes': 0,
         'total_versions_count': 0,
-        'total_versions_to_delete_count': {},  # Per policy
-        'total_versions_to_delete_bytes': {},  # Per policy
+        'total_versions_to_delete_count': {},
+        'total_versions_to_delete_bytes': {},
         'files_with_more_versions': {},
         'report_file': output_file
     }
@@ -817,23 +837,29 @@ def process_site(site_url):
             print(f"  No items found in {library['title']}")
             continue
         
+        # Filter out folders (FSObjType = 1) and keep only files
         files = [item for item in items if item.get('FileSystemObjectType') == 0]
         
         if not files:
             print(f"  No files found in {library['title']}")
             continue
         
-        valid_files = []
-        for f in files:
-            file_name = f.get('File', {}).get('Name', f"Item_{f.get('Id', 0)}")
-            if should_process_file(file_name):
-                valid_files.append(f)
-            else:
-                skipped_by_extension += 1
+        # Additional filter by extension if not already filtered at API level
+        if not CONFIG.get('filter_at_endpoint', True) or not ALLOWED_FILE_EXTENSIONS:
+            valid_files = []
+            for f in files:
+                file_name = f.get('FileLeafRef', f"Item_{f.get('Id', 0)}")
+                if should_process_file(file_name):
+                    valid_files.append(f)
+                else:
+                    skipped_by_extension += 1
+        else:
+            valid_files = files
         
         print(f"  Found {len(files)} files in {library['title']}")
         print(f"  - Files matching extension filter: {len(valid_files)}")
-        print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
+        if not CONFIG.get('filter_at_endpoint', True) or not ALLOWED_FILE_EXTENSIONS:
+            print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
         
         total_files += len(valid_files)
         
@@ -1005,7 +1031,7 @@ def main():
     """Main function to process all sites with multiple policies in ONE report"""
     print("="*100)
     print("📊 BULK SITE VERSION HISTORY REPORT GENERATOR")
-    print("(Multiple Policies in ONE Report)")
+    print("(NO $expand - Using Direct Fields for Maximum Performance)")
     print("="*100)
     
     global ALLOWED_FILE_EXTENSIONS
@@ -1018,6 +1044,9 @@ def main():
     print(f"  Total Sites: {len(SITES)}")
     print(f"  Version Policies: {CONFIG['keep_versions_options']} (in ONE report per site)")
     print(f"  Min File Size for Version Check: {CONFIG['min_file_size_mb']} MB")
+    print(f"  File Extensions: {FILE_EXTENSIONS if FILE_EXTENSIONS else 'All files'}")
+    print(f"  $expand: DISABLED (faster performance)")
+    print(f"  File Size Source: File_x005f_x0020_x005f_Size (direct field)")
     print(f"  Output Directory: {CONFIG['output_dir']}")
     print("="*100)
     
