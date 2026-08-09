@@ -1,0 +1,60 @@
+{
+  "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+  "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+  "scope": "https://geekbyteonline.sharepoint.com/.default",
+  "certificate_path": "certificate.pem",
+  "private_key_path": "private_key.pem",
+  
+  "sites": [
+    "https://geekbyteonline.sharepoint.com/sites/Team_"
+  ],
+  
+  "file_extensions": ["docx", "pdf", "xlsx"],
+  
+  "version_settings": {
+    "min_file_size_mb": 200,
+    "keep_versions_options": [20, 50, 100],
+    "request_timeout": 120
+  },
+  
+  "performance_test": {
+    "max_items_to_process": 20000,
+    "test_configs": [
+      {
+        "name": "Config A: 100/50",
+        "batch_size": 100,
+        "max_workers": 50
+      },
+      {
+        "name": "Config B: 200/50",
+        "batch_size": 200,
+        "max_workers": 50
+      },
+      {
+        "name": "Config C: 300/50",
+        "batch_size": 300,
+        "max_workers": 50
+      },
+      {
+        "name": "Config D: 100/20",
+        "batch_size": 100,
+        "max_workers": 20
+      },
+      {
+        "name": "Config E: 200/20",
+        "batch_size": 200,
+        "max_workers": 20
+      },
+      {
+        "name": "Config F: 300/20",
+        "batch_size": 300,
+        "max_workers": 20
+      }
+    ]
+  },
+  
+  "output": {
+    "output_dir": "analysis_reports",
+    "summary_file": "performance_summary.csv"
+  }
+}
