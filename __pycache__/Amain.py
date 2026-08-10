@@ -5,11 +5,12 @@ import uuid
 import base64
 import time
 import os
-from datetime import datetime
+import sys
 import re
 import gc
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -48,6 +49,7 @@ csv_file = None
 csv_lock = threading.Lock()
 current_csv_rows = 0
 csv_file_counter = 1
+batch_paused = threading.Event()
 
 # Statistics
 STATS = {
@@ -60,38 +62,21 @@ STATS = {
     "total_versions_to_delete_count": 0,
     "files_with_more_versions": 0,
     "rate_limit_errors": 0,
-    "retry_count": 0
+    "retry_count": 0,
+    "total_batches": 0,
+    "total_429_errors": 0,
+    "total_timeouts": 0
 }
 stats_lock = threading.Lock()
 
 # ============================================================
-# CSV ROTATION FUNCTIONS (For large datasets)
+# CSV ROTATION FUNCTIONS (FIXED)
 # ============================================================
 
 def get_csv_filename(site_prefix, counter=1):
     """Generate CSV filename with rotation"""
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     return os.path.join(CONFIG['output']['output_dir'], f"{site_prefix}_Version_Report_Part{counter}_{timestamp}.csv")
-
-def rotate_csv(site_prefix):
-    """Rotate CSV file when max rows reached"""
-    global csv_writer, csv_file, current_csv_rows, csv_file_counter
-    
-    with csv_lock:
-        # Close current file if exists
-        if csv_file:
-            csv_file.close()
-        
-        # Create new file
-        csv_file_counter += 1
-        filename = get_csv_filename(site_prefix, csv_file_counter)
-        csv_file = open(filename, 'w', newline='', encoding='utf-8-sig')
-        csv_writer = csv.DictWriter(csv_file, fieldnames=get_csv_headers())
-        csv_writer.writeheader()
-        csv_file.flush()
-        current_csv_rows = 0
-        
-        print(f"  📄 CSV rotated to: {filename}")
 
 def get_csv_headers():
     """Get CSV headers"""
@@ -112,34 +97,76 @@ def get_csv_headers():
     return base_headers + policy_headers + ['Processed At']
 
 def initialize_csv(site_prefix):
-    """Initialize CSV file"""
+    """Initialize CSV file - ONLY creates Part 1"""
     global csv_writer, csv_file, current_csv_rows, csv_file_counter
     
     os.makedirs(CONFIG['output']['output_dir'], exist_ok=True)
     
+    # Reset counter to 1
     csv_file_counter = 1
+    current_csv_rows = 0
+    
     filename = get_csv_filename(site_prefix, csv_file_counter)
     csv_file = open(filename, 'w', newline='', encoding='utf-8-sig')
     csv_writer = csv.DictWriter(csv_file, fieldnames=get_csv_headers())
     csv_writer.writeheader()
     csv_file.flush()
-    current_csv_rows = 0
     
     print(f"✅ CSV initialized: {filename}")
     return filename
 
-def append_to_csv(data, site_prefix):
-    """Append row to CSV with rotation"""
+def rotate_csv(site_prefix):
+    """Rotate CSV file and show progress"""
     global csv_writer, csv_file, current_csv_rows, csv_file_counter
     
     with csv_lock:
         try:
-            # Check if rotation needed
-            max_rows = CONFIG['output'].get('csv_max_rows', 100000)
-            if current_csv_rows >= max_rows:
+            # Close current file
+            if csv_file:
+                csv_file.close()
+                print(f"  ✅ Part {csv_file_counter} completed with {current_csv_rows} rows")
+            
+            # Increment counter and create new file
+            csv_file_counter += 1
+            filename = get_csv_filename(site_prefix, csv_file_counter)
+            csv_file = open(filename, 'w', newline='', encoding='utf-8-sig')
+            csv_writer = csv.DictWriter(csv_file, fieldnames=get_csv_headers())
+            csv_writer.writeheader()
+            csv_file.flush()
+            current_csv_rows = 0
+            
+            print(f"  📄 CSV rotated to Part {csv_file_counter}: {filename}")
+            
+        except Exception as e:
+            print(f"  ❌ Error during rotation: {str(e)}")
+            # Try to recover
+            try:
+                csv_file_counter += 1
+                filename = get_csv_filename(site_prefix, csv_file_counter)
+                csv_file = open(filename, 'w', newline='', encoding='utf-8-sig')
+                csv_writer = csv.DictWriter(csv_file, fieldnames=get_csv_headers())
+                csv_writer.writeheader()
+                csv_file.flush()
+                current_csv_rows = 0
+                print(f"  ✅ Recovered: Part {csv_file_counter} created")
+            except:
+                print(f"  ❌ FATAL: Cannot create new CSV file")
+                raise
+
+def append_to_csv(data, site_prefix):
+    """Append row to CSV with rotation BEFORE reaching limit"""
+    global csv_writer, csv_file, current_csv_rows, csv_file_counter
+    
+    with csv_lock:
+        try:
+            max_rows = CONFIG['output'].get('csv_max_rows', 10000)
+            
+            # ✅ FIX: Rotate BEFORE reaching max (at max_rows - 1)
+            if current_csv_rows >= (max_rows - 1):
+                print(f"\n  📊 Part {csv_file_counter} has {current_csv_rows} rows, rotating to Part {csv_file_counter + 1}...")
                 rotate_csv(site_prefix)
             
-            # Build row
+            # Build row data
             row = {
                 'Site': data.get('site', ''),
                 'Library': data.get('library', ''),
@@ -155,7 +182,6 @@ def append_to_csv(data, site_prefix):
                 'Versions Checked': 'Yes' if data.get('versions_checked', False) else 'No'
             }
             
-            # Add policy columns
             savings_data = data.get('savings_data', {})
             for keep in CONFIG['version_settings']['keep_versions_options']:
                 policy_key = f'Keep_{keep}'
@@ -166,11 +192,17 @@ def append_to_csv(data, site_prefix):
             
             row['Processed At'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
+            # Write row
             csv_writer.writerow(row)
             csv_file.flush()
             current_csv_rows += 1
             
+            # Show progress every 100 rows
+            if current_csv_rows % 100 == 0:
+                print(f"  📊 Part {csv_file_counter}: {current_csv_rows} rows written", end="\r")
+            
             return True
+            
         except Exception as e:
             print(f"❌ Error writing to CSV: {str(e)}")
             return False
@@ -179,6 +211,7 @@ def close_csv():
     """Close CSV file"""
     global csv_file
     if csv_file:
+        print(f"\n  ✅ Part {csv_file_counter} completed with {current_csv_rows} rows")
         csv_file.close()
 
 # ============================================================
@@ -289,14 +322,24 @@ def get_cached_token(force_refresh=False):
 def get_current_token():
     return get_cached_token()
 
-def make_sharepoint_request(site_url, url, max_retries=5):
+def make_sharepoint_request(site_url, url, max_retries=None):
     """Make request with retry logic for 429 errors"""
-    global STATS
+    global STATS, batch_paused
+    
+    if max_retries is None:
+        max_retries = CONFIG['version_settings'].get('max_retries', 5)
     
     retry_delay = CONFIG['version_settings'].get('retry_delay_seconds', 3)
+    request_timeout = CONFIG['version_settings'].get('request_timeout', 120)
     
     for attempt in range(max_retries + 1):
         try:
+            # Check if batch is paused
+            while batch_paused.is_set():
+                print(f"\n    ⏳ Batch paused, waiting...", end="")
+                time.sleep(1)
+                print(".", end="", flush=True)
+            
             token = get_current_token()
             if not token:
                 return None
@@ -307,24 +350,30 @@ def make_sharepoint_request(site_url, url, max_retries=5):
                 "Content-Type": "application/json"
             }
             
-            response = requests.get(url, headers=headers, timeout=CONFIG['version_settings']['request_timeout'])
+            response = requests.get(url, headers=headers, timeout=request_timeout)
             
-            # Handle 429 Too Many Requests
+            # Handle 429
             if response.status_code == 429:
                 with stats_lock:
                     STATS["rate_limit_errors"] += 1
+                    STATS["total_429_errors"] += 1
                 
-                wait_time = retry_delay * (attempt + 1)  # 3s, 6s, 9s, 12s, 15s
-                print(f"    ⚠️ 429 Too Many Requests! Waiting {wait_time}s... (Attempt {attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+                wait_time = retry_delay * (attempt + 1)
                 
-                # Refresh token and retry
+                # Show progress during wait
+                print(f"\n    ⚠️ 429: Waiting {wait_time}s... (Attempt {attempt+1}/{max_retries})", end="")
+                for i in range(wait_time):
+                    time.sleep(1)
+                    if i % 5 == 0:
+                        print(".", end="", flush=True)
+                print(" ✅ Resuming")
+                
                 TOKEN_CACHE["token"] = None
                 TOKEN_CACHE["expires"] = 0
                 continue
             
             if response.status_code == 401 and attempt < max_retries:
-                print(f"    ⚠️ Token expired, refreshing...")
+                print(f"\n    ⚠️ Token expired, refreshing...")
                 TOKEN_CACHE["token"] = None
                 TOKEN_CACHE["expires"] = 0
                 with stats_lock:
@@ -333,6 +382,13 @@ def make_sharepoint_request(site_url, url, max_retries=5):
             
             response.raise_for_status()
             return response.json()
+            
+        except requests.exceptions.Timeout:
+            print(f"\n    ⚠️ Request timeout, retrying... (Attempt {attempt+1}/{max_retries})")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+                continue
+            return None
             
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
@@ -343,7 +399,9 @@ def make_sharepoint_request(site_url, url, max_retries=5):
                     STATS["retry_count"] += 1
                 continue
             return None
+            
         except Exception as e:
+            print(f"\n    ⚠️ Error: {str(e)[:50]}")
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
                 with stats_lock:
@@ -485,7 +543,6 @@ def get_all_libraries(site_url):
     next_url = lists_url
     
     while next_url:
-        print(f"  Fetching libraries page...")
         response = make_sharepoint_request(site_url, next_url)
         
         if not response or 'd' not in response:
@@ -570,8 +627,8 @@ def get_file_versions(site_url, list_id, item_id):
 # BATCH PROCESSING
 # ============================================================
 
-def process_single_file(site_url, site_prefix, list_id, item, library_title):
-    """Process a single file"""
+def _process_single_file_internal(site_url, site_prefix, list_id, item, library_title):
+    """Internal file processing function"""
     global STATS
     
     try:
@@ -585,11 +642,9 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
         if not file_name:
             file_name = item.get('Title', f"Item_{item_id}")
         
-        # Get versions
         versions = get_file_versions(site_url, list_id, item_id)
         version_count = len(versions)
         
-        # Get current file size from latest version
         current_file_size = 0
         if versions:
             sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
@@ -598,16 +653,13 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
         
         file_size_mb = bytes_to_mb(current_file_size)
         
-        # Skip small files
         if file_size_mb <= CONFIG['version_settings']['min_file_size_mb']:
             return None
         
-        # Calculate totals
         total_versions_size = 0
         for version in versions:
             total_versions_size += version.get('size', 0)
         
-        # Calculate savings for each policy
         savings_data = {}
         for keep_versions in CONFIG['version_settings']['keep_versions_options']:
             savings = calculate_version_space_savings(versions, keep_versions)
@@ -617,7 +669,6 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
                 'delete_range': savings['delete_range']
             }
         
-        # Update statistics
         with stats_lock:
             STATS["total_files"] += 1
             STATS["total_current_size_bytes"] += current_file_size
@@ -633,7 +684,6 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
                     STATS["total_versions_to_delete_bytes"] += int(savings['space_saved_gb'] * 1024 * 1024 * 1024)
                     STATS["files_with_more_versions"] += 1
         
-        # Prepare data for CSV
         file_data = {
             'site': site_prefix,
             'library': library_title,
@@ -650,7 +700,6 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
             'savings_data': savings_data
         }
         
-        # Write to CSV
         append_to_csv(file_data, site_prefix)
         
         return file_data
@@ -658,14 +707,50 @@ def process_single_file(site_url, site_prefix, list_id, item, library_title):
     except Exception as e:
         return None
 
+def process_single_file(site_url, site_prefix, list_id, item, library_title):
+    """Process a single file with timeout and skip on failure"""
+    global STATS
+    
+    try:
+        file_timeout = CONFIG['batch_settings'].get('file_timeout_seconds', 120)
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _process_single_file_internal,
+                site_url,
+                site_prefix,
+                list_id,
+                item,
+                library_title
+            )
+            try:
+                result = future.result(timeout=file_timeout)
+                return result
+            except TimeoutError:
+                with stats_lock:
+                    STATS["total_timeouts"] += 1
+                item_id = item.get('Id')
+                file_name = item.get('FileLeafRef', 'Unknown')
+                print(f"\n    ⚠️ File {file_name} (ID: {item_id}) timeout after {file_timeout}s - SKIPPING")
+                return None
+                
+    except Exception as e:
+        print(f"\n    ⚠️ Error processing file: {str(e)[:50]}")
+        return None
+
 def process_batch(batch_items, site_url, site_prefix, library_id, library_title, batch_num):
-    """Process a batch of files in parallel"""
+    """Process a batch with timeout and skip on failure"""
+    global STATS, batch_paused
+    
     print(f"\n  📦 Processing Batch {batch_num} ({len(batch_items)} files)...")
     
     results = []
-    batch_size = CONFIG['batch_settings']['max_workers']
+    max_workers = CONFIG['batch_settings']['max_workers']
     
-    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+    with stats_lock:
+        STATS["total_batches"] += 1
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 process_single_file,
@@ -679,18 +764,40 @@ def process_batch(batch_items, site_url, site_prefix, library_id, library_title,
         }
         
         processed = 0
+        start_time = time.time()
+        timeout_count = 0
+        
         for future in as_completed(futures):
             try:
-                result = future.result()
+                result = future.result(timeout=60)
                 if result:
                     results.append(result)
+                
                 processed += 1
-                if processed % 10 == 0:
-                    print(f"    Processed {processed}/{len(batch_items)} files...", end="\r")
+                if processed % 5 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"    Processed {processed}/{len(batch_items)} files in {elapsed:.1f}s (Timeouts: {timeout_count})", end="\r")
+                    
+            except TimeoutError:
+                timeout_count += 1
+                with stats_lock:
+                    STATS["total_timeouts"] += 1
+                print(f"\n    ⚠️ File timeout - continuing... (Total timeouts: {timeout_count})")
+                processed += 1
+                continue
             except Exception as e:
-                pass
+                error_msg = str(e)
+                if "429" in error_msg:
+                    print(f"\n    ⚠️ 429 detected - waiting 3s...")
+                    batch_paused.set()
+                    time.sleep(3)
+                    batch_paused.clear()
+                    continue
+                print(f"\n    ⚠️ Error: {error_msg[:50]}")
+                processed += 1
+                continue
         
-        print(f"    ✅ Completed {len(results)} files")
+        print(f"\n    ✅ Batch {batch_num} completed: {len(results)} files (Timeouts: {timeout_count})")
     
     return results
 
@@ -706,10 +813,8 @@ def process_site(site_url):
     print(f"📍 SITE: {site_url}")
     print(f"{'#'*80}")
     
-    # Initialize CSV for this site
     initialize_csv(site_prefix)
     
-    # Get libraries
     libraries = get_all_libraries(site_url)
     
     if not libraries:
@@ -746,7 +851,6 @@ def process_site(site_url):
             print("  No files found")
             continue
         
-        # Filter by extension
         valid_files = []
         for f in files:
             file_name = f.get('FileLeafRef', f"Item_{f.get('Id', 0)}")
@@ -758,7 +862,6 @@ def process_site(site_url):
         if not valid_files:
             continue
         
-        # Process in batches
         batch_size = CONFIG['batch_settings']['batch_size']
         total_batches = (len(valid_files) + batch_size - 1) // batch_size
         
@@ -777,7 +880,6 @@ def process_site(site_url):
             
             total_files_processed += len(results)
             
-            # Cleanup after each batch
             batch = None
             gc.collect()
     
@@ -833,7 +935,9 @@ def print_summary_report():
         print(f"  Savings percentage: {savings_percentage:.1f}% of version history")
     
     print(f"\n🚀 PERFORMANCE:")
-    print(f"  429 Errors encountered: {STATS['rate_limit_errors']}")
+    print(f"  Total Batches: {STATS['total_batches']}")
+    print(f"  429 Errors: {STATS['rate_limit_errors']}")
+    print(f"  Timeouts: {STATS['total_timeouts']}")
     print(f"  Retries: {STATS['retry_count']}")
     
     print("\n" + "="*80)
@@ -863,7 +967,9 @@ def save_summary_csv():
         writer.writerow(['Versions to Delete', STATS['total_versions_to_delete_count']])
         writer.writerow(['Space to Save (GB)', f"{bytes_to_gb(STATS['total_versions_to_delete_bytes']):.2f}"])
         writer.writerow(['429 Errors', STATS['rate_limit_errors']])
+        writer.writerow(['Timeouts', STATS['total_timeouts']])
         writer.writerow(['Retries', STATS['retry_count']])
+        writer.writerow(['Total Batches', STATS['total_batches']])
     
     print(f"📁 Summary saved to: {summary_file}")
 
