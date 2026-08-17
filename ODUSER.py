@@ -45,6 +45,34 @@ class SharePointTokenManager:
         self.token_expiry_time = time.time() + 2700
         print(f"  [Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
 
+class GraphTokenManager:
+    """Manages Microsoft Graph token with automatic renewal"""
+    
+    def __init__(self, certificate, private_key, tenant_name, app_id):
+        self.certificate = certificate
+        self.private_key = private_key
+        self.tenant_name = tenant_name
+        self.app_id = app_id
+        self.token = None
+        self.token_expiry_time = 0
+        self.refresh_buffer = 300
+        self.token_lock = Lock()
+    
+    def get_token(self):
+        with self.token_lock:
+            current_time = time.time()
+            if not self.token or current_time >= (self.token_expiry_time - self.refresh_buffer):
+                self._renew_token()
+            return self.token
+    
+    def _renew_token(self):
+        print(f"  [Graph Token] Renewing access token...")
+        scope = "https://graph.microsoft.com/.default"
+        jwt = get_jwt_token(self.certificate, self.private_key, self.tenant_name, self.app_id, scope)
+        self.token = get_graph_access_token(jwt, self.tenant_name, self.app_id)
+        self.token_expiry_time = time.time() + 2700
+        print(f"  [Graph Token] Token renewed, expires at {datetime.fromtimestamp(self.token_expiry_time).strftime('%H:%M:%S')}")
+
 def load_config(config_file="config.json"):
     try:
         with open(config_file, 'r') as f:
@@ -137,6 +165,24 @@ def get_access_token(jwt, tenant_name, app_id, scope):
         print(f"Error getting SharePoint access token: {err}")
         raise
 
+def get_graph_access_token(jwt, tenant_name, app_id):
+    url = f"https://login.microsoftonline.com/{tenant_name}/oauth2/v2.0/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "client_id": app_id,
+        "client_assertion": jwt,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials"
+    }
+    try:
+        response = requests.post(url, headers=headers, data=data)
+        response.raise_for_status()
+        return response.json()["access_token"]
+    except Exception as err:
+        print(f"Error getting Graph access token: {err}")
+        raise
+
 def make_sharepoint_request(token_manager, endpoint, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -171,6 +217,56 @@ def make_sharepoint_request(token_manager, endpoint, max_retries=3):
             raise
     
     raise Exception(f"Failed after {max_retries} attempts")
+
+def get_user_upn_from_graph(graph_token_manager, user_email, max_retries=3):
+    """
+    Get user UPN from Graph API using email filter
+    """
+    if not user_email:
+        return ''
+    
+    try:
+        encoded_email = requests.utils.quote(user_email)
+        endpoint = f"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{encoded_email}'&$select=userPrincipalName"
+        
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    "Authorization": f"Bearer {graph_token_manager.get_token()}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+                response = requests.get(endpoint, headers=headers, timeout=15)
+                
+                if response.status_code == 401:
+                    print(f"  [Graph Auth] Token expired, renewing... (Attempt {attempt + 1}/{max_retries})")
+                    graph_token_manager._renew_token()
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                value = data.get('value', [])
+                if value and len(value) > 0:
+                    user = value[0]
+                    return user.get('userPrincipalName', '')
+                else:
+                    return ''
+                    
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return ''
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                return ''
+        
+        return ''
+        
+    except Exception as e:
+        return ''
 
 def should_ignore_url(site_url, config):
     if not site_url:
@@ -219,8 +315,8 @@ def load_existing_report(report_file):
         print(f"Warning: Could not load report: {str(e)}")
         return {}, []
 
-def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_size=500, config=None):
-    """Get OneDrive sites with all required parameters"""
+def get_all_sites_from_list(token_manager, graph_token_manager, sharepoint_admin_url, list_id, page_size=500, max_workers=50, config=None):
+    """Get OneDrive sites with all required parameters including UPN"""
     print(f"\n{'='*60}")
     print("📁 FETCHING ONEDRIVE SITES")
     print(f"{'='*60}")
@@ -228,6 +324,7 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
     all_sites = []
     skipped_sites = 0
     ignored_sites = 0
+    upn_cache = {}  # Cache to avoid duplicate Graph API calls
     
     # Get ALL required fields: SiteId, SiteUrl, SiteOwnerName, SiteOwnerEmail, CreatedBy, CreatedByEmail
     base_endpoint = f"{sharepoint_admin_url}/_api/Web/Lists(guid'{list_id}')/items"
@@ -261,14 +358,17 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
                     continue
                 
                 if is_onedrive_site(site_url):
-                    # Get ALL required parameters
+                    # Get all required parameters
+                    site_owner_email = safe_str(item.get('SiteOwnerEmail', ''))
+                    created_by_email = safe_str(item.get('CreatedByEmail', ''))
+                    
                     site_info = {
                         'site_id': safe_str(item.get('SiteId', '')),
                         'site_url': site_url,
                         'site_owner_name': safe_str(item.get('SiteOwnerName', '')),
-                        'site_owner_email': safe_str(item.get('SiteOwnerEmail', '')),
+                        'site_owner_email': site_owner_email,
                         'created_by': safe_str(item.get('CreatedBy', '')),
-                        'created_by_email': safe_str(item.get('CreatedByEmail', '')),
+                        'created_by_email': created_by_email,
                     }
                     all_sites.append(site_info)
                 else:
@@ -283,6 +383,67 @@ def get_all_sites_from_list(token_manager, sharepoint_admin_url, list_id, page_s
     print(f"  ✅ OneDrive sites found: {len(all_sites)}")
     print(f"  ⏭️  Ignored sites (pattern match): {ignored_sites}")
     print(f"  ⏭️  Non-OneDrive sites skipped: {skipped_sites}")
+    
+    # Get UPN for each site using Graph API (with caching)
+    if all_sites:
+        print(f"\n{'='*60}")
+        print("🔍 FETCHING USER UPN FROM GRAPH API")
+        print(f"{'='*60}")
+        print(f"Processing {len(all_sites)} sites...")
+        print(f"  - Graph API permission required: User.Read.All or Directory.Read.All")
+        
+        processed = 0
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            def process_site(site):
+                site_owner_email = site.get('site_owner_email', '')
+                created_by_email = site.get('created_by_email', '')
+                
+                # Get UPN for Site Owner Email (with caching)
+                if site_owner_email:
+                    if site_owner_email not in upn_cache:
+                        upn_cache[site_owner_email] = get_user_upn_from_graph(graph_token_manager, site_owner_email)
+                    site['user_upn'] = upn_cache[site_owner_email]
+                else:
+                    site['user_upn'] = ''
+                
+                # Get UPN for Created By Email (with caching)
+                if created_by_email:
+                    if created_by_email not in upn_cache:
+                        upn_cache[created_by_email] = get_user_upn_from_graph(graph_token_manager, created_by_email)
+                    site['created_by_upn'] = upn_cache[created_by_email]
+                else:
+                    site['created_by_upn'] = ''
+                
+                return site
+            
+            futures = {
+                executor.submit(process_site, site): site
+                for site in all_sites
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    future.result(timeout=30)
+                    processed += 1
+                    if processed % 50 == 0 or processed == 1:
+                        print(f"  Progress: {processed}/{len(all_sites)}")
+                except Exception as e:
+                    print(f"  ⚠️ Error processing site: {str(e)[:100]}")
+        
+        elapsed = time.time() - start_time
+        print(f"\n✅ UPN fetching completed in {elapsed:.2f} seconds")
+        
+        # Count UPNs found
+        upn_found = sum(1 for s in all_sites if s.get('user_upn', ''))
+        created_upn_found = sum(1 for s in all_sites if s.get('created_by_upn', ''))
+        
+        print(f"\n📊 UPN Summary:")
+        print(f"  ✅ Site Owner UPN found: {upn_found}")
+        print(f"  ❌ Site Owner UPN not found: {len(all_sites) - upn_found}")
+        print(f"  ✅ Created By UPN found: {created_upn_found}")
+        print(f"  ❌ Created By UPN not found: {len(all_sites) - created_upn_found}")
     
     return all_sites
 
@@ -331,6 +492,10 @@ def update_report(current_sites, report_file, config):
             'Site Owner Email': safe_str(site.get('site_owner_email', existing_row.get('Site Owner Email', ''))),
             'Site Owner Email Change History': existing_row.get('Site Owner Email Change History', ''),
             
+            # User UPN and its history (NEW)
+            'User UPN': safe_str(site.get('user_upn', existing_row.get('User UPN', ''))),
+            'User UPN Change History': existing_row.get('User UPN Change History', ''),
+            
             # Created By (display name) and its history
             'Created By': safe_str(site.get('created_by', existing_row.get('Created By', ''))),
             'Created By Change History': existing_row.get('Created By Change History', ''),
@@ -338,6 +503,10 @@ def update_report(current_sites, report_file, config):
             # Created By Email and its history
             'Created By Email': safe_str(site.get('created_by_email', existing_row.get('Created By Email', ''))),
             'Created By Email Change History': existing_row.get('Created By Email Change History', ''),
+            
+            # Created By UPN and its history (NEW)
+            'Created By UPN': safe_str(site.get('created_by_upn', existing_row.get('Created By UPN', ''))),
+            'Created By UPN Change History': existing_row.get('Created By UPN Change History', ''),
             
             'Is Newly Added': 'Yes' if is_newly_added else 'No',
             'Last Updated': current_time
@@ -392,6 +561,21 @@ def update_report(current_sites, report_file, config):
                     'new_value': new_email
                 })
             
+            # Check User UPN change (NEW)
+            old_upn = existing_row.get('User UPN', '')
+            new_upn = row['User UPN']
+            if new_upn != old_upn:
+                old_history = existing_row.get('User UPN Change History', '')
+                change_entry = f"[{current_time}] {old_upn} >> {new_upn}"
+                row['User UPN Change History'] = f"{old_history}\n{change_entry}" if old_history else change_entry
+                changes_detected = True
+                all_changes.append({
+                    'site_id': site_id,
+                    'field': 'User UPN',
+                    'old_value': old_upn,
+                    'new_value': new_upn
+                })
+            
             # Check Created By (display name) change
             old_created = existing_row.get('Created By', '')
             new_created = row['Created By']
@@ -421,6 +605,21 @@ def update_report(current_sites, report_file, config):
                     'old_value': old_created_email,
                     'new_value': new_created_email
                 })
+            
+            # Check Created By UPN change (NEW)
+            old_created_upn = existing_row.get('Created By UPN', '')
+            new_created_upn = row['Created By UPN']
+            if new_created_upn != old_created_upn:
+                old_history = existing_row.get('Created By UPN Change History', '')
+                change_entry = f"[{current_time}] {old_created_upn} >> {new_created_upn}"
+                row['Created By UPN Change History'] = f"{old_history}\n{change_entry}" if old_history else change_entry
+                changes_detected = True
+                all_changes.append({
+                    'site_id': site_id,
+                    'field': 'Created By UPN',
+                    'old_value': old_created_upn,
+                    'new_value': new_created_upn
+                })
         
         master_data.append(row)
     
@@ -443,10 +642,14 @@ def update_report(current_sites, report_file, config):
             'Site Owner Name Change History',
             'Site Owner Email',
             'Site Owner Email Change History',
+            'User UPN',
+            'User UPN Change History',
             'Created By',
             'Created By Change History',
             'Created By Email',
             'Created By Email Change History',
+            'Created By UPN',
+            'Created By UPN Change History',
             'Is Newly Added',
             'Last Updated'
         ]
@@ -497,6 +700,7 @@ def main():
     sharepoint_admin_url = config.get('sharepoint_admin_url')
     list_id = config.get('list_id')
     page_size = config.get('page_size', 500)
+    max_workers = config.get('max_workers', 50)
     ignore_pattern = config.get('ignore_url_pattern', r'm_[A-Za-z0-9]+_[A-Za-z0-9]+')
     
     print(f"\n{'='*60}")
@@ -506,7 +710,8 @@ def main():
     print(f"🏢 Tenant: {tenant_name}")
     print(f"🔍 Ignore URL Pattern: {ignore_pattern}")
     print(f"🔑 Primary Key: Site ID (Unique)")
-    print(f"📝 Data Source: SharePoint Only")
+    print(f"📝 Data Sources: SharePoint + Graph API (for UPN)")
+    print(f"🔐 Graph Permission Required: User.Read.All or Directory.Read.All")
     
     if not sharepoint_admin_url:
         print("Error: sharepoint_admin_url is required in config.json")
@@ -520,15 +725,19 @@ def main():
         print("✅ Certificate and private key loaded successfully")
         
         sharepoint_token_manager = SharePointTokenManager(certificate, private_key, tenant_name, app_id, sharepoint_admin_url)
+        graph_token_manager = GraphTokenManager(certificate, private_key, tenant_name, app_id)
         
         sharepoint_token_manager.get_token()
-        print("✅ SharePoint token retrieved successfully")
+        graph_token_manager.get_token()
+        print("✅ SharePoint and Graph tokens retrieved successfully")
         
         onedrive_sites = get_all_sites_from_list(
             sharepoint_token_manager,
+            graph_token_manager,
             sharepoint_admin_url,
             list_id,
             page_size,
+            max_workers,
             config
         )
         
