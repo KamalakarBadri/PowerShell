@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SharePoint Site Sharing Domains Report Generator
-Uses existing JWT token to get sharing allowed domain lists for SharePoint sites
+SharePoint Site Sharing Domains Report Generator - Parallel Version
+Uses existing JWT token and multi-threading for faster processing
 """
 
 import json
@@ -10,6 +10,9 @@ import time
 import os
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import sys
 
 # ============================================================
 # ALL CONFIGURATION PARAMETERS - EDIT THESE
@@ -33,9 +36,15 @@ SITE_ID_COLUMN = "SiteId"  # Column name containing site IDs (auto-detect if Non
 # SharePoint Configuration
 SHAREPOINT_SCOPE = "https://{tenant}-admin.sharepoint.com/.default"  # Will be auto-generated
 
-# Request Configuration
+# Performance Configuration
+MAX_WORKERS = 20  # Maximum number of parallel requests (adjust based on your needs)
 REQUEST_TIMEOUT = 30  # Timeout in seconds for API requests
-DELAY_BETWEEN_REQUESTS = 0.5  # Delay in seconds between requests to avoid rate limiting
+RATE_LIMIT_DELAY = 0.1  # Delay between requests in seconds (to avoid rate limiting)
+MAX_RETRIES = 3  # Maximum retries for failed requests
+
+# Progress Display
+SHOW_PROGRESS = True  # Show progress bar
+PROGRESS_UPDATE_INTERVAL = 1  # Update progress every N seconds
 
 # ============================================================
 # TOKEN EXCHANGE FUNCTIONS
@@ -72,9 +81,9 @@ def get_access_token_from_jwt(jwt_token, tenant_name, app_id, scope):
 # SHAREPOINT API FUNCTIONS
 # ============================================================
 
-def get_site_sharing_domains(access_token, site_id, tenant_prefix):
+def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0):
     """
-    Get sharing allowed domain list for a SharePoint site
+    Get sharing allowed domain list for a SharePoint site with retry logic
     """
     url = f"https://{tenant_prefix}-admin.sharepoint.com/_api/spo.tenant/sites('{site_id}')"
     
@@ -106,6 +115,7 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix):
             
             # Also get additional info if available
             site_info = {
+                'site_id': site_id,
                 'sharing_allowed_domain_list': sharing_domains if sharing_domains else '',
                 'sharing_capability': site_data.get('SharingCapability'),
                 'site_url': site_data.get('Url', ''),
@@ -114,8 +124,24 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix):
             }
             
             return site_info
+            
+        elif response.status_code == 429:  # Rate limiting
+            if retry_count < MAX_RETRIES:
+                wait_time = (2 ** retry_count) * 2  # Exponential backoff
+                time.sleep(wait_time)
+                return get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count + 1)
+            else:
+                return {
+                    'site_id': site_id,
+                    'sharing_allowed_domain_list': '',
+                    'sharing_capability': None,
+                    'site_url': '',
+                    'site_title': '',
+                    'status': 'Failed - Rate Limited'
+                }
         else:
             return {
+                'site_id': site_id,
                 'sharing_allowed_domain_list': '',
                 'sharing_capability': None,
                 'site_url': '',
@@ -124,15 +150,21 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix):
             }
             
     except requests.exceptions.Timeout:
-        return {
-            'sharing_allowed_domain_list': '',
-            'sharing_capability': None,
-            'site_url': '',
-            'site_title': '',
-            'status': 'Failed - Timeout'
-        }
+        if retry_count < MAX_RETRIES:
+            time.sleep(2)
+            return get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count + 1)
+        else:
+            return {
+                'site_id': site_id,
+                'sharing_allowed_domain_list': '',
+                'sharing_capability': None,
+                'site_url': '',
+                'site_title': '',
+                'status': 'Failed - Timeout'
+            }
     except Exception as e:
         return {
+            'site_id': site_id,
             'sharing_allowed_domain_list': '',
             'sharing_capability': None,
             'site_url': '',
@@ -150,6 +182,69 @@ def get_sharing_capability_text(value):
         4: "Guest Sharing Only"
     }
     return mapping.get(value, f"Unknown ({value})")
+
+# ============================================================
+# PROGRESS TRACKING
+# ============================================================
+
+class ProgressTracker:
+    def __init__(self, total, show_progress=True):
+        self.total = total
+        self.completed = 0
+        self.success = 0
+        self.failed = 0
+        self.lock = Lock()
+        self.show_progress = show_progress
+        self.start_time = time.time()
+        self.last_update = 0
+        
+    def update(self, status='success'):
+        with self.lock:
+            self.completed += 1
+            if status == 'success':
+                self.success += 1
+            else:
+                self.failed += 1
+            
+            if self.show_progress:
+                current_time = time.time()
+                if current_time - self.last_update >= PROGRESS_UPDATE_INTERVAL or self.completed == self.total:
+                    self.display_progress()
+                    self.last_update = current_time
+    
+    def display_progress(self):
+        if self.total == 0:
+            return
+        
+        percentage = (self.completed / self.total) * 100
+        elapsed = time.time() - self.start_time
+        
+        # Create progress bar
+        bar_length = 30
+        filled = int(bar_length * self.completed / self.total)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        # Estimate time remaining
+        if self.completed > 0:
+            avg_time = elapsed / self.completed
+            remaining = (self.total - self.completed) * avg_time
+            eta = f"{int(remaining // 60)}m {int(remaining % 60)}s"
+        else:
+            eta = "Calculating..."
+        
+        print(f"\r⏳ Progress: [{bar}] {percentage:.1f}% | "
+              f"✅ {self.success} | ❌ {self.failed} | "
+              f"⏱️ {int(elapsed // 60)}m {int(elapsed % 60)}s | "
+              f"⏳ ETA: {eta}", end='', flush=True)
+    
+    def get_stats(self):
+        return {
+            'total': self.total,
+            'completed': self.completed,
+            'success': self.success,
+            'failed': self.failed,
+            'elapsed': time.time() - self.start_time
+        }
 
 # ============================================================
 # CSV HANDLING FUNCTIONS
@@ -319,8 +414,10 @@ def validate_config():
 
 def main():
     print("\n" + "="*70)
-    print("🔐 SHAREPOINT SITE SHARING DOMAINS RETRIEVER")
+    print("🔐 SHAREPOINT SITE SHARING DOMAINS RETRIEVER - PARALLEL VERSION")
     print("="*70)
+    print(f"⚡ Parallel Workers: {MAX_WORKERS}")
+    print(f"🔄 Max Retries: {MAX_RETRIES}")
     
     # Validate configuration
     print("\n📋 Validating configuration...")
@@ -342,7 +439,6 @@ def main():
     print(f"   Tenant: {TENANT_NAME}")
     print(f"   App ID: {APP_ID}")
     print(f"   Scope: {sharepoint_scope}")
-    print(f"   JWT Token: {JWT_TOKEN[:50]}...")
     
     access_token = get_access_token_from_jwt(
         JWT_TOKEN,
@@ -369,40 +465,58 @@ def main():
         return
     
     site_id_column = detected_column or SITE_ID_COLUMN
+    total_sites = len(site_ids)
     
-    # Step 3: Get sharing domains for each site
-    print(f"\n🔍 Fetching sharing allowed domain lists for {len(site_ids)} sites...")
+    # Step 3: Process sites in parallel
+    print(f"\n🚀 Processing {total_sites} sites in parallel...")
     print("-" * 70)
     
     site_data_map = {}
-    success_count = 0
+    progress = ProgressTracker(total_sites, SHOW_PROGRESS)
     
-    for idx, site_id in enumerate(site_ids, 1):
-        print(f"  [{idx}/{len(site_ids)}] Processing site: {site_id[:30]}...")
+    # Create a thread pool
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_site = {
+            executor.submit(get_site_sharing_domains, access_token, site_id, tenant_prefix): site_id
+            for site_id in site_ids
+        }
         
-        site_data = get_site_sharing_domains(access_token, site_id, tenant_prefix)
-        site_data_map[site_id] = site_data
-        
-        if site_data['status'] == 'Success':
-            success_count += 1
-            sharing_domains = site_data.get('sharing_allowed_domain_list', '')
-            if sharing_domains:
-                print(f"    ✅ Domains: {sharing_domains[:50]}")
-            else:
-                print(f"    ℹ️ No domain restrictions")
-        else:
-            print(f"    ❌ {site_data['status']}")
-        
-        # Add delay between requests
-        if idx < len(site_ids):
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+        # Process completed tasks
+        for future in as_completed(future_to_site):
+            site_id = future_to_site[future]
+            try:
+                result = future.result(timeout=REQUEST_TIMEOUT + 10)
+                site_data_map[site_id] = result
+                
+                # Update progress
+                if result['status'] == 'Success':
+                    progress.update('success')
+                else:
+                    progress.update('failed')
+                    
+            except Exception as e:
+                site_data_map[site_id] = {
+                    'site_id': site_id,
+                    'sharing_allowed_domain_list': '',
+                    'sharing_capability': None,
+                    'site_url': '',
+                    'site_title': '',
+                    'status': f'Failed - Exception: {str(e)}'
+                }
+                progress.update('failed')
+    
+    # Final progress display
+    print("\n")
     
     # Step 4: Summary
+    stats = progress.get_stats()
     print("\n" + "="*70)
     print("📊 SUMMARY:")
-    print(f"  ✅ Successful: {success_count}")
-    print(f"  ❌ Failed: {len(site_ids) - success_count}")
-    print(f"  📊 Total: {len(site_ids)}")
+    print(f"  ✅ Successful: {stats['success']}")
+    print(f"  ❌ Failed: {stats['failed']}")
+    print(f"  📊 Total: {stats['total']}")
+    print(f"  ⏱️ Time taken: {int(stats['elapsed'] // 60)}m {int(stats['elapsed'] % 60)}s")
     
     # Step 5: Generate output files
     print("\n💾 Generating output files...")
@@ -425,9 +539,12 @@ def main():
     print("📊 SAMPLE RESULTS (First 5 sites):")
     print("="*70)
     
-    for i, site_id in enumerate(site_ids[:5], 1):
-        data = site_data_map.get(site_id, {})
-        print(f"\n{i}. Site ID: {site_id[:40]}...")
+    # Get successful results for sample
+    successful_results = [site_data_map.get(sid) for sid in site_ids[:10] 
+                          if site_data_map.get(sid, {}).get('status') == 'Success']
+    
+    for i, data in enumerate(successful_results[:5], 1):
+        print(f"\n{i}. Site ID: {data['site_id'][:40]}...")
         sharing_domains = data.get('sharing_allowed_domain_list', '')
         if sharing_domains:
             print(f"   Sharing Allowed Domains: {sharing_domains}")
@@ -437,8 +554,18 @@ def main():
         print(f"   Site URL: {data.get('site_url', 'N/A')}")
         print(f"   Status: {data.get('status', 'Unknown')}")
     
-    if len(site_ids) > 5:
-        print(f"\n... and {len(site_ids) - 5} more sites (see output files)")
+    if len(successful_results) > 5:
+        print(f"\n... and {len(successful_results) - 5} more successful results (see output files)")
+    
+    # Show failed sites if any
+    failed_results = [site_data_map.get(sid) for sid in site_ids 
+                      if site_data_map.get(sid, {}).get('status') != 'Success']
+    if failed_results:
+        print(f"\n❌ Failed Sites ({len(failed_results)}):")
+        for data in failed_results[:5]:
+            print(f"   - {data['site_id'][:40]}... ({data.get('status', 'Unknown')})")
+        if len(failed_results) > 5:
+            print(f"   ... and {len(failed_results) - 5} more failures")
     
     print("\n" + "="*70)
     print("✅ PROCESS COMPLETE!")
@@ -457,5 +584,9 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\n⏹️ Process interrupted by user")
+        sys.exit(0)
     except Exception as e:
         print(f"\n❌ Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
