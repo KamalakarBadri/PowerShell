@@ -2,6 +2,7 @@
 """
 SharePoint Site Sharing Domains Report Generator - Parallel Version
 Uses existing JWT token and multi-threading for faster processing
+Includes SharingDomainRestrictionMode
 """
 
 import json
@@ -39,7 +40,6 @@ SHAREPOINT_SCOPE = "https://{tenant}-admin.sharepoint.com/.default"  # Will be a
 # Performance Configuration
 MAX_WORKERS = 20  # Maximum number of parallel requests (adjust based on your needs)
 REQUEST_TIMEOUT = 30  # Timeout in seconds for API requests
-RATE_LIMIT_DELAY = 0.1  # Delay between requests in seconds (to avoid rate limiting)
 MAX_RETRIES = 3  # Maximum retries for failed requests
 
 # Progress Display
@@ -83,7 +83,7 @@ def get_access_token_from_jwt(jwt_token, tenant_name, app_id, scope):
 
 def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0):
     """
-    Get sharing allowed domain list for a SharePoint site with retry logic
+    Get sharing allowed domain list and restriction mode for a SharePoint site
     """
     url = f"https://{tenant_prefix}-admin.sharepoint.com/_api/spo.tenant/sites('{site_id}')"
     
@@ -98,25 +98,26 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0
         if response.status_code == 200:
             data = response.json()
             
-            # Extract sharing allowed domain list
-            sharing_domains = None
-            
-            # Try different possible locations of the property
+            # Extract data
             if 'd' in data:
                 site_data = data['d']
             else:
                 site_data = data
             
-            # Look for sharingalloweddomainlist
-            if 'SharingAllowedDomainList' in site_data:
-                sharing_domains = site_data['SharingAllowedDomainList']
-            elif 'sharingalloweddomainlist' in site_data:
-                sharing_domains = site_data['sharingalloweddomainlist']
+            # Get sharing allowed domain list
+            sharing_domains = site_data.get('SharingAllowedDomainList', '')
             
-            # Also get additional info if available
+            # Get sharing domain restriction mode
+            # 0 = Not limit sharing by domain (allow all domains)
+            # 1 = Limit sharing by domain (only allowed domains)
+            restriction_mode = site_data.get('SharingDomainRestrictionMode', 0)
+            
+            # Get additional info
             site_info = {
                 'site_id': site_id,
                 'sharing_allowed_domain_list': sharing_domains if sharing_domains else '',
+                'sharing_domain_restriction_mode': restriction_mode,
+                'sharing_domain_restriction_mode_text': get_restriction_mode_text(restriction_mode),
                 'sharing_capability': site_data.get('SharingCapability'),
                 'site_url': site_data.get('Url', ''),
                 'site_title': site_data.get('Title', ''),
@@ -134,6 +135,8 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0
                 return {
                     'site_id': site_id,
                     'sharing_allowed_domain_list': '',
+                    'sharing_domain_restriction_mode': None,
+                    'sharing_domain_restriction_mode_text': 'N/A',
                     'sharing_capability': None,
                     'site_url': '',
                     'site_title': '',
@@ -143,6 +146,8 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0
             return {
                 'site_id': site_id,
                 'sharing_allowed_domain_list': '',
+                'sharing_domain_restriction_mode': None,
+                'sharing_domain_restriction_mode_text': 'N/A',
                 'sharing_capability': None,
                 'site_url': '',
                 'site_title': '',
@@ -157,6 +162,8 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0
             return {
                 'site_id': site_id,
                 'sharing_allowed_domain_list': '',
+                'sharing_domain_restriction_mode': None,
+                'sharing_domain_restriction_mode_text': 'N/A',
                 'sharing_capability': None,
                 'site_url': '',
                 'site_title': '',
@@ -166,11 +173,25 @@ def get_site_sharing_domains(access_token, site_id, tenant_prefix, retry_count=0
         return {
             'site_id': site_id,
             'sharing_allowed_domain_list': '',
+            'sharing_domain_restriction_mode': None,
+            'sharing_domain_restriction_mode_text': 'N/A',
             'sharing_capability': None,
             'site_url': '',
             'site_title': '',
             'status': f'Failed - {str(e)}'
         }
+
+def get_restriction_mode_text(value):
+    """
+    Convert SharingDomainRestrictionMode numeric value to text
+    0 = Not restricted (allow all domains)
+    1 = Restricted (only allowed domains)
+    """
+    mapping = {
+        0: "Not Restricted (Allow All Domains)",
+        1: "Restricted (Limit to Allowed Domains)"
+    }
+    return mapping.get(value, f"Unknown ({value})")
 
 def get_sharing_capability_text(value):
     """Convert numeric sharing capability to text"""
@@ -305,12 +326,14 @@ def read_site_ids_from_csv(csv_file_path, site_id_column=None):
 
 def update_csv_with_sharing_domains(input_csv_path, output_csv_path, rows, fieldnames, site_id_column, site_data_map):
     """
-    Update CSV file with sharing allowed domain list
+    Update CSV file with sharing allowed domain list and restriction mode
     """
     try:
         # Add new columns if they don't exist
         new_columns = [
             'sharing_allowed_domain_list',
+            'sharing_domain_restriction_mode',
+            'sharing_domain_restriction_mode_text',
             'sharing_capability',
             'sharing_capability_text',
             'site_url'
@@ -326,11 +349,15 @@ def update_csv_with_sharing_domains(input_csv_path, output_csv_path, rows, field
             if site_id in site_data_map:
                 data = site_data_map[site_id]
                 row['sharing_allowed_domain_list'] = data.get('sharing_allowed_domain_list', '')
+                row['sharing_domain_restriction_mode'] = data.get('sharing_domain_restriction_mode', '')
+                row['sharing_domain_restriction_mode_text'] = data.get('sharing_domain_restriction_mode_text', '')
                 row['sharing_capability'] = data.get('sharing_capability', '')
                 row['sharing_capability_text'] = get_sharing_capability_text(data.get('sharing_capability'))
                 row['site_url'] = data.get('site_url', '')
             else:
                 row['sharing_allowed_domain_list'] = ''
+                row['sharing_domain_restriction_mode'] = ''
+                row['sharing_domain_restriction_mode_text'] = ''
                 row['sharing_capability'] = ''
                 row['sharing_capability_text'] = ''
                 row['site_url'] = ''
@@ -356,6 +383,8 @@ def generate_report(report_csv_path, site_data_map, site_ids):
             fieldnames = [
                 'site_id',
                 'sharing_allowed_domain_list',
+                'sharing_domain_restriction_mode',
+                'sharing_domain_restriction_mode_text',
                 'sharing_capability',
                 'sharing_capability_text',
                 'site_url',
@@ -370,6 +399,8 @@ def generate_report(report_csv_path, site_data_map, site_ids):
                 writer.writerow({
                     'site_id': site_id,
                     'sharing_allowed_domain_list': data.get('sharing_allowed_domain_list', ''),
+                    'sharing_domain_restriction_mode': data.get('sharing_domain_restriction_mode', ''),
+                    'sharing_domain_restriction_mode_text': data.get('sharing_domain_restriction_mode_text', ''),
                     'sharing_capability': data.get('sharing_capability', ''),
                     'sharing_capability_text': get_sharing_capability_text(data.get('sharing_capability')),
                     'site_url': data.get('site_url', ''),
@@ -499,6 +530,8 @@ def main():
                 site_data_map[site_id] = {
                     'site_id': site_id,
                     'sharing_allowed_domain_list': '',
+                    'sharing_domain_restriction_mode': None,
+                    'sharing_domain_restriction_mode_text': 'N/A',
                     'sharing_capability': None,
                     'site_url': '',
                     'site_title': '',
@@ -550,6 +583,13 @@ def main():
             print(f"   Sharing Allowed Domains: {sharing_domains}")
         else:
             print(f"   Sharing Allowed Domains: (None or not set)")
+        
+        restriction_mode = data.get('sharing_domain_restriction_mode')
+        if restriction_mode is not None:
+            print(f"   Restriction Mode: {restriction_mode} - {data.get('sharing_domain_restriction_mode_text', '')}")
+        else:
+            print(f"   Restriction Mode: Not available")
+        
         print(f"   Sharing Capability: {get_sharing_capability_text(data.get('sharing_capability'))}")
         print(f"   Site URL: {data.get('site_url', 'N/A')}")
         print(f"   Status: {data.get('status', 'Unknown')}")
@@ -566,6 +606,33 @@ def main():
             print(f"   - {data['site_id'][:40]}... ({data.get('status', 'Unknown')})")
         if len(failed_results) > 5:
             print(f"   ... and {len(failed_results) - 5} more failures")
+    
+    # Step 7: Additional statistics about restriction modes
+    print("\n" + "="*70)
+    print("📊 RESTRICTION MODE STATISTICS:")
+    print("="*70)
+    
+    restriction_stats = {
+        'not_restricted': 0,  # Mode 0
+        'restricted': 0,       # Mode 1
+        'unknown': 0
+    }
+    
+    for site_id in site_ids:
+        data = site_data_map.get(site_id, {})
+        if data.get('status') == 'Success':
+            mode = data.get('sharing_domain_restriction_mode')
+            if mode == 0:
+                restriction_stats['not_restricted'] += 1
+            elif mode == 1:
+                restriction_stats['restricted'] += 1
+            else:
+                restriction_stats['unknown'] += 1
+    
+    print(f"  🔓 Not Restricted (Allow All Domains): {restriction_stats['not_restricted']}")
+    print(f"  🔒 Restricted (Limit to Allowed Domains): {restriction_stats['restricted']}")
+    if restriction_stats['unknown'] > 0:
+        print(f"  ❓ Unknown: {restriction_stats['unknown']}")
     
     print("\n" + "="*70)
     print("✅ PROCESS COMPLETE!")
