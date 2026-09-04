@@ -281,7 +281,6 @@ def filter_libraries(libraries):
 
 def get_list_items(site_url, list_id, access_token):
     """Get all items from a list with pagination"""
-    # Simple endpoint without Author/Editor expand
     items_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items?$expand=File,Folder"
     all_items = []
     next_url = items_url
@@ -302,10 +301,7 @@ def get_list_items(site_url, list_id, access_token):
     return all_items
 
 def get_file_details_from_versions(site_url, list_id, item_id, access_token):
-    """
-    Get file details (Created By, Modified By, Size) from versions endpoint
-    Returns the latest version details
-    """
+    """Get file details from versions endpoint"""
     try:
         versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions?$top=1&$orderby=Created desc"
         
@@ -317,10 +313,8 @@ def get_file_details_from_versions(site_url, list_id, item_id, access_token):
         if 'results' not in response['d'] or len(response['d']['results']) == 0:
             return None
         
-        # Get the latest version
         latest_version = response['d']['results'][0]
         
-        # Extract details from versions response
         details = {
             'created_by': 'N/A',
             'modified_by': 'N/A',
@@ -328,18 +322,14 @@ def get_file_details_from_versions(site_url, list_id, item_id, access_token):
             'file_size_mb': 0.00
         }
         
-        # ✅ Get Created By from versions response
         if 'Author' in latest_version and latest_version['Author']:
             details['created_by'] = latest_version['Author'].get('LookupValue', 'N/A')
         
-        # ✅ Get Modified By from versions response
         if 'Editor' in latest_version and latest_version['Editor']:
             details['modified_by'] = latest_version['Editor'].get('LookupValue', 'N/A')
         
-        # ✅ Get File Size from versions response
         file_size = latest_version.get('File_x005f_x0020_x005f_Size', 0)
         if not file_size:
-            # Fallback: try other fields
             file_size = latest_version.get('SMTotalFileStreamSize', 0)
         
         details['file_size'] = safe_int_conversion(file_size)
@@ -350,7 +340,25 @@ def get_file_details_from_versions(site_url, list_id, item_id, access_token):
     except Exception as e:
         return None
 
-def process_item(site_url, list_id, item, access_token):
+def get_file_versions_count(site_url, list_id, item_id, access_token):
+    """Get version count for a specific file item"""
+    try:
+        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
+        
+        response = make_sharepoint_request(versions_url, access_token)
+        
+        if not response or 'd' not in response:
+            return 0
+        
+        if 'results' not in response['d']:
+            return 0
+        
+        return len(response['d']['results'])
+        
+    except Exception as e:
+        return 0
+
+def process_item(site_url, list_id, item, access_token, item_index, total_items):
     """Extract relevant details from an item using versions endpoint"""
     item_type = item.get('FileSystemObjectType', 0)
     item_id = item.get('Id', 0)
@@ -370,7 +378,6 @@ def process_item(site_url, list_id, item, access_token):
     }
     
     if item_type == 0:  # File
-        # Get file name and path
         if 'File' in item and item['File']:
             file = item['File']
             details['Name'] = file.get('Name', '')
@@ -379,7 +386,6 @@ def process_item(site_url, list_id, item, access_token):
             details['Name'] = item.get('FileLeafRef', '')
             details['Path'] = item.get('FileRef', '')
         
-        # ✅ Get Created By, Modified By, and File Size from versions endpoint
         version_details = get_file_details_from_versions(site_url, list_id, item_id, access_token)
         
         if version_details:
@@ -388,7 +394,6 @@ def process_item(site_url, list_id, item, access_token):
             details['Size'] = version_details.get('file_size', 0)
             details['Size_MB'] = version_details.get('file_size_mb', 0.00)
         
-        # ✅ Get version count
         details['Version_Count'] = get_file_versions_count(site_url, list_id, item_id, access_token)
         
     else:  # Folder
@@ -401,24 +406,6 @@ def process_item(site_url, list_id, item, access_token):
             details['Path'] = item.get('FileRef', '')
     
     return details
-
-def get_file_versions_count(site_url, list_id, item_id, access_token):
-    """Get version count for a specific file item"""
-    try:
-        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
-        
-        response = make_sharepoint_request(versions_url, access_token)
-        
-        if not response or 'd' not in response:
-            return 0
-        
-        if 'results' not in response['d']:
-            return 0
-        
-        return len(response['d']['results'])
-        
-    except Exception as e:
-        return 0
 
 # ============================================================
 # MAIN FUNCTION
@@ -471,6 +458,7 @@ def main():
         print(f"  - {lib['Title']}")
     
     print(f"\n📊 Generating report...")
+    print("="*80)
     
     with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = [
@@ -486,6 +474,7 @@ def main():
         total_folders = 0
         total_versions = 0
         processed_libraries = 0
+        grand_total_items = 0
         
         for library in libraries:
             library_title = library['Title']
@@ -501,14 +490,25 @@ def main():
                 print("  No items found in this library")
                 continue
             
-            print(f"  Total items: {len(items)}")
+            total_items_in_library = len(items)
+            print(f"  Total items in library: {total_items_in_library}")
+            print(f"  Processing items...")
+            
             library_files = 0
             library_folders = 0
             library_versions = 0
+            processed_count = 0
             
             for item in items:
+                processed_count += 1
+                grand_total_items += 1
+                
+                # ✅ Show progress for every item
+                progress_percent = (processed_count / total_items_in_library) * 100
+                print(f"\r  [{processed_count}/{total_items_in_library}] ({progress_percent:.1f}%) Processing item ID: {item.get('Id', 'N/A')}...", end="")
+                
                 try:
-                    details = process_item(SHAREPOINT_SITE, library_id, item, access_token)
+                    details = process_item(SHAREPOINT_SITE, library_id, item, access_token, processed_count, total_items_in_library)
                     details['Library'] = library_title
                     
                     row = {
@@ -534,14 +534,17 @@ def main():
                         library_folders += 1
                     
                 except Exception as e:
-                    print(f"  ❌ Error processing item {item.get('Id', 'unknown')}: {str(e)}")
+                    print(f"\n  ❌ Error processing item {item.get('Id', 'unknown')}: {str(e)}")
             
             total_files += library_files
             total_folders += library_folders
             total_versions += library_versions
             
-            print(f"  ✅ Library complete: {library_files} files, {library_folders} folders, {library_versions} versions")
+            # ✅ Show library completion summary
+            print(f"\n  ✅ Library complete: {library_files} files, {library_folders} folders, {library_versions} versions")
+            print(f"  📊 Grand Total Items Processed: {grand_total_items}")
     
+    # ✅ Final summary
     print("\n" + "="*80)
     print("📊 REPORT GENERATED SUCCESSFULLY")
     print("="*80)
