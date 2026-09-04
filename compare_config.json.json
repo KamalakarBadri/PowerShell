@@ -1,0 +1,32 @@
+{
+  "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+  "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+  "scope": "https://geekbyteonline.sharepoint.com/.default",
+  "certificate_path": "certificate.pem",
+  "private_key_path": "private_key.pem",
+  
+  "source": {
+    "site_url": "https://geekbyteonline.sharepoint.com/sites/SourceSite",
+    "library_name": "Documents"
+  },
+  
+  "destination": {
+    "site_url": "https://geekbyteonline.sharepoint.com/sites/DestinationSite",
+    "library_name": "Documents"
+  },
+  
+  "comparison_settings": {
+    "compare_by": "name", 
+    "include_subfolders": true,
+    "check_versions": true,
+    "check_modified_date": true,
+    "check_file_size": true,
+    "verbose_logging": true
+  },
+  
+  "output": {
+    "output_dir": "comparison_reports",
+    "summary_file": "migration_comparison_summary.csv",
+    "detailed_file": "migration_comparison_details.csv"
+  }
+}
