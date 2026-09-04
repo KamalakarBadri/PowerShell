@@ -227,6 +227,31 @@ def make_sharepoint_request(url, access_token, method='GET', headers=None, max_r
     return None
 
 # ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def safe_int_conversion(value):
+    """Safely convert value to integer"""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r'[^\d.]', '', value)
+        try:
+            return int(float(cleaned)) if cleaned else 0
+        except ValueError:
+            return 0
+    return 0
+
+def bytes_to_mb(bytes_value):
+    """Convert bytes to MB"""
+    bytes_value = safe_int_conversion(bytes_value)
+    if bytes_value == 0:
+        return 0.00
+    return round(bytes_value / (1024 * 1024), 2)
+
+# ============================================================
 # SHAREPOINT DATA RETRIEVAL
 # ============================================================
 
@@ -256,7 +281,7 @@ def filter_libraries(libraries):
 
 def get_list_items(site_url, list_id, access_token):
     """Get all items from a list with pagination"""
-    # ✅ Simple working endpoint - using File and Folder expansion
+    # Simple endpoint without Author/Editor expand
     items_url = f"{site_url}/_api/web/lists(guid'{list_id}')/items?$expand=File,Folder"
     all_items = []
     next_url = items_url
@@ -276,6 +301,107 @@ def get_list_items(site_url, list_id, access_token):
             
     return all_items
 
+def get_file_details_from_versions(site_url, list_id, item_id, access_token):
+    """
+    Get file details (Created By, Modified By, Size) from versions endpoint
+    Returns the latest version details
+    """
+    try:
+        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions?$top=1&$orderby=Created desc"
+        
+        response = make_sharepoint_request(versions_url, access_token)
+        
+        if not response or 'd' not in response:
+            return None
+        
+        if 'results' not in response['d'] or len(response['d']['results']) == 0:
+            return None
+        
+        # Get the latest version
+        latest_version = response['d']['results'][0]
+        
+        # Extract details from versions response
+        details = {
+            'created_by': 'N/A',
+            'modified_by': 'N/A',
+            'file_size': 0,
+            'file_size_mb': 0.00
+        }
+        
+        # ✅ Get Created By from versions response
+        if 'Author' in latest_version and latest_version['Author']:
+            details['created_by'] = latest_version['Author'].get('LookupValue', 'N/A')
+        
+        # ✅ Get Modified By from versions response
+        if 'Editor' in latest_version and latest_version['Editor']:
+            details['modified_by'] = latest_version['Editor'].get('LookupValue', 'N/A')
+        
+        # ✅ Get File Size from versions response
+        file_size = latest_version.get('File_x005f_x0020_x005f_Size', 0)
+        if not file_size:
+            # Fallback: try other fields
+            file_size = latest_version.get('SMTotalFileStreamSize', 0)
+        
+        details['file_size'] = safe_int_conversion(file_size)
+        details['file_size_mb'] = bytes_to_mb(details['file_size'])
+        
+        return details
+        
+    except Exception as e:
+        return None
+
+def process_item(site_url, list_id, item, access_token):
+    """Extract relevant details from an item using versions endpoint"""
+    item_type = item.get('FileSystemObjectType', 0)
+    item_id = item.get('Id', 0)
+    
+    details = {
+        'Type': 'File' if item_type == 0 else 'Folder',
+        'ID': item_id,
+        'Name': '',
+        'Path': '',
+        'Size': 0,
+        'Size_MB': 0.00,
+        'Created': item.get('Created', 'N/A'),
+        'Modified': item.get('Modified', 'N/A'),
+        'Author': 'N/A',
+        'Editor': 'N/A',
+        'Version_Count': 0
+    }
+    
+    if item_type == 0:  # File
+        # Get file name and path
+        if 'File' in item and item['File']:
+            file = item['File']
+            details['Name'] = file.get('Name', '')
+            details['Path'] = file.get('ServerRelativeUrl', '')
+        else:
+            details['Name'] = item.get('FileLeafRef', '')
+            details['Path'] = item.get('FileRef', '')
+        
+        # ✅ Get Created By, Modified By, and File Size from versions endpoint
+        version_details = get_file_details_from_versions(site_url, list_id, item_id, access_token)
+        
+        if version_details:
+            details['Author'] = version_details.get('created_by', 'N/A')
+            details['Editor'] = version_details.get('modified_by', 'N/A')
+            details['Size'] = version_details.get('file_size', 0)
+            details['Size_MB'] = version_details.get('file_size_mb', 0.00)
+        
+        # ✅ Get version count
+        details['Version_Count'] = get_file_versions_count(site_url, list_id, item_id, access_token)
+        
+    else:  # Folder
+        if 'Folder' in item and item['Folder']:
+            folder = item['Folder']
+            details['Name'] = folder.get('Name', '')
+            details['Path'] = folder.get('ServerRelativeUrl', '')
+        else:
+            details['Name'] = item.get('FileLeafRef', '')
+            details['Path'] = item.get('FileRef', '')
+    
+    return details
+
 def get_file_versions_count(site_url, list_id, item_id, access_token):
     """Get version count for a specific file item"""
     try:
@@ -294,63 +420,6 @@ def get_file_versions_count(site_url, list_id, item_id, access_token):
     except Exception as e:
         return 0
 
-def process_item(site_url, list_id, item, access_token):
-    """Extract relevant details from an item with version count"""
-    item_type = item.get('FileSystemObjectType', 0)
-    
-    details = {
-        'Type': 'File' if item_type == 0 else 'Folder',
-        'ID': item.get('Id', 0),
-        'Name': '',
-        'Path': '',
-        'Size': 'N/A',
-        'Size_MB': 'N/A',
-        'Created': item.get('Created', 'N/A'),
-        'Modified': item.get('Modified', 'N/A'),
-        'Author': 'N/A',
-        'Editor': 'N/A',
-        'Version_Count': 0
-    }
-    
-    # Get Author and Editor from item (if available)
-    if 'Author' in item and item['Author']:
-        details['Author'] = item['Author'].get('Title', 'N/A')
-    
-    if 'Editor' in item and item['Editor']:
-        details['Editor'] = item['Editor'].get('Title', 'N/A')
-    
-    if item_type == 0:  # File
-        if 'File' in item and item['File']:
-            file = item['File']
-            details['Name'] = file.get('Name', '')
-            details['Path'] = file.get('ServerRelativeUrl', '')
-            size = file.get('Length', 0)
-            details['Size'] = size
-            if size and size != 'N/A':
-                details['Size_MB'] = round(size / (1024 * 1024), 2)
-        else:
-            # Fallback: use direct fields
-            details['Name'] = item.get('FileLeafRef', '')
-            details['Path'] = item.get('FileRef', '')
-            size = item.get('File_x005f_x0020_x005f_Size', 0)
-            details['Size'] = size
-            if size and size != 'N/A':
-                details['Size_MB'] = round(size / (1024 * 1024), 2)
-        
-        # Get version count for files
-        details['Version_Count'] = get_file_versions_count(site_url, list_id, details['ID'], access_token)
-        
-    else:  # Folder
-        if 'Folder' in item and item['Folder']:
-            folder = item['Folder']
-            details['Name'] = folder.get('Name', '')
-            details['Path'] = folder.get('ServerRelativeUrl', '')
-        else:
-            details['Name'] = item.get('FileLeafRef', '')
-            details['Path'] = item.get('FileRef', '')
-    
-    return details
-
 # ============================================================
 # MAIN FUNCTION
 # ============================================================
@@ -358,7 +427,7 @@ def process_item(site_url, list_id, item, access_token):
 def main():
     print("="*80)
     print("📊 SHAREPOINT LIBRARY INVENTORY REPORT")
-    print("Generate detailed report with version counts")
+    print("(Uses Versions endpoint for Created By, Modified By, File Size)")
     print("="*80)
     
     print(f"\n📍 Site: {SHAREPOINT_SITE}")
@@ -408,7 +477,7 @@ def main():
             'Library', 'Type', 'ID', 'Name', 'Path', 
             'Size (Bytes)', 'Size (MB)', 
             'Created', 'Modified',
-            'Author', 'Editor', 'Version Count'
+            'Author (Created By)', 'Editor (Modified By)', 'Version Count'
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -449,11 +518,11 @@ def main():
                         'Name': details['Name'],
                         'Path': details['Path'],
                         'Size (Bytes)': details['Size'],
-                        'Size (MB)': details['Size_MB'],
+                        'Size (MB)': f"{details['Size_MB']:.2f}",
                         'Created': details['Created'],
                         'Modified': details['Modified'],
-                        'Author': details['Author'],
-                        'Editor': details['Editor'],
+                        'Author (Created By)': details['Author'],
+                        'Editor (Modified By)': details['Editor'],
                         'Version Count': details['Version_Count']
                     }
                     writer.writerow(row)
