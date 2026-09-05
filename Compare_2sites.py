@@ -18,18 +18,40 @@ from cryptography.hazmat.backends import default_backend
 import urllib.parse
 
 # ============================================================
-# CONFIGURATION - TRACEBACK ON/OFF
+# CONFIGURATION
 # ============================================================
 
-SHOW_TRACEBACK = False  # Set to True for debugging, False for clean output
+SHOW_TRACEBACK = False  # Set to True for debugging
 
 def log_error(message, error=None):
     """Log error with optional traceback"""
-    print(f"  ❌ {message}")
+    print(f"  [ERROR] {message}")
     if SHOW_TRACEBACK and error:
         print("  " + "-"*60)
         traceback.print_exc()
         print("  " + "-"*60)
+
+def print_success(message):
+    print(f"[OK] {message}")
+
+def print_error(message):
+    print(f"[ERROR] {message}")
+
+def print_warning(message):
+    print(f"[WARNING] {message}")
+
+def print_info(message):
+    print(f"[INFO] {message}")
+
+def print_header(message):
+    print(f"\n{'='*80}")
+    print(f" {message}")
+    print(f"{'='*80}")
+
+def print_subheader(message):
+    print(f"\n{'-'*80}")
+    print(f" {message}")
+    print(f"{'-'*80}")
 
 # ============================================================
 # LOAD CONFIGURATION
@@ -40,14 +62,14 @@ def load_config():
     config_file = "compare_config.json"
     
     if not os.path.exists(config_file):
-        print(f"❌ Config file '{config_file}' not found!")
-        print("📌 Please create compare_config.json file")
+        print_error(f"Config file '{config_file}' not found!")
+        print_info("Please create compare_config.json file")
         sys.exit(1)
     
     with open(config_file, 'r') as f:
         config = json.load(f)
     
-    print(f"✅ Configuration loaded from {config_file}")
+    print_success(f"Configuration loaded from {config_file}")
     return config
 
 CONFIG = load_config()
@@ -111,15 +133,15 @@ def update_progress(file_name, library_name):
             remaining = (PROGRESS['total_items'] - PROGRESS['processed_items']) / items_per_sec if items_per_sec > 0 else 0
             
             progress_pct = (PROGRESS['processed_items'] / PROGRESS['total_items']) * 100 if PROGRESS['total_items'] > 0 else 0
-            print(f"\r  📊 Progress: {PROGRESS['processed_items']}/{PROGRESS['total_items']} ({progress_pct:.1f}%) | "
+            print(f"\r  [PROGRESS] {PROGRESS['processed_items']}/{PROGRESS['total_items']} ({progress_pct:.1f}%) | "
                   f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
                   f"Current: {file_name[:30]}...", end="", flush=True)
 
 def print_progress_summary():
     """Print final progress summary"""
     elapsed = time.time() - PROGRESS['start_time']
-    print(f"\n\n  ✅ Processing complete in {elapsed:.1f} seconds")
-    print(f"  📊 Processed {PROGRESS['processed_items']} items")
+    print(f"\n\n  [OK] Processing complete in {elapsed:.1f} seconds")
+    print(f"  [INFO] Processed {PROGRESS['processed_items']} items")
 
 # ============================================================
 # AUTHENTICATION FUNCTIONS
@@ -183,7 +205,7 @@ def get_jwt_token(certificate, private_key, tenant_id, app_id):
         raise
 
 def get_access_token(jwt, tenant_id, app_id, scope):
-    print("  🔑 Getting access token...")
+    print("  [KEY] Getting access token...")
     url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -200,7 +222,7 @@ def get_access_token(jwt, tenant_id, app_id, scope):
         response = requests.post(url, headers=headers, data=data, timeout=120)
         response.raise_for_status()
         result = response.json()
-        print("  ✅ Token obtained")
+        print_success("Token obtained")
         return result["access_token"]
     except Exception as e:
         log_error(f"Error getting token: {str(e)}", e)
@@ -252,12 +274,12 @@ def make_sharepoint_request(site_url, url, max_retries=5):
             
             if response.status_code == 429:
                 wait_time = 3 * (attempt + 1)
-                print(f"\n    ⚠️ 429: Waiting {wait_time}s...")
+                print(f"\n    [WARNING] 429: Waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             
             if response.status_code == 401 and attempt < max_retries:
-                print(f"\n    ⚠️ Token expired, refreshing...")
+                print(f"\n    [WARNING] Token expired, refreshing...")
                 TOKEN_CACHE[site_url]["token"] = None
                 TOKEN_CACHE[site_url]["expires"] = 0
                 continue
@@ -303,7 +325,6 @@ def safe_int_conversion(value):
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str):
-        # Remove non-numeric characters except decimal point
         cleaned = re.sub(r'[^\d.]', '', value)
         try:
             return int(float(cleaned)) if cleaned else 0
@@ -328,13 +349,11 @@ def format_datetime(datetime_str):
         return "N/A"
     try:
         if 'T' in datetime_str:
-            # Handle different formats
             if '.' in datetime_str and 'Z' in datetime_str:
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ")
             elif 'Z' in datetime_str:
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
             else:
-                # Handle format without Z: "2026-06-26T05:50:41"
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S")
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         return datetime_str
@@ -357,57 +376,49 @@ def get_file_extension(file_name):
 
 def get_library_id(site_url, library_name):
     """Get library ID by name with proper URL encoding"""
-    print(f"\n🔍 Finding library: {library_name}")
+    print(f"\n[SEARCH] Finding library: {library_name}")
     
-    # URL encode the library name for the filter
-    encoded_name = urllib.parse.quote(library_name)
-    
-    # Try exact match with proper encoding
+    encoded_name = urllib.parse.quote(library_name, safe='')
     url = f"{site_url}/_api/web/lists?$filter=Title eq '{encoded_name}'"
     response = make_sharepoint_request(site_url, url)
     
     if response and 'd' in response and 'results' in response['d'] and len(response['d']['results']) > 0:
         library = response['d']['results'][0]
-        print(f"✅ Found library: {library['Title']} (ID: {library['Id']})")
+        print_success(f"Found library: '{library['Title']}' (ID: {library['Id']})")
         return library['Id']
     
-    # If not found, try case-insensitive search
-    print(f"  ⚠️ Exact match not found, trying case-insensitive search...")
+    print_warning("Exact match not found, trying case-insensitive search...")
     
-    # Get all document libraries
     url = f"{site_url}/_api/web/lists?$filter=BaseTemplate eq 101"
     response = make_sharepoint_request(site_url, url)
     
     if response and 'd' in response and 'results' in response['d']:
-        # Case-insensitive match
         for lib in response['d']['results']:
             if lib['Title'].lower() == library_name.lower():
-                print(f"✅ Found library (case-insensitive): {lib['Title']} (ID: {lib['Id']})")
+                print_success(f"Found library (case-insensitive): '{lib['Title']}' (ID: {lib['Id']})")
                 return lib['Id']
         
-        # If still not found, try partial match
-        print(f"  ⚠️ Case-insensitive match not found, trying partial match...")
+        print_warning("Case-insensitive match not found, trying partial match...")
         library_lower = library_name.lower()
         for lib in response['d']['results']:
             if library_lower in lib['Title'].lower() or lib['Title'].lower() in library_lower:
-                print(f"✅ Found partial match: '{lib['Title']}' (ID: {lib['Id']})")
-                print(f"  💡 Did you mean: '{lib['Title']}'?")
+                print_success(f"Found partial match: '{lib['Title']}' (ID: {lib['Id']})")
+                print_info(f"Did you mean: '{lib['Title']}'?")
                 return lib['Id']
         
-        # List available libraries for debugging
-        print(f"\n  📋 Available document libraries:")
+        print(f"\n  [INFO] Available document libraries:")
         for lib in response['d']['results'][:15]:
             print(f"    - '{lib['Title']}'")
         if len(response['d']['results']) > 15:
             print(f"    ... and {len(response['d']['results']) - 15} more")
     
-    print(f"❌ Library '{library_name}' not found")
-    print(f"  💡 Please check the exact library name in SharePoint")
+    print_error(f"Library '{library_name}' not found")
+    print_info("Please check the exact library name in SharePoint")
     return None
 
 def get_all_items_from_library(site_url, library_id, library_name):
     """Get all items from library with pagination"""
-    print(f"\n📁 Fetching items from library: {library_name}")
+    print(f"\n[FOLDER] Fetching items from library: {library_name}")
     
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,Title,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size,Created,Modified,FileSystemObjectType&$top=5000"
     
@@ -421,13 +432,13 @@ def get_all_items_from_library(site_url, library_id, library_name):
         response = make_sharepoint_request(site_url, next_url)
         
         if not response or 'd' not in response:
-            print(" ✗ Failed")
+            print(" [FAILED]")
             break
         
         if 'results' in response['d']:
             items_in_page = len(response['d']['results'])
             all_items.extend(response['d']['results'])
-            print(f" ✓ Got {items_in_page} items")
+            print(f" [OK] Got {items_in_page} items")
         
         next_url = None
         if '__next' in response.get('d', {}):
@@ -437,16 +448,7 @@ def get_all_items_from_library(site_url, library_id, library_name):
     return all_items
 
 def get_file_versions_complete(site_url, list_id, item_id):
-    """
-    Get COMPLETE version information including:
-    - Version ID, Label
-    - Created Date (when version was created)
-    - Modified Date (when version was last modified)
-    - Size (file size for that version)
-    - Editor (who modified)
-    - Check-in comments
-    - Is current version
-    """
+    """Get COMPLETE version information"""
     try:
         versions_url = (
             f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
@@ -466,53 +468,38 @@ def get_file_versions_complete(site_url, list_id, item_id):
         
         versions = []
         for version in response['d'].get('results', []):
-            # Get Editor (who modified)
             editor = version.get('Editor', {})
             editor_name = editor.get('LookupValue', '') if isinstance(editor, dict) else ''
             editor_email = editor.get('Email', '') if isinstance(editor, dict) else ''
             editor_id = editor.get('LookupId', 0) if isinstance(editor, dict) else 0
             
-            # Get Author/Created By
             author = version.get('Author', {})
             author_name = author.get('LookupValue', '') if isinstance(author, dict) else ''
             author_email = author.get('Email', '') if isinstance(author, dict) else ''
             author_id = author.get('LookupId', 0) if isinstance(author, dict) else 0
             
-            # Get direct fields (as seen in your response)
             created_by = version.get('Created_x005f_x0020_x005f_By', '')
             modified_by = version.get('Modified_x005f_x0020_x005f_By', '')
             
-            # Parse file size (it's a string in your response)
             size_str = version.get('File_x005f_x0020_x005f_Size', '0')
             size = safe_int_conversion(size_str)
             
             version_data = {
-                # Version identifiers
                 'version_id': version.get('VersionId', 0),
                 'version_label': version.get('VersionLabel', ''),
                 'is_current': version.get('IsCurrentVersion', False),
-                
-                # Dates
                 'created': version.get('Created', ''),
                 'created_formatted': format_datetime(version.get('Created', '')),
                 'modified': version.get('Modified', ''),
                 'modified_formatted': format_datetime(version.get('Modified', '')),
-                
-                # Size
                 'size': size,
                 'size_mb': bytes_to_mb(size),
-                
-                # Editor (who modified)
                 'editor_name': editor_name or modified_by,
                 'editor_email': editor_email,
                 'editor_id': editor_id,
-                
-                # Author/Creator
                 'author_name': author_name or created_by,
                 'author_email': author_email,
                 'author_id': author_id,
-                
-                # Additional info
                 'check_in_comment': version.get('CheckInComment', ''),
                 'is_current_version': version.get('IsCurrentVersion', False)
             }
@@ -554,23 +541,17 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
     file_details = get_file_details(item)
     
     if not file_details['is_folder']:
-        # Get ALL version details
         versions = get_file_versions_complete(site_url, list_id, item.get('Id'))
-        
-        # Store complete version data
         file_details['versions'] = versions
         file_details['version_count'] = len(versions)
         
-        # Version statistics
         if versions:
-            # Latest version (index 0 since sorted by Created desc)
             latest = versions[0]
             file_details['last_modified_by'] = latest.get('editor_name', '')
             file_details['last_modified_by_email'] = latest.get('editor_email', '')
             file_details['last_modified_date'] = latest.get('modified_formatted', '')
             file_details['last_modified_size'] = latest.get('size_mb', 0)
             
-            # Version summary stats
             all_sizes = [v['size'] for v in versions]
             file_details['version_stats'] = {
                 'min_size': bytes_to_mb(min(all_sizes)) if all_sizes else 0,
@@ -579,14 +560,12 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
                 'total_versions_size': bytes_to_mb(sum(all_sizes)) if all_sizes else 0
             }
             
-            # Get unique editors
             editors = set()
             for v in versions:
                 if v['editor_name']:
                     editors.add(v['editor_name'])
             file_details['unique_editors'] = list(editors)
             file_details['editor_count'] = len(editors)
-            
         else:
             file_details['last_modified_by'] = ''
             file_details['last_modified_by_email'] = ''
@@ -595,7 +574,6 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
             file_details['unique_editors'] = []
             file_details['editor_count'] = 0
     else:
-        # Folder handling
         file_details['version_count'] = 0
         file_details['versions'] = []
         file_details['last_modified_by'] = ''
@@ -620,9 +598,8 @@ def build_file_map(items, site_url, list_id, library_name):
     folders = 0
     files_count = 0
     
-    print(f"\n📊 Building file map for {library_name}...")
+    print(f"\n[BUILD] Building file map for {library_name}...")
     
-    # Set up progress tracking
     PROGRESS['total_items'] = len(items)
     PROGRESS['processed_items'] = 0
     PROGRESS['current_library'] = library_name
@@ -651,7 +628,6 @@ def build_file_map(items, site_url, list_id, library_name):
         
         update_progress(file_details['name'], library_name)
     
-    # Clear progress line
     print()
     
     print(f"  Files: {files_count}")
@@ -664,9 +640,7 @@ def build_file_map(items, site_url, list_id, library_name):
 
 def compare_libraries(source_map, dest_map, source_site, dest_site):
     """Compare source and destination file maps"""
-    print("\n" + "="*80)
-    print("🔍 COMPARING SOURCE vs DESTINATION")
-    print("="*80)
+    print_header("COMPARING SOURCE vs DESTINATION")
     
     differences = {
         "missing_in_destination": [],
@@ -685,17 +659,14 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
     missing_in_dest = source_keys - dest_keys
     missing_in_source = dest_keys - source_keys
     
-    print(f"\n📄 Files missing in Destination: {len(missing_in_dest)}")
-    print(f"📄 Files missing in Source: {len(missing_in_source)}")
+    print(f"\n[INFO] Files missing in Destination: {len(missing_in_dest)}")
+    print(f"[INFO] Files missing in Source: {len(missing_in_source)}")
     
     common_keys = source_keys & dest_keys
-    print(f"\n📄 Common files: {len(common_keys)}")
+    print(f"\n[INFO] Common files: {len(common_keys)}")
     
-    print("\n" + "-"*80)
-    print("DETAILED COMPARISON - COMMON FILES")
-    print("-"*80)
+    print_subheader("DETAILED COMPARISON - COMMON FILES")
     
-    # Progress for comparison
     total_common = len(common_keys)
     processed = 0
     
@@ -711,7 +682,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
             source_file = source_files[0]
             dest_file = dest_files[0]
             
-            # Check extension mismatch
             if source_file['extension'] != dest_file['extension']:
                 differences['file_name_mismatch'].append({
                     'name': key,
@@ -720,7 +690,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     'issue': 'Extension mismatch'
                 })
             
-            # Check size
             if source_file['size'] != dest_file['size']:
                 differences['size_mismatch'].append({
                     'name': key,
@@ -731,7 +700,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     'diff_mb': source_file['size_mb'] - dest_file['size_mb']
                 })
             
-            # Check modified date
             if source_file['modified'] != dest_file['modified']:
                 differences['modified_date_mismatch'].append({
                     'name': key,
@@ -741,7 +709,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     'dest_modified': dest_file['modified_formatted']
                 })
             
-            # Check version count
             if source_file['version_count'] != dest_file['version_count']:
                 differences['version_count_mismatch'].append({
                     'name': key,
@@ -751,7 +718,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     'dest_versions': dest_file['version_count']
                 })
             
-            # Check version editors (Modified By)
             if CONFIG['comparison_settings'].get('check_version_editor', True):
                 source_editors = set()
                 dest_editors = set()
@@ -764,7 +730,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     if v.get('editor_name'):
                         dest_editors.add(v['editor_name'])
                 
-                # Check if editors are different
                 if source_editors != dest_editors:
                     differences['version_editor_mismatch'].append({
                         'name': key,
@@ -776,7 +741,6 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                         'dest_version_count': len(dest_file.get('versions', []))
                     })
             
-            # If all match, it's a match
             if (source_file['size'] == dest_file['size'] and 
                 source_file['modified'] == dest_file['modified'] and
                 source_file['version_count'] == dest_file['version_count']):
@@ -796,9 +760,8 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                 'issue': 'Multiple files with same name'
             })
     
-    print()  # New line after progress
+    print()
     
-    # Store missing files details
     for key in missing_in_dest:
         for file in source_map[key]:
             differences['missing_in_destination'].append(file)
@@ -813,37 +776,35 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
 
 def print_comparison_summary(differences):
     """Print comparison summary"""
-    print("\n" + "="*80)
-    print("📊 COMPARISON SUMMARY")
-    print("="*80)
+    print_header("COMPARISON SUMMARY")
     
-    print(f"\n✅ Matched Files: {len(differences['matched_files'])}")
+    print(f"\n[OK] Matched Files: {len(differences['matched_files'])}")
     
-    print(f"\n❌ Missing in Destination: {len(differences['missing_in_destination'])}")
+    print(f"\n[ERROR] Missing in Destination: {len(differences['missing_in_destination'])}")
     if differences['missing_in_destination']:
         print("  (Files that exist in Source but not in Destination)")
     
-    print(f"\n❌ Missing in Source: {len(differences['missing_in_source'])}")
+    print(f"\n[ERROR] Missing in Source: {len(differences['missing_in_source'])}")
     if differences['missing_in_source']:
         print("  (Files that exist in Destination but not in Source)")
     
-    print(f"\n⚠️ Size Mismatch: {len(differences['size_mismatch'])}")
+    print(f"\n[WARNING] Size Mismatch: {len(differences['size_mismatch'])}")
     if differences['size_mismatch']:
         print("  (Files with different sizes)")
     
-    print(f"\n⚠️ Modified Date Mismatch: {len(differences['modified_date_mismatch'])}")
+    print(f"\n[WARNING] Modified Date Mismatch: {len(differences['modified_date_mismatch'])}")
     if differences['modified_date_mismatch']:
         print("  (Files with different modified dates)")
     
-    print(f"\n⚠️ Version Count Mismatch: {len(differences['version_count_mismatch'])}")
+    print(f"\n[WARNING] Version Count Mismatch: {len(differences['version_count_mismatch'])}")
     if differences['version_count_mismatch']:
         print("  (Files with different version counts)")
     
-    print(f"\n⚠️ Version Editor Mismatch: {len(differences['version_editor_mismatch'])}")
+    print(f"\n[WARNING] Version Editor Mismatch: {len(differences['version_editor_mismatch'])}")
     if differences['version_editor_mismatch']:
         print("  (Files where version editors are different)")
     
-    print(f"\n⚠️ File Name Issues: {len(differences['file_name_mismatch'])}")
+    print(f"\n[WARNING] File Name Issues: {len(differences['file_name_mismatch'])}")
     if differences['file_name_mismatch']:
         print("  (Files with extension mismatches or duplicates)")
     
@@ -855,7 +816,7 @@ def print_comparison_summary(differences):
                     len(differences['version_editor_mismatch']) +
                     len(differences['file_name_mismatch']))
     
-    print(f"\n🔴 TOTAL ISSUES FOUND: {total_issues}")
+    print(f"\n[CRITICAL] TOTAL ISSUES FOUND: {total_issues}")
     print("="*80)
 
 # ============================================================
@@ -870,7 +831,6 @@ def save_comparison_report(differences, source_site, dest_site):
     source_prefix = get_site_prefix(source_site)
     dest_prefix = get_site_prefix(dest_site)
     
-    # Summary file
     summary_file = os.path.join(CONFIG['output']['output_dir'], 
                                 CONFIG['output']['summary_file'])
     
@@ -900,9 +860,8 @@ def save_comparison_report(differences, source_site, dest_site):
                         len(differences['version_editor_mismatch']) +
                         len(differences['file_name_mismatch'])])
     
-    print(f"\n📊 Summary report saved: {summary_file}")
+    print(f"\n[FILE] Summary report saved: {summary_file}")
     
-    # Detailed file
     detail_file = os.path.join(CONFIG['output']['output_dir'], 
                                f"{source_prefix}_vs_{dest_prefix}_comparison_details_{timestamp}.csv")
     
@@ -918,11 +877,10 @@ def save_comparison_report(differences, source_site, dest_site):
             'Source Path', 'Dest Path', 'Issue'
         ])
         
-        # Matched files
         for file in differences['matched_files']:
             writer.writerow([
                 file['name'],
-                '✅ Matched',
+                'MATCHED',
                 file['source']['size_mb'],
                 file['destination']['size_mb'],
                 0,
@@ -938,11 +896,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 ''
             ])
         
-        # Missing in destination
         for file in differences['missing_in_destination']:
             writer.writerow([
                 file['name'],
-                '❌ Missing in Destination',
+                'MISSING IN DESTINATION',
                 file['size_mb'],
                 '',
                 '',
@@ -958,11 +915,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 'File not found in destination'
             ])
         
-        # Missing in source
         for file in differences['missing_in_source']:
             writer.writerow([
                 file['name'],
-                '❌ Missing in Source',
+                'MISSING IN SOURCE',
                 '',
                 file['size_mb'],
                 '',
@@ -978,11 +934,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 'File not found in source'
             ])
         
-        # Size mismatches
         for item in differences['size_mismatch']:
             writer.writerow([
                 item['name'],
-                '⚠️ Size Mismatch',
+                'SIZE MISMATCH',
                 item['source_size_mb'],
                 item['dest_size_mb'],
                 item['diff_mb'],
@@ -998,11 +953,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 f'Size diff: {item["diff_mb"]:.2f} MB'
             ])
         
-        # Modified date mismatches
         for item in differences['modified_date_mismatch']:
             writer.writerow([
                 item['name'],
-                '⚠️ Modified Date Mismatch',
+                'MODIFIED DATE MISMATCH',
                 item['source']['size_mb'],
                 item['destination']['size_mb'],
                 item['source']['size_mb'] - item['destination']['size_mb'],
@@ -1018,11 +972,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 'Modified dates differ'
             ])
         
-        # Version count mismatches
         for item in differences['version_count_mismatch']:
             writer.writerow([
                 item['name'],
-                '⚠️ Version Count Mismatch',
+                'VERSION COUNT MISMATCH',
                 item['source']['size_mb'],
                 item['destination']['size_mb'],
                 item['source']['size_mb'] - item['destination']['size_mb'],
@@ -1038,11 +991,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 f'Version diff: {item["source_versions"] - item["dest_versions"]}'
             ])
         
-        # Version editor mismatches
         for item in differences['version_editor_mismatch']:
             writer.writerow([
                 item['name'],
-                '⚠️ Version Editor Mismatch',
+                'VERSION EDITOR MISMATCH',
                 item['source']['size_mb'],
                 item['destination']['size_mb'],
                 item['source']['size_mb'] - item['destination']['size_mb'],
@@ -1058,11 +1010,10 @@ def save_comparison_report(differences, source_site, dest_site):
                 'Version editors differ'
             ])
         
-        # File name issues
         for item in differences['file_name_mismatch']:
             writer.writerow([
                 item['name'],
-                '⚠️ File Name Issue',
+                'FILE NAME ISSUE',
                 '',
                 '',
                 '',
@@ -1078,9 +1029,8 @@ def save_comparison_report(differences, source_site, dest_site):
                 item.get('issue', 'File name mismatch')
             ])
     
-    print(f"📄 Detailed report saved: {detail_file}")
+    print(f"[FILE] Detailed report saved: {detail_file}")
     
-    # Version details file
     version_detail_file = os.path.join(CONFIG['output']['output_dir'], 
                                         CONFIG['output'].get('version_details_file', 'version_comparison_details.csv'))
     
@@ -1115,18 +1065,15 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
             'Status'
         ])
         
-        # Get files with version mismatches
         version_mismatch_files = []
         version_mismatch_files.extend(differences.get('version_count_mismatch', []))
         version_mismatch_files.extend(differences.get('version_editor_mismatch', []))
         
         if version_mismatch_files:
             for item in version_mismatch_files:
-                # Source versions
                 source_file = item.get('source', {})
                 dest_file = item.get('destination', {})
                 
-                # Source versions
                 for version in source_file.get('versions', []):
                     writer.writerow([
                         source_file.get('name', ''),
@@ -1144,7 +1091,6 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
                         'Source'
                     ])
                 
-                # Destination versions
                 for version in dest_file.get('versions', []):
                     writer.writerow([
                         dest_file.get('name', ''),
@@ -1162,12 +1108,11 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
                         'Destination'
                     ])
                 
-                # Empty line between files
                 writer.writerow([])
         else:
             writer.writerow(['No version mismatches found'])
     
-    print(f"📄 Version details report saved: {version_detail_file}")
+    print(f"[FILE] Version details report saved: {version_detail_file}")
 
 # ============================================================
 # MAIN FUNCTION
@@ -1175,51 +1120,44 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
 
 def main():
     """Main function to compare two libraries"""
-    print("="*80)
-    print("📊 MIGRATION COMPARISON TOOL (with Complete Version Info)")
+    print_header("MIGRATION COMPARISON TOOL (with Complete Version Info)")
     print("Compare two document libraries after migration")
-    print("="*80)
     
     if SHOW_TRACEBACK:
-        print("⚠️  TRACEBACK MODE: ENABLED (detailed error output)")
+        print("[WARNING] TRACEBACK MODE: ENABLED (detailed error output)")
     else:
-        print("ℹ️  TRACEBACK MODE: DISABLED (set SHOW_TRACEBACK=True for debugging)")
+        print("[INFO] TRACEBACK MODE: DISABLED (set SHOW_TRACEBACK=True for debugging)")
     
     source_site = CONFIG['source']['site_url']
     dest_site = CONFIG['destination']['site_url']
     source_library = CONFIG['source']['library_name']
     dest_library = CONFIG['destination']['library_name']
     
-    print(f"\n📌 Source Site: {source_site}")
-    print(f"📌 Source Library: {source_library}")
-    print(f"📌 Destination Site: {dest_site}")
-    print(f"📌 Destination Library: {dest_library}")
+    print(f"\n[INFO] Source Site: {source_site}")
+    print(f"[INFO] Source Library: {source_library}")
+    print(f"[INFO] Destination Site: {dest_site}")
+    print(f"[INFO] Destination Library: {dest_library}")
     print("="*80)
     
-    # Get library IDs
-    print("\n🔍 Finding libraries...")
+    print("\n[SEARCH] Finding libraries...")
     source_library_id = get_library_id(source_site, source_library)
     if not source_library_id:
-        print("❌ Source library not found!")
+        print_error("Source library not found!")
         return
     
     dest_library_id = get_library_id(dest_site, dest_library)
     if not dest_library_id:
-        print("❌ Destination library not found!")
+        print_error("Destination library not found!")
         return
     
-    # Get items from both libraries
     source_items = get_all_items_from_library(source_site, source_library_id, source_library)
     dest_items = get_all_items_from_library(dest_site, dest_library_id, dest_library)
     
     if not source_items or not dest_items:
-        print("❌ No items found in one or both libraries!")
+        print_error("No items found in one or both libraries!")
         return
     
-    # Build file maps
-    print("\n" + "="*80)
-    print("📊 BUILDING FILE MAPS (with complete version details)")
-    print("="*80)
+    print_header("BUILDING FILE MAPS (with complete version details)")
     
     source_map, source_size, source_versions, source_versions_files = build_file_map(
         source_items, source_site, source_library_id, source_library
@@ -1229,33 +1167,24 @@ def main():
         dest_items, dest_site, dest_library_id, dest_library
     )
     
-    # Print summary
-    print("\n" + "="*80)
-    print("📊 SOURCE LIBRARY SUMMARY")
-    print("="*80)
+    print_header("SOURCE LIBRARY SUMMARY")
     print(f"  Total Files: {len([f for files in source_map.values() for f in files])}")
     print(f"  Total Size: {bytes_to_gb(source_size):.2f} GB")
     print(f"  Total Versions: {source_versions}")
     print(f"  Files with Versions: {source_versions_files}")
     
-    print("\n" + "="*80)
-    print("📊 DESTINATION LIBRARY SUMMARY")
-    print("="*80)
+    print_header("DESTINATION LIBRARY SUMMARY")
     print(f"  Total Files: {len([f for files in dest_map.values() for f in files])}")
     print(f"  Total Size: {bytes_to_gb(dest_size):.2f} GB")
     print(f"  Total Versions: {dest_versions}")
     print(f"  Files with Versions: {dest_versions_files}")
     
-    # Compare libraries
     differences = compare_libraries(source_map, dest_map, source_site, dest_site)
     
-    # Save reports
     summary_file, detail_file, version_detail_file = save_comparison_report(differences, source_site, dest_site)
     
-    print("\n" + "="*80)
-    print("✅ COMPARISON COMPLETED SUCCESSFULLY!")
-    print("="*80)
-    print(f"\n📁 Reports saved in: {CONFIG['output']['output_dir']}")
+    print_header("COMPARISON COMPLETED SUCCESSFULLY!")
+    print(f"\n[FILE] Reports saved in: {CONFIG['output']['output_dir']}")
     print(f"  - Summary: {os.path.basename(summary_file)}")
     print(f"  - Details: {os.path.basename(detail_file)}")
     print(f"  - Version Details: {os.path.basename(version_detail_file)}")
