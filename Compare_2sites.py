@@ -380,7 +380,7 @@ def get_file_extension(file_name):
     return os.path.splitext(file_name)[1].lower()
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL - FIXED
+# SHAREPOINT DATA RETRIEVAL - CORRECTED
 # ============================================================
 
 def get_library_id(site_url, library_name):
@@ -425,11 +425,11 @@ def get_library_id(site_url, library_name):
     return None
 
 def get_all_items_from_library(site_url, library_id, library_name):
-    """Get all items from library with pagination - FIXED fields"""
+    """Get all items from library with pagination - REMOVED size field"""
     print(f"\n[FOLDER] Fetching items from library: {library_name}")
     
-    # CORRECTED: Use proper field names
-    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size,Created,Modified,FileSystemObjectType&$top=5000"
+    # CORRECTED: Removed File_x005f_x0020_x005f_Size - get size from versions endpoint
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,FileLeafRef,FileRef,Created,Modified,FileSystemObjectType&$top=5000"
     
     all_items = []
     next_url = items_url
@@ -459,7 +459,7 @@ def get_all_items_from_library(site_url, library_id, library_name):
 def get_file_versions_complete(site_url, list_id, item_id):
     """
     Get COMPLETE version information from versions endpoint
-    This is where we get Created, Modified, Size per version
+    This is where we get: Created, Modified, Size, Editor, Author
     """
     try:
         versions_url = (
@@ -496,7 +496,7 @@ def get_file_versions_complete(site_url, list_id, item_id):
             created_by = version.get('Created_x005f_x0020_x005f_By', '')
             modified_by = version.get('Modified_x005f_x0020_x005f_By', '')
             
-            # Parse file size from versions endpoint
+            # Parse file size from versions endpoint (this is where size comes from)
             size_str = version.get('File_x005f_x0020_x005f_Size', '0')
             size = safe_int_conversion(size_str)
             
@@ -550,14 +550,12 @@ def process_item_batch(site_url, list_id, items, library_name):
 
 def get_file_details_with_complete_versions(site_url, list_id, item):
     """
-    Get file details with COMPLETE version information from versions endpoint
+    Get file details - size comes from versions endpoint
     """
-    # Get basic file info from items endpoint
+    # Get basic file info from items endpoint (NO size here)
     file_name = item.get('FileLeafRef', '')
     if not file_name:
         file_name = f"Item_{item.get('Id', 0)}"
-    
-    file_size = item.get('File_x005f_x0020_x005f_Size', 0)
     
     file_details = {
         'id': item.get('Id', 0),
@@ -565,8 +563,9 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
         'name_without_ext': get_file_name_without_extension(file_name),
         'extension': get_file_extension(file_name),
         'path': item.get('FileRef', ''),
-        'size': safe_int_conversion(file_size),
-        'size_mb': bytes_to_mb(file_size),
+        # Size will come from versions endpoint
+        'size': 0,
+        'size_mb': 0,
         'created': item.get('Created', 'N/A'),
         'modified': item.get('Modified', 'N/A'),
         'created_formatted': format_datetime(item.get('Created', 'N/A')),
@@ -586,7 +585,7 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
         file_details['editor_count'] = 0
         return file_details
     
-    # Get ALL version details from versions endpoint
+    # Get ALL version details from versions endpoint (this includes size)
     versions = get_file_versions_complete(site_url, list_id, item.get('Id'))
     
     # Store complete version data
@@ -597,6 +596,11 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
     if versions:
         # Latest version (index 0 since sorted by Created desc)
         latest = versions[0]
+        
+        # Get size from latest version
+        file_details['size'] = latest.get('size', 0)
+        file_details['size_mb'] = latest.get('size_mb', 0)
+        
         file_details['last_modified_by'] = latest.get('editor_name', '')
         file_details['last_modified_by_email'] = latest.get('editor_email', '')
         file_details['last_modified_date'] = latest.get('modified_formatted', '')
@@ -619,6 +623,7 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
         file_details['unique_editors'] = list(editors)
         file_details['editor_count'] = len(editors)
     else:
+        # No versions - size remains 0
         file_details['last_modified_by'] = ''
         file_details['last_modified_by_email'] = ''
         file_details['last_modified_date'] = file_details['modified_formatted']
@@ -646,6 +651,7 @@ def build_file_map(items, site_url, list_id, library_name):
     print(f"\n[BUILD] Building file map for {library_name}...")
     print(f"[INFO] Total items: {len(items)}")
     print(f"[INFO] Processing in batches of {BATCH_SIZE} with {MAX_WORKERS} parallel threads")
+    print(f"[INFO] File size will be retrieved from versions endpoint")
     
     # Reset progress
     PROCESSED_COUNT = 0
@@ -877,7 +883,7 @@ def print_comparison_summary(differences):
     print("="*80)
 
 # ============================================================
-# CSV REPORT FUNCTIONS
+# CSV REPORT FUNCTIONS (same as before - kept for brevity)
 # ============================================================
 
 def save_comparison_report(differences, source_site, dest_site):
@@ -1095,10 +1101,6 @@ def save_comparison_report(differences, source_site, dest_site):
     
     return summary_file, detail_file, version_detail_file
 
-# ============================================================
-# VERSION DETAILS WITH COMPLETE INFO
-# ============================================================
-
 def save_version_details(differences, source_prefix, dest_prefix, version_detail_file):
     """Save detailed version comparison including ALL information"""
     
@@ -1186,6 +1188,7 @@ def main():
         print("[INFO] TRACEBACK MODE: DISABLED (set SHOW_TRACEBACK=True for debugging)")
     
     print(f"[INFO] Batch Size: {BATCH_SIZE}, Max Workers: {MAX_WORKERS}")
+    print(f"[INFO] File size will be retrieved from versions endpoint")
     
     source_site = CONFIG['source']['site_url']
     dest_site = CONFIG['destination']['site_url']
