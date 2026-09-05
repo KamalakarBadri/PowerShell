@@ -27,6 +27,12 @@ SHOW_TRACEBACK = False  # Set to True for debugging
 BATCH_SIZE = 50  # Number of files to process in parallel
 MAX_WORKERS = 10  # Max parallel threads
 
+# ============================================================
+# REPORT CONFIGURATION
+# ============================================================
+
+INCLUDE_ITEM_IDS_IN_REPORT = True  # Set to True to include Item IDs, False to exclude
+
 def log_error(message, error=None):
     """Log error with optional traceback"""
     print(f"  [ERROR] {message}")
@@ -380,7 +386,7 @@ def get_file_extension(file_name):
     return os.path.splitext(file_name)[1].lower()
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL - CORRECTED
+# SHAREPOINT DATA RETRIEVAL
 # ============================================================
 
 def get_library_id(site_url, library_name):
@@ -425,10 +431,10 @@ def get_library_id(site_url, library_name):
     return None
 
 def get_all_items_from_library(site_url, library_id, library_name):
-    """Get all items from library with pagination - REMOVED size field"""
+    """Get all items from library with pagination"""
     print(f"\n[FOLDER] Fetching items from library: {library_name}")
     
-    # CORRECTED: Removed File_x005f_x0020_x005f_Size - get size from versions endpoint
+    # Get items without size field (size comes from versions endpoint)
     items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,FileLeafRef,FileRef,Created,Modified,FileSystemObjectType&$top=5000"
     
     all_items = []
@@ -496,7 +502,7 @@ def get_file_versions_complete(site_url, list_id, item_id):
             created_by = version.get('Created_x005f_x0020_x005f_By', '')
             modified_by = version.get('Modified_x005f_x0020_x005f_By', '')
             
-            # Parse file size from versions endpoint (this is where size comes from)
+            # Parse file size from versions endpoint
             size_str = version.get('File_x005f_x0020_x005f_Size', '0')
             size = safe_int_conversion(size_str)
             
@@ -552,13 +558,13 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
     """
     Get file details - size comes from versions endpoint
     """
-    # Get basic file info from items endpoint (NO size here)
+    # Get basic file info from items endpoint
     file_name = item.get('FileLeafRef', '')
     if not file_name:
         file_name = f"Item_{item.get('Id', 0)}"
     
     file_details = {
-        'id': item.get('Id', 0),
+        'id': item.get('Id', 0),  # Store item ID
         'name': file_name,
         'name_without_ext': get_file_name_without_extension(file_name),
         'extension': get_file_extension(file_name),
@@ -883,7 +889,7 @@ def print_comparison_summary(differences):
     print("="*80)
 
 # ============================================================
-# CSV REPORT FUNCTIONS (same as before - kept for brevity)
+# CSV REPORT FUNCTIONS
 # ============================================================
 
 def save_comparison_report(differences, source_site, dest_site):
@@ -894,6 +900,9 @@ def save_comparison_report(differences, source_site, dest_site):
     source_prefix = get_site_prefix(source_site)
     dest_prefix = get_site_prefix(dest_site)
     
+    # Display ID inclusion status
+    print_info(f"Including Item IDs in report: {INCLUDE_ITEM_IDS_IN_REPORT}")
+    
     summary_file = os.path.join(CONFIG['output']['output_dir'], 
                                 CONFIG['output']['summary_file'])
     
@@ -903,6 +912,7 @@ def save_comparison_report(differences, source_site, dest_site):
         writer.writerow(['Generated At', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow(['Source Site', source_site])
         writer.writerow(['Destination Site', dest_site])
+        writer.writerow(['Include Item IDs', str(INCLUDE_ITEM_IDS_IN_REPORT)])
         writer.writerow([])
         
         writer.writerow(['Metric', 'Count'])
@@ -928,169 +938,357 @@ def save_comparison_report(differences, source_site, dest_site):
     detail_file = os.path.join(CONFIG['output']['output_dir'], 
                                f"{source_prefix}_vs_{dest_prefix}_comparison_details_{timestamp}.csv")
     
-    with open(detail_file, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.writer(f)
-        
-        writer.writerow([
-            'File Name', 'Status', 
+    # Build header based on INCLUDE_ITEM_IDS_IN_REPORT
+    if INCLUDE_ITEM_IDS_IN_REPORT:
+        header = [
+            'File Name', 'Status',
+            'Source Item ID', 'Dest Item ID',
             'Source Size (MB)', 'Dest Size (MB)', 'Size Diff (MB)',
             'Source Modified', 'Dest Modified',
             'Source Versions', 'Dest Versions', 'Version Diff',
             'Source Last Modified By', 'Dest Last Modified By',
             'Source Path', 'Dest Path', 'Issue'
-        ])
+        ]
+    else:
+        header = [
+            'File Name', 'Status',
+            'Source Size (MB)', 'Dest Size (MB)', 'Size Diff (MB)',
+            'Source Modified', 'Dest Modified',
+            'Source Versions', 'Dest Versions', 'Version Diff',
+            'Source Last Modified By', 'Dest Last Modified By',
+            'Source Path', 'Dest Path', 'Issue'
+        ]
+    
+    with open(detail_file, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
         
+        # Matched files
         for file in differences['matched_files']:
-            writer.writerow([
-                file['name'],
-                'MATCHED',
-                file['source']['size_mb'],
-                file['destination']['size_mb'],
-                0,
-                file['source']['modified_formatted'],
-                file['destination']['modified_formatted'],
-                file['source']['version_count'],
-                file['destination']['version_count'],
-                0,
-                file['source'].get('last_modified_by', ''),
-                file['destination'].get('last_modified_by', ''),
-                file['source']['path'],
-                file['destination']['path'],
-                ''
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    file['name'],
+                    'MATCHED',
+                    file['source']['id'],
+                    file['destination']['id'],
+                    file['source']['size_mb'],
+                    file['destination']['size_mb'],
+                    0,
+                    file['source']['modified_formatted'],
+                    file['destination']['modified_formatted'],
+                    file['source']['version_count'],
+                    file['destination']['version_count'],
+                    0,
+                    file['source'].get('last_modified_by', ''),
+                    file['destination'].get('last_modified_by', ''),
+                    file['source']['path'],
+                    file['destination']['path'],
+                    ''
+                ])
+            else:
+                writer.writerow([
+                    file['name'],
+                    'MATCHED',
+                    file['source']['size_mb'],
+                    file['destination']['size_mb'],
+                    0,
+                    file['source']['modified_formatted'],
+                    file['destination']['modified_formatted'],
+                    file['source']['version_count'],
+                    file['destination']['version_count'],
+                    0,
+                    file['source'].get('last_modified_by', ''),
+                    file['destination'].get('last_modified_by', ''),
+                    file['source']['path'],
+                    file['destination']['path'],
+                    ''
+                ])
         
+        # Missing in destination
         for file in differences['missing_in_destination']:
-            writer.writerow([
-                file['name'],
-                'MISSING IN DESTINATION',
-                file['size_mb'],
-                '',
-                '',
-                file['modified_formatted'],
-                '',
-                file['version_count'],
-                '',
-                '',
-                file.get('last_modified_by', ''),
-                '',
-                file['path'],
-                '',
-                'File not found in destination'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    file['name'],
+                    'MISSING IN DESTINATION',
+                    file['id'],
+                    '',
+                    file['size_mb'],
+                    '',
+                    '',
+                    file['modified_formatted'],
+                    '',
+                    file['version_count'],
+                    '',
+                    '',
+                    file.get('last_modified_by', ''),
+                    '',
+                    file['path'],
+                    '',
+                    'File not found in destination'
+                ])
+            else:
+                writer.writerow([
+                    file['name'],
+                    'MISSING IN DESTINATION',
+                    file['size_mb'],
+                    '',
+                    '',
+                    file['modified_formatted'],
+                    '',
+                    file['version_count'],
+                    '',
+                    '',
+                    file.get('last_modified_by', ''),
+                    '',
+                    file['path'],
+                    '',
+                    'File not found in destination'
+                ])
         
+        # Missing in source
         for file in differences['missing_in_source']:
-            writer.writerow([
-                file['name'],
-                'MISSING IN SOURCE',
-                '',
-                file['size_mb'],
-                '',
-                '',
-                file['modified_formatted'],
-                '',
-                file['version_count'],
-                '',
-                '',
-                file.get('last_modified_by', ''),
-                '',
-                file['path'],
-                'File not found in source'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    file['name'],
+                    'MISSING IN SOURCE',
+                    '',
+                    file['id'],
+                    '',
+                    file['size_mb'],
+                    '',
+                    '',
+                    file['modified_formatted'],
+                    '',
+                    file['version_count'],
+                    '',
+                    '',
+                    file.get('last_modified_by', ''),
+                    '',
+                    file['path'],
+                    'File not found in source'
+                ])
+            else:
+                writer.writerow([
+                    file['name'],
+                    'MISSING IN SOURCE',
+                    '',
+                    file['size_mb'],
+                    '',
+                    '',
+                    file['modified_formatted'],
+                    '',
+                    file['version_count'],
+                    '',
+                    '',
+                    file.get('last_modified_by', ''),
+                    '',
+                    file['path'],
+                    'File not found in source'
+                ])
         
+        # Size mismatches
         for item in differences['size_mismatch']:
-            writer.writerow([
-                item['name'],
-                'SIZE MISMATCH',
-                item['source_size_mb'],
-                item['dest_size_mb'],
-                item['diff_mb'],
-                item['source']['modified_formatted'],
-                item['destination']['modified_formatted'],
-                item['source']['version_count'],
-                item['destination']['version_count'],
-                item['source']['version_count'] - item['destination']['version_count'],
-                item['source'].get('last_modified_by', ''),
-                item['destination'].get('last_modified_by', ''),
-                item['source']['path'],
-                item['destination']['path'],
-                f'Size diff: {item["diff_mb"]:.2f} MB'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    item['name'],
+                    'SIZE MISMATCH',
+                    item['source']['id'],
+                    item['destination']['id'],
+                    item['source_size_mb'],
+                    item['dest_size_mb'],
+                    item['diff_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source']['version_count'],
+                    item['destination']['version_count'],
+                    item['source']['version_count'] - item['destination']['version_count'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    f'Size diff: {item["diff_mb"]:.2f} MB'
+                ])
+            else:
+                writer.writerow([
+                    item['name'],
+                    'SIZE MISMATCH',
+                    item['source_size_mb'],
+                    item['dest_size_mb'],
+                    item['diff_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source']['version_count'],
+                    item['destination']['version_count'],
+                    item['source']['version_count'] - item['destination']['version_count'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    f'Size diff: {item["diff_mb"]:.2f} MB'
+                ])
         
+        # Modified date mismatches
         for item in differences['modified_date_mismatch']:
-            writer.writerow([
-                item['name'],
-                'MODIFIED DATE MISMATCH',
-                item['source']['size_mb'],
-                item['destination']['size_mb'],
-                item['source']['size_mb'] - item['destination']['size_mb'],
-                item['source_modified'],
-                item['dest_modified'],
-                item['source']['version_count'],
-                item['destination']['version_count'],
-                item['source']['version_count'] - item['destination']['version_count'],
-                item['source'].get('last_modified_by', ''),
-                item['destination'].get('last_modified_by', ''),
-                item['source']['path'],
-                item['destination']['path'],
-                'Modified dates differ'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    item['name'],
+                    'MODIFIED DATE MISMATCH',
+                    item['source']['id'],
+                    item['destination']['id'],
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source_modified'],
+                    item['dest_modified'],
+                    item['source']['version_count'],
+                    item['destination']['version_count'],
+                    item['source']['version_count'] - item['destination']['version_count'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    'Modified dates differ'
+                ])
+            else:
+                writer.writerow([
+                    item['name'],
+                    'MODIFIED DATE MISMATCH',
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source_modified'],
+                    item['dest_modified'],
+                    item['source']['version_count'],
+                    item['destination']['version_count'],
+                    item['source']['version_count'] - item['destination']['version_count'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    'Modified dates differ'
+                ])
         
+        # Version count mismatches
         for item in differences['version_count_mismatch']:
-            writer.writerow([
-                item['name'],
-                'VERSION COUNT MISMATCH',
-                item['source']['size_mb'],
-                item['destination']['size_mb'],
-                item['source']['size_mb'] - item['destination']['size_mb'],
-                item['source']['modified_formatted'],
-                item['destination']['modified_formatted'],
-                item['source_versions'],
-                item['dest_versions'],
-                item['source_versions'] - item['dest_versions'],
-                item['source'].get('last_modified_by', ''),
-                item['destination'].get('last_modified_by', ''),
-                item['source']['path'],
-                item['destination']['path'],
-                f'Version diff: {item["source_versions"] - item["dest_versions"]}'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    item['name'],
+                    'VERSION COUNT MISMATCH',
+                    item['source']['id'],
+                    item['destination']['id'],
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source_versions'],
+                    item['dest_versions'],
+                    item['source_versions'] - item['dest_versions'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    f'Version diff: {item["source_versions"] - item["dest_versions"]}'
+                ])
+            else:
+                writer.writerow([
+                    item['name'],
+                    'VERSION COUNT MISMATCH',
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source_versions'],
+                    item['dest_versions'],
+                    item['source_versions'] - item['dest_versions'],
+                    item['source'].get('last_modified_by', ''),
+                    item['destination'].get('last_modified_by', ''),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    f'Version diff: {item["source_versions"] - item["dest_versions"]}'
+                ])
         
+        # Version editor mismatches
         for item in differences['version_editor_mismatch']:
-            writer.writerow([
-                item['name'],
-                'VERSION EDITOR MISMATCH',
-                item['source']['size_mb'],
-                item['destination']['size_mb'],
-                item['source']['size_mb'] - item['destination']['size_mb'],
-                item['source']['modified_formatted'],
-                item['destination']['modified_formatted'],
-                item['source_version_count'],
-                item['dest_version_count'],
-                item['source_version_count'] - item['dest_version_count'],
-                ', '.join(item['source_editors']),
-                ', '.join(item['dest_editors']),
-                item['source']['path'],
-                item['destination']['path'],
-                'Version editors differ'
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    item['name'],
+                    'VERSION EDITOR MISMATCH',
+                    item['source']['id'],
+                    item['destination']['id'],
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source_version_count'],
+                    item['dest_version_count'],
+                    item['source_version_count'] - item['dest_version_count'],
+                    ', '.join(item['source_editors']),
+                    ', '.join(item['dest_editors']),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    'Version editors differ'
+                ])
+            else:
+                writer.writerow([
+                    item['name'],
+                    'VERSION EDITOR MISMATCH',
+                    item['source']['size_mb'],
+                    item['destination']['size_mb'],
+                    item['source']['size_mb'] - item['destination']['size_mb'],
+                    item['source']['modified_formatted'],
+                    item['destination']['modified_formatted'],
+                    item['source_version_count'],
+                    item['dest_version_count'],
+                    item['source_version_count'] - item['dest_version_count'],
+                    ', '.join(item['source_editors']),
+                    ', '.join(item['dest_editors']),
+                    item['source']['path'],
+                    item['destination']['path'],
+                    'Version editors differ'
+                ])
         
+        # File name issues
         for item in differences['file_name_mismatch']:
-            writer.writerow([
-                item['name'],
-                'FILE NAME ISSUE',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                '',
-                item.get('issue', 'File name mismatch')
-            ])
+            if INCLUDE_ITEM_IDS_IN_REPORT:
+                writer.writerow([
+                    item['name'],
+                    'FILE NAME ISSUE',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    item.get('issue', 'File name mismatch')
+                ])
+            else:
+                writer.writerow([
+                    item['name'],
+                    'FILE NAME ISSUE',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    item.get('issue', 'File name mismatch')
+                ])
     
     print(f"[FILE] Detailed report saved: {detail_file}")
     
@@ -1111,18 +1309,31 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
         writer.writerow(['Generated At', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow(['Source', source_prefix])
         writer.writerow(['Destination', dest_prefix])
+        writer.writerow(['Include Item IDs', str(INCLUDE_ITEM_IDS_IN_REPORT)])
         writer.writerow([])
         
-        writer.writerow([
-            'File Name', 'Side', 
-            'Version Label', 'Is Current',
-            'Created Date', 'Modified Date',
-            'Size (MB)', 
-            'Editor Name', 'Editor Email',
-            'Author Name', 'Author Email',
-            'Check-in Comment',
-            'Status'
-        ])
+        if INCLUDE_ITEM_IDS_IN_REPORT:
+            writer.writerow([
+                'File Name', 'Item ID', 'Side', 
+                'Version Label', 'Is Current',
+                'Created Date', 'Modified Date',
+                'Size (MB)', 
+                'Editor Name', 'Editor Email',
+                'Author Name', 'Author Email',
+                'Check-in Comment',
+                'Status'
+            ])
+        else:
+            writer.writerow([
+                'File Name', 'Side', 
+                'Version Label', 'Is Current',
+                'Created Date', 'Modified Date',
+                'Size (MB)', 
+                'Editor Name', 'Editor Email',
+                'Author Name', 'Author Email',
+                'Check-in Comment',
+                'Status'
+            ])
         
         version_mismatch_files = []
         version_mismatch_files.extend(differences.get('version_count_mismatch', []))
@@ -1133,39 +1344,77 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
                 source_file = item.get('source', {})
                 dest_file = item.get('destination', {})
                 
+                # Source versions
                 for version in source_file.get('versions', []):
-                    writer.writerow([
-                        source_file.get('name', ''),
-                        'SOURCE',
-                        version.get('version_label', ''),
-                        'Yes' if version.get('is_current') else 'No',
-                        version.get('created_formatted', ''),
-                        version.get('modified_formatted', ''),
-                        version.get('size_mb', 0),
-                        version.get('editor_name', ''),
-                        version.get('editor_email', ''),
-                        version.get('author_name', ''),
-                        version.get('author_email', ''),
-                        version.get('check_in_comment', ''),
-                        'Source'
-                    ])
+                    if INCLUDE_ITEM_IDS_IN_REPORT:
+                        writer.writerow([
+                            source_file.get('name', ''),
+                            source_file.get('id', ''),
+                            'SOURCE',
+                            version.get('version_label', ''),
+                            'Yes' if version.get('is_current') else 'No',
+                            version.get('created_formatted', ''),
+                            version.get('modified_formatted', ''),
+                            version.get('size_mb', 0),
+                            version.get('editor_name', ''),
+                            version.get('editor_email', ''),
+                            version.get('author_name', ''),
+                            version.get('author_email', ''),
+                            version.get('check_in_comment', ''),
+                            'Source'
+                        ])
+                    else:
+                        writer.writerow([
+                            source_file.get('name', ''),
+                            'SOURCE',
+                            version.get('version_label', ''),
+                            'Yes' if version.get('is_current') else 'No',
+                            version.get('created_formatted', ''),
+                            version.get('modified_formatted', ''),
+                            version.get('size_mb', 0),
+                            version.get('editor_name', ''),
+                            version.get('editor_email', ''),
+                            version.get('author_name', ''),
+                            version.get('author_email', ''),
+                            version.get('check_in_comment', ''),
+                            'Source'
+                        ])
                 
+                # Destination versions
                 for version in dest_file.get('versions', []):
-                    writer.writerow([
-                        dest_file.get('name', ''),
-                        'DESTINATION',
-                        version.get('version_label', ''),
-                        'Yes' if version.get('is_current') else 'No',
-                        version.get('created_formatted', ''),
-                        version.get('modified_formatted', ''),
-                        version.get('size_mb', 0),
-                        version.get('editor_name', ''),
-                        version.get('editor_email', ''),
-                        version.get('author_name', ''),
-                        version.get('author_email', ''),
-                        version.get('check_in_comment', ''),
-                        'Destination'
-                    ])
+                    if INCLUDE_ITEM_IDS_IN_REPORT:
+                        writer.writerow([
+                            dest_file.get('name', ''),
+                            dest_file.get('id', ''),
+                            'DESTINATION',
+                            version.get('version_label', ''),
+                            'Yes' if version.get('is_current') else 'No',
+                            version.get('created_formatted', ''),
+                            version.get('modified_formatted', ''),
+                            version.get('size_mb', 0),
+                            version.get('editor_name', ''),
+                            version.get('editor_email', ''),
+                            version.get('author_name', ''),
+                            version.get('author_email', ''),
+                            version.get('check_in_comment', ''),
+                            'Destination'
+                        ])
+                    else:
+                        writer.writerow([
+                            dest_file.get('name', ''),
+                            'DESTINATION',
+                            version.get('version_label', ''),
+                            'Yes' if version.get('is_current') else 'No',
+                            version.get('created_formatted', ''),
+                            version.get('modified_formatted', ''),
+                            version.get('size_mb', 0),
+                            version.get('editor_name', ''),
+                            version.get('editor_email', ''),
+                            version.get('author_name', ''),
+                            version.get('author_email', ''),
+                            version.get('check_in_comment', ''),
+                            'Destination'
+                        ])
                 
                 writer.writerow([])
         else:
@@ -1189,6 +1438,7 @@ def main():
     
     print(f"[INFO] Batch Size: {BATCH_SIZE}, Max Workers: {MAX_WORKERS}")
     print(f"[INFO] File size will be retrieved from versions endpoint")
+    print(f"[INFO] Include Item IDs in report: {INCLUDE_ITEM_IDS_IN_REPORT}")
     
     source_site = CONFIG['source']['site_url']
     dest_site = CONFIG['destination']['site_url']
