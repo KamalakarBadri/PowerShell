@@ -7,6 +7,7 @@ import time
 import os
 import sys
 import re
+import traceback
 from datetime import datetime
 from collections import defaultdict
 from cryptography.hazmat.primitives import hashes
@@ -14,6 +15,21 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
+import urllib.parse
+
+# ============================================================
+# CONFIGURATION - TRACEBACK ON/OFF
+# ============================================================
+
+SHOW_TRACEBACK = False  # Set to True for debugging, False for clean output
+
+def log_error(message, error=None):
+    """Log error with optional traceback"""
+    print(f"  ❌ {message}")
+    if SHOW_TRACEBACK and error:
+        print("  " + "-"*60)
+        traceback.print_exc()
+        print("  " + "-"*60)
 
 # ============================================================
 # LOAD CONFIGURATION
@@ -43,6 +59,15 @@ CONFIG = load_config()
 TOKEN_CACHE = {}
 ALLOWED_FILE_EXTENSIONS = None
 
+# Progress tracking
+PROGRESS = {
+    'total_items': 0,
+    'processed_items': 0,
+    'current_library': '',
+    'current_file': '',
+    'start_time': time.time()
+}
+
 # Comparison results
 COMPARISON_RESULTS = {
     "source": {
@@ -71,6 +96,32 @@ COMPARISON_RESULTS = {
 }
 
 # ============================================================
+# PROGRESS DISPLAY FUNCTIONS
+# ============================================================
+
+def update_progress(file_name, library_name):
+    """Update progress display"""
+    PROGRESS['processed_items'] += 1
+    PROGRESS['current_file'] = file_name
+    
+    if PROGRESS['processed_items'] % 10 == 0 or PROGRESS['processed_items'] == PROGRESS['total_items']:
+        elapsed = time.time() - PROGRESS['start_time']
+        if PROGRESS['processed_items'] > 0:
+            items_per_sec = PROGRESS['processed_items'] / elapsed if elapsed > 0 else 0
+            remaining = (PROGRESS['total_items'] - PROGRESS['processed_items']) / items_per_sec if items_per_sec > 0 else 0
+            
+            progress_pct = (PROGRESS['processed_items'] / PROGRESS['total_items']) * 100 if PROGRESS['total_items'] > 0 else 0
+            print(f"\r  📊 Progress: {PROGRESS['processed_items']}/{PROGRESS['total_items']} ({progress_pct:.1f}%) | "
+                  f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
+                  f"Current: {file_name[:30]}...", end="", flush=True)
+
+def print_progress_summary():
+    """Print final progress summary"""
+    elapsed = time.time() - PROGRESS['start_time']
+    print(f"\n\n  ✅ Processing complete in {elapsed:.1f} seconds")
+    print(f"  📊 Processed {PROGRESS['processed_items']} items")
+
+# ============================================================
 # AUTHENTICATION FUNCTIONS
 # ============================================================
 
@@ -87,7 +138,7 @@ def load_certificate_and_key():
         
         return certificate, private_key
     except Exception as e:
-        print(f"❌ Error loading certificate: {str(e)}")
+        log_error(f"Error loading certificate: {str(e)}", e)
         raise
 
 def get_jwt_token(certificate, private_key, tenant_id, app_id):
@@ -128,7 +179,7 @@ def get_jwt_token(certificate, private_key, tenant_id, app_id):
         
         return f"{jwt_unsigned}.{encoded_signature}"
     except Exception as e:
-        print(f"❌ Error generating JWT: {str(e)}")
+        log_error(f"Error generating JWT: {str(e)}", e)
         raise
 
 def get_access_token(jwt, tenant_id, app_id, scope):
@@ -152,7 +203,7 @@ def get_access_token(jwt, tenant_id, app_id, scope):
         print("  ✅ Token obtained")
         return result["access_token"]
     except Exception as e:
-        print(f"  ❌ Error: {str(e)}")
+        log_error(f"Error getting token: {str(e)}", e)
         raise
 
 def get_cached_token(site_url, force_refresh=False):
@@ -176,7 +227,7 @@ def get_cached_token(site_url, force_refresh=False):
             return token
         return None
     except Exception as e:
-        print(f"  ❌ Authentication failed: {str(e)}")
+        log_error(f"Authentication failed: {str(e)}", e)
         return None
 
 def get_current_token(site_url):
@@ -220,13 +271,13 @@ def make_sharepoint_request(site_url, url, max_retries=5):
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
                 continue
-            print(f"  ❌ Request failed: {str(e)}")
+            log_error(f"Request failed: {str(e)}", e)
             return None
         except Exception as e:
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
                 continue
-            print(f"  ❌ Error: {str(e)}")
+            log_error(f"Error: {str(e)}", e)
             return None
     
     return None
@@ -252,6 +303,7 @@ def safe_int_conversion(value):
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str):
+        # Remove non-numeric characters except decimal point
         cleaned = re.sub(r'[^\d.]', '', value)
         try:
             return int(float(cleaned)) if cleaned else 0
@@ -276,10 +328,14 @@ def format_datetime(datetime_str):
         return "N/A"
     try:
         if 'T' in datetime_str:
-            if '.' in datetime_str:
+            # Handle different formats
+            if '.' in datetime_str and 'Z' in datetime_str:
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            else:
+            elif 'Z' in datetime_str:
                 dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
+            else:
+                # Handle format without Z: "2026-06-26T05:50:41"
+                dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S")
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         return datetime_str
     except:
@@ -300,23 +356,54 @@ def get_file_extension(file_name):
 # ============================================================
 
 def get_library_id(site_url, library_name):
-    """Get library ID by name"""
+    """Get library ID by name with proper URL encoding"""
     print(f"\n🔍 Finding library: {library_name}")
     
-    url = f"{site_url}/_api/web/lists?$filter=Title eq '{library_name}'"
+    # URL encode the library name for the filter
+    encoded_name = urllib.parse.quote(library_name)
+    
+    # Try exact match with proper encoding
+    url = f"{site_url}/_api/web/lists?$filter=Title eq '{encoded_name}'"
     response = make_sharepoint_request(site_url, url)
     
-    if not response or 'd' not in response or 'results' not in response['d']:
-        print(f"❌ Library '{library_name}' not found")
-        return None
+    if response and 'd' in response and 'results' in response['d'] and len(response['d']['results']) > 0:
+        library = response['d']['results'][0]
+        print(f"✅ Found library: {library['Title']} (ID: {library['Id']})")
+        return library['Id']
     
-    if len(response['d']['results']) == 0:
-        print(f"❌ Library '{library_name}' not found")
-        return None
+    # If not found, try case-insensitive search
+    print(f"  ⚠️ Exact match not found, trying case-insensitive search...")
     
-    library = response['d']['results'][0]
-    print(f"✅ Found library: {library['Title']} (ID: {library['Id']})")
-    return library['Id']
+    # Get all document libraries
+    url = f"{site_url}/_api/web/lists?$filter=BaseTemplate eq 101"
+    response = make_sharepoint_request(site_url, url)
+    
+    if response and 'd' in response and 'results' in response['d']:
+        # Case-insensitive match
+        for lib in response['d']['results']:
+            if lib['Title'].lower() == library_name.lower():
+                print(f"✅ Found library (case-insensitive): {lib['Title']} (ID: {lib['Id']})")
+                return lib['Id']
+        
+        # If still not found, try partial match
+        print(f"  ⚠️ Case-insensitive match not found, trying partial match...")
+        library_lower = library_name.lower()
+        for lib in response['d']['results']:
+            if library_lower in lib['Title'].lower() or lib['Title'].lower() in library_lower:
+                print(f"✅ Found partial match: '{lib['Title']}' (ID: {lib['Id']})")
+                print(f"  💡 Did you mean: '{lib['Title']}'?")
+                return lib['Id']
+        
+        # List available libraries for debugging
+        print(f"\n  📋 Available document libraries:")
+        for lib in response['d']['results'][:15]:
+            print(f"    - '{lib['Title']}'")
+        if len(response['d']['results']) > 15:
+            print(f"    ... and {len(response['d']['results']) - 15} more")
+    
+    print(f"❌ Library '{library_name}' not found")
+    print(f"  💡 Please check the exact library name in SharePoint")
+    return None
 
 def get_all_items_from_library(site_url, library_id, library_name):
     """Get all items from library with pagination"""
@@ -349,46 +436,92 @@ def get_all_items_from_library(site_url, library_id, library_name):
     print(f"  Total items fetched: {len(all_items)}")
     return all_items
 
-def get_file_versions_with_editor(site_url, list_id, item_id):
-    """Get versions for a specific item with Editor (Modified By) information"""
+def get_file_versions_complete(site_url, list_id, item_id):
+    """
+    Get COMPLETE version information including:
+    - Version ID, Label
+    - Created Date (when version was created)
+    - Modified Date (when version was last modified)
+    - Size (file size for that version)
+    - Editor (who modified)
+    - Check-in comments
+    - Is current version
+    """
     try:
-        # ✅ Added $expand=Editor to get Modified By information
-        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions?$select=VersionId,VersionLabel,Created,IsCurrentVersion,File_x005f_x0020_x005f_Size,Editor/Title,Editor/Email,Editor/Id&$expand=Editor&$orderby=Created desc"
+        versions_url = (
+            f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
+            f"?$select=VersionId,VersionLabel,Created,Modified,IsCurrentVersion,"
+            f"File_x005f_x0020_x005f_Size,CheckInComment,"
+            f"Author/Title,Author/Email,Author/Id,"
+            f"Editor/Title,Editor/Email,Editor/Id,"
+            f"Created_x005f_x0020_x005f_By,Modified_x005f_x0020_x005f_By"
+            f"&$expand=Author,Editor"
+            f"&$orderby=Created desc"
+        )
         
         response = make_sharepoint_request(site_url, versions_url)
         
         if not response or 'd' not in response:
             return []
         
-        if 'results' not in response['d']:
-            return []
-        
         versions = []
-        for version in response['d']['results']:
-            # Get editor information
+        for version in response['d'].get('results', []):
+            # Get Editor (who modified)
             editor = version.get('Editor', {})
-            editor_name = editor.get('Title', '') if editor else ''
-            editor_email = editor.get('Email', '') if editor else ''
-            editor_id = editor.get('Id', 0) if editor else 0
+            editor_name = editor.get('LookupValue', '') if isinstance(editor, dict) else ''
+            editor_email = editor.get('Email', '') if isinstance(editor, dict) else ''
+            editor_id = editor.get('LookupId', 0) if isinstance(editor, dict) else 0
+            
+            # Get Author/Created By
+            author = version.get('Author', {})
+            author_name = author.get('LookupValue', '') if isinstance(author, dict) else ''
+            author_email = author.get('Email', '') if isinstance(author, dict) else ''
+            author_id = author.get('LookupId', 0) if isinstance(author, dict) else 0
+            
+            # Get direct fields (as seen in your response)
+            created_by = version.get('Created_x005f_x0020_x005f_By', '')
+            modified_by = version.get('Modified_x005f_x0020_x005f_By', '')
+            
+            # Parse file size (it's a string in your response)
+            size_str = version.get('File_x005f_x0020_x005f_Size', '0')
+            size = safe_int_conversion(size_str)
             
             version_data = {
+                # Version identifiers
                 'version_id': version.get('VersionId', 0),
                 'version_label': version.get('VersionLabel', ''),
+                'is_current': version.get('IsCurrentVersion', False),
+                
+                # Dates
                 'created': version.get('Created', ''),
                 'created_formatted': format_datetime(version.get('Created', '')),
-                'is_current': version.get('IsCurrentVersion', False),
-                'size': safe_int_conversion(version.get('File_x005f_x0020_x005f_Size', 0)),
-                'size_mb': bytes_to_mb(version.get('File_x005f_x0020_x005f_Size', 0)),
-                'editor_name': editor_name,
+                'modified': version.get('Modified', ''),
+                'modified_formatted': format_datetime(version.get('Modified', '')),
+                
+                # Size
+                'size': size,
+                'size_mb': bytes_to_mb(size),
+                
+                # Editor (who modified)
+                'editor_name': editor_name or modified_by,
                 'editor_email': editor_email,
-                'editor_id': editor_id
+                'editor_id': editor_id,
+                
+                # Author/Creator
+                'author_name': author_name or created_by,
+                'author_email': author_email,
+                'author_id': author_id,
+                
+                # Additional info
+                'check_in_comment': version.get('CheckInComment', ''),
+                'is_current_version': version.get('IsCurrentVersion', False)
             }
             versions.append(version_data)
         
         return versions
         
     except Exception as e:
-        print(f"    Error getting versions with editor: {str(e)}")
+        log_error(f"Error getting versions for item {item_id}: {str(e)}", e)
         return []
 
 def get_file_details(item):
@@ -416,31 +549,61 @@ def get_file_details(item):
         'is_folder': item.get('FileSystemObjectType', 0) == 1
     }
 
-def get_file_details_with_versions(site_url, list_id, item):
-    """Get file details including version count and editor info"""
+def get_file_details_with_complete_versions(site_url, list_id, item):
+    """Get file details with COMPLETE version information"""
     file_details = get_file_details(item)
     
     if not file_details['is_folder']:
-        versions = get_file_versions_with_editor(site_url, list_id, item.get('Id'))
-        file_details['version_count'] = len(versions)
-        file_details['versions'] = versions
+        # Get ALL version details
+        versions = get_file_versions_complete(site_url, list_id, item.get('Id'))
         
-        # Get latest version editor (Modified By)
+        # Store complete version data
+        file_details['versions'] = versions
+        file_details['version_count'] = len(versions)
+        
+        # Version statistics
         if versions:
-            latest_version = versions[0]  # Already sorted by Created desc
-            file_details['last_modified_by'] = latest_version.get('editor_name', '')
-            file_details['last_modified_by_email'] = latest_version.get('editor_email', '')
-            file_details['last_modified_date'] = latest_version.get('created_formatted', '')
+            # Latest version (index 0 since sorted by Created desc)
+            latest = versions[0]
+            file_details['last_modified_by'] = latest.get('editor_name', '')
+            file_details['last_modified_by_email'] = latest.get('editor_email', '')
+            file_details['last_modified_date'] = latest.get('modified_formatted', '')
+            file_details['last_modified_size'] = latest.get('size_mb', 0)
+            
+            # Version summary stats
+            all_sizes = [v['size'] for v in versions]
+            file_details['version_stats'] = {
+                'min_size': bytes_to_mb(min(all_sizes)) if all_sizes else 0,
+                'max_size': bytes_to_mb(max(all_sizes)) if all_sizes else 0,
+                'avg_size': bytes_to_mb(sum(all_sizes) // len(all_sizes)) if all_sizes else 0,
+                'total_versions_size': bytes_to_mb(sum(all_sizes)) if all_sizes else 0
+            }
+            
+            # Get unique editors
+            editors = set()
+            for v in versions:
+                if v['editor_name']:
+                    editors.add(v['editor_name'])
+            file_details['unique_editors'] = list(editors)
+            file_details['editor_count'] = len(editors)
+            
         else:
             file_details['last_modified_by'] = ''
             file_details['last_modified_by_email'] = ''
             file_details['last_modified_date'] = file_details['modified_formatted']
+            file_details['version_stats'] = {}
+            file_details['unique_editors'] = []
+            file_details['editor_count'] = 0
     else:
+        # Folder handling
         file_details['version_count'] = 0
         file_details['versions'] = []
         file_details['last_modified_by'] = ''
         file_details['last_modified_by_email'] = ''
         file_details['last_modified_date'] = file_details['modified_formatted']
+        file_details['version_stats'] = {}
+        file_details['unique_editors'] = []
+        file_details['editor_count'] = 0
     
     return file_details
 
@@ -455,14 +618,22 @@ def build_file_map(items, site_url, list_id, library_name):
     total_versions = 0
     files_with_versions = 0
     folders = 0
+    files_count = 0
     
     print(f"\n📊 Building file map for {library_name}...")
     
+    # Set up progress tracking
+    PROGRESS['total_items'] = len(items)
+    PROGRESS['processed_items'] = 0
+    PROGRESS['current_library'] = library_name
+    PROGRESS['start_time'] = time.time()
+    
     for item in items:
-        file_details = get_file_details_with_versions(site_url, list_id, item)
+        file_details = get_file_details_with_complete_versions(site_url, list_id, item)
         
         if file_details['is_folder']:
             folders += 1
+            update_progress(file_details['name'] or "Folder", library_name)
             continue
         
         key = file_details['name_without_ext'].lower()
@@ -471,13 +642,19 @@ def build_file_map(items, site_url, list_id, library_name):
             file_map[key] = []
         
         file_map[key].append(file_details)
+        files_count += 1
         
         total_size += file_details['size']
         total_versions += file_details['version_count']
         if file_details['version_count'] > 0:
             files_with_versions += 1
+        
+        update_progress(file_details['name'], library_name)
     
-    print(f"  Files: {len([f for files in file_map.values() for f in files])}")
+    # Clear progress line
+    print()
+    
+    print(f"  Files: {files_count}")
     print(f"  Folders: {folders}")
     print(f"  Total Size: {bytes_to_gb(total_size):.2f} GB")
     print(f"  Total Versions: {total_versions}")
@@ -518,7 +695,15 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
     print("DETAILED COMPARISON - COMMON FILES")
     print("-"*80)
     
+    # Progress for comparison
+    total_common = len(common_keys)
+    processed = 0
+    
     for key in sorted(common_keys):
+        processed += 1
+        if processed % 50 == 0 or processed == total_common:
+            print(f"\r  Comparing: {processed}/{total_common} files...", end="", flush=True)
+        
         source_files = source_map[key]
         dest_files = dest_map[key]
         
@@ -566,7 +751,7 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                     'dest_versions': dest_file['version_count']
                 })
             
-            # ✅ NEW: Check version editors (Modified By)
+            # Check version editors (Modified By)
             if CONFIG['comparison_settings'].get('check_version_editor', True):
                 source_editors = set()
                 dest_editors = set()
@@ -610,6 +795,8 @@ def compare_libraries(source_map, dest_map, source_site, dest_site):
                 'dest_files': [f['name'] for f in dest_files],
                 'issue': 'Multiple files with same name'
             })
+    
+    print()  # New line after progress
     
     # Store missing files details
     for key in missing_in_dest:
@@ -893,7 +1080,7 @@ def save_comparison_report(differences, source_site, dest_site):
     
     print(f"📄 Detailed report saved: {detail_file}")
     
-    # ✅ NEW: Version details file
+    # Version details file
     version_detail_file = os.path.join(CONFIG['output']['output_dir'], 
                                         CONFIG['output'].get('version_details_file', 'version_comparison_details.csv'))
     
@@ -902,16 +1089,16 @@ def save_comparison_report(differences, source_site, dest_site):
     return summary_file, detail_file, version_detail_file
 
 # ============================================================
-# VERSION DETAILS WITH EDITOR
+# VERSION DETAILS WITH COMPLETE INFO
 # ============================================================
 
 def save_version_details(differences, source_prefix, dest_prefix, version_detail_file):
-    """Save detailed version comparison including editor information"""
+    """Save detailed version comparison including ALL information"""
     
     with open(version_detail_file, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
         
-        writer.writerow(['Version Comparison with Editor Details'])
+        writer.writerow(['Complete Version Comparison with All Details'])
         writer.writerow(['Generated At', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow(['Source', source_prefix])
         writer.writerow(['Destination', dest_prefix])
@@ -919,9 +1106,13 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
         
         writer.writerow([
             'File Name', 'Side', 
-            'Version', 'Created', 
-            'Size (MB)', 'Modified By', 'Modified By Email',
-            'Is Current Version', 'Status'
+            'Version Label', 'Is Current',
+            'Created Date', 'Modified Date',
+            'Size (MB)', 
+            'Editor Name', 'Editor Email',
+            'Author Name', 'Author Email',
+            'Check-in Comment',
+            'Status'
         ])
         
         # Get files with version mismatches
@@ -941,11 +1132,15 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
                         source_file.get('name', ''),
                         'SOURCE',
                         version.get('version_label', ''),
+                        'Yes' if version.get('is_current') else 'No',
                         version.get('created_formatted', ''),
+                        version.get('modified_formatted', ''),
                         version.get('size_mb', 0),
                         version.get('editor_name', ''),
                         version.get('editor_email', ''),
-                        'Yes' if version.get('is_current') else 'No',
+                        version.get('author_name', ''),
+                        version.get('author_email', ''),
+                        version.get('check_in_comment', ''),
                         'Source'
                     ])
                 
@@ -955,11 +1150,15 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
                         dest_file.get('name', ''),
                         'DESTINATION',
                         version.get('version_label', ''),
+                        'Yes' if version.get('is_current') else 'No',
                         version.get('created_formatted', ''),
+                        version.get('modified_formatted', ''),
                         version.get('size_mb', 0),
                         version.get('editor_name', ''),
                         version.get('editor_email', ''),
-                        'Yes' if version.get('is_current') else 'No',
+                        version.get('author_name', ''),
+                        version.get('author_email', ''),
+                        version.get('check_in_comment', ''),
                         'Destination'
                     ])
                 
@@ -977,9 +1176,14 @@ def save_version_details(differences, source_prefix, dest_prefix, version_detail
 def main():
     """Main function to compare two libraries"""
     print("="*80)
-    print("📊 MIGRATION COMPARISON TOOL (with Version Editor Info)")
+    print("📊 MIGRATION COMPARISON TOOL (with Complete Version Info)")
     print("Compare two document libraries after migration")
     print("="*80)
+    
+    if SHOW_TRACEBACK:
+        print("⚠️  TRACEBACK MODE: ENABLED (detailed error output)")
+    else:
+        print("ℹ️  TRACEBACK MODE: DISABLED (set SHOW_TRACEBACK=True for debugging)")
     
     source_site = CONFIG['source']['site_url']
     dest_site = CONFIG['destination']['site_url']
@@ -1014,7 +1218,7 @@ def main():
     
     # Build file maps
     print("\n" + "="*80)
-    print("📊 BUILDING FILE MAPS")
+    print("📊 BUILDING FILE MAPS (with complete version details)")
     print("="*80)
     
     source_map, source_size, source_versions, source_versions_files = build_file_map(
@@ -1055,6 +1259,8 @@ def main():
     print(f"  - Summary: {os.path.basename(summary_file)}")
     print(f"  - Details: {os.path.basename(detail_file)}")
     print(f"  - Version Details: {os.path.basename(version_detail_file)}")
+    
+    print_progress_summary()
 
 if __name__ == "__main__":
     main()
