@@ -16,12 +16,16 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.hazmat.backends import default_backend
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 SHOW_TRACEBACK = False  # Set to True for debugging
+BATCH_SIZE = 50  # Number of files to process in parallel
+MAX_WORKERS = 10  # Max parallel threads
 
 def log_error(message, error=None):
     """Log error with optional traceback"""
@@ -80,6 +84,8 @@ CONFIG = load_config()
 
 TOKEN_CACHE = {}
 ALLOWED_FILE_EXTENSIONS = None
+PROCESSED_COUNT = 0
+PROCESSED_LOCK = threading.Lock()
 
 # Progress tracking
 PROGRESS = {
@@ -123,19 +129,22 @@ COMPARISON_RESULTS = {
 
 def update_progress(file_name, library_name):
     """Update progress display"""
-    PROGRESS['processed_items'] += 1
-    PROGRESS['current_file'] = file_name
-    
-    if PROGRESS['processed_items'] % 10 == 0 or PROGRESS['processed_items'] == PROGRESS['total_items']:
-        elapsed = time.time() - PROGRESS['start_time']
-        if PROGRESS['processed_items'] > 0:
-            items_per_sec = PROGRESS['processed_items'] / elapsed if elapsed > 0 else 0
-            remaining = (PROGRESS['total_items'] - PROGRESS['processed_items']) / items_per_sec if items_per_sec > 0 else 0
-            
-            progress_pct = (PROGRESS['processed_items'] / PROGRESS['total_items']) * 100 if PROGRESS['total_items'] > 0 else 0
-            print(f"\r  [PROGRESS] {PROGRESS['processed_items']}/{PROGRESS['total_items']} ({progress_pct:.1f}%) | "
-                  f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
-                  f"Current: {file_name[:30]}...", end="", flush=True)
+    global PROCESSED_COUNT
+    with PROCESSED_LOCK:
+        PROCESSED_COUNT += 1
+        PROGRESS['processed_items'] = PROCESSED_COUNT
+        PROGRESS['current_file'] = file_name
+        
+        if PROCESSED_COUNT % 10 == 0 or PROCESSED_COUNT == PROGRESS['total_items']:
+            elapsed = time.time() - PROGRESS['start_time']
+            if PROCESSED_COUNT > 0:
+                items_per_sec = PROCESSED_COUNT / elapsed if elapsed > 0 else 0
+                remaining = (PROGRESS['total_items'] - PROCESSED_COUNT) / items_per_sec if items_per_sec > 0 else 0
+                
+                progress_pct = (PROCESSED_COUNT / PROGRESS['total_items']) * 100 if PROGRESS['total_items'] > 0 else 0
+                print(f"\r  [PROGRESS] {PROCESSED_COUNT}/{PROGRESS['total_items']} ({progress_pct:.1f}%) | "
+                      f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
+                      f"Current: {file_name[:30]}...", end="", flush=True)
 
 def print_progress_summary():
     """Print final progress summary"""
@@ -371,44 +380,43 @@ def get_file_extension(file_name):
     return os.path.splitext(file_name)[1].lower()
 
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL
+# SHAREPOINT DATA RETRIEVAL - FIXED
 # ============================================================
 
 def get_library_id(site_url, library_name):
-    """Get library ID by name with proper URL encoding"""
+    """Get library ID by EntityTypeName (not Title)"""
     print(f"\n[SEARCH] Finding library: {library_name}")
     
-    encoded_name = urllib.parse.quote(library_name, safe='')
-    url = f"{site_url}/_api/web/lists?$filter=Title eq '{encoded_name}'"
-    response = make_sharepoint_request(site_url, url)
-    
-    if response and 'd' in response and 'results' in response['d'] and len(response['d']['results']) > 0:
-        library = response['d']['results'][0]
-        print_success(f"Found library: '{library['Title']}' (ID: {library['Id']})")
-        return library['Id']
-    
-    print_warning("Exact match not found, trying case-insensitive search...")
-    
-    url = f"{site_url}/_api/web/lists?$filter=BaseTemplate eq 101"
+    # Get all document libraries with EntityTypeName
+    url = f"{site_url}/_api/web/lists?$filter=BaseTemplate eq 101&$select=Id,Title,EntityTypeName"
     response = make_sharepoint_request(site_url, url)
     
     if response and 'd' in response and 'results' in response['d']:
+        # First try: Match by EntityTypeName
         for lib in response['d']['results']:
-            if lib['Title'].lower() == library_name.lower():
-                print_success(f"Found library (case-insensitive): '{lib['Title']}' (ID: {lib['Id']})")
+            entity_type = lib.get('EntityTypeName', '')
+            if entity_type.lower() == library_name.lower():
+                print_success(f"Found library by EntityTypeName: '{lib['Title']}' (ID: {lib['Id']})")
                 return lib['Id']
         
-        print_warning("Case-insensitive match not found, trying partial match...")
+        # Second try: Match by Title
+        for lib in response['d']['results']:
+            if lib['Title'].lower() == library_name.lower():
+                print_success(f"Found library by Title: '{lib['Title']}' (ID: {lib['Id']})")
+                return lib['Id']
+        
+        # Third try: Partial match
         library_lower = library_name.lower()
         for lib in response['d']['results']:
-            if library_lower in lib['Title'].lower() or lib['Title'].lower() in library_lower:
-                print_success(f"Found partial match: '{lib['Title']}' (ID: {lib['Id']})")
+            if library_lower in lib['Title'].lower() or library_lower in lib.get('EntityTypeName', '').lower():
+                print_success(f"Found partial match: '{lib['Title']}' (EntityType: {lib.get('EntityTypeName', 'N/A')})")
                 print_info(f"Did you mean: '{lib['Title']}'?")
                 return lib['Id']
         
+        # List available libraries
         print(f"\n  [INFO] Available document libraries:")
         for lib in response['d']['results'][:15]:
-            print(f"    - '{lib['Title']}'")
+            print(f"    - Title: '{lib['Title']}', EntityType: '{lib.get('EntityTypeName', 'N/A')}'")
         if len(response['d']['results']) > 15:
             print(f"    ... and {len(response['d']['results']) - 15} more")
     
@@ -417,10 +425,11 @@ def get_library_id(site_url, library_name):
     return None
 
 def get_all_items_from_library(site_url, library_id, library_name):
-    """Get all items from library with pagination"""
+    """Get all items from library with pagination - FIXED fields"""
     print(f"\n[FOLDER] Fetching items from library: {library_name}")
     
-    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,Title,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size,Created,Modified,FileSystemObjectType&$top=5000"
+    # CORRECTED: Use proper field names
+    items_url = f"{site_url}/_api/web/lists(guid'{library_id}')/items?$select=Id,FileLeafRef,FileRef,File_x005f_x0020_x005f_Size,Created,Modified,FileSystemObjectType&$top=5000"
     
     all_items = []
     next_url = items_url
@@ -448,7 +457,10 @@ def get_all_items_from_library(site_url, library_id, library_name):
     return all_items
 
 def get_file_versions_complete(site_url, list_id, item_id):
-    """Get COMPLETE version information"""
+    """
+    Get COMPLETE version information from versions endpoint
+    This is where we get Created, Modified, Size per version
+    """
     try:
         versions_url = (
             f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
@@ -468,19 +480,23 @@ def get_file_versions_complete(site_url, list_id, item_id):
         
         versions = []
         for version in response['d'].get('results', []):
+            # Get Editor (who modified)
             editor = version.get('Editor', {})
             editor_name = editor.get('LookupValue', '') if isinstance(editor, dict) else ''
             editor_email = editor.get('Email', '') if isinstance(editor, dict) else ''
             editor_id = editor.get('LookupId', 0) if isinstance(editor, dict) else 0
             
+            # Get Author/Created By
             author = version.get('Author', {})
             author_name = author.get('LookupValue', '') if isinstance(author, dict) else ''
             author_email = author.get('Email', '') if isinstance(author, dict) else ''
             author_id = author.get('LookupId', 0) if isinstance(author, dict) else 0
             
+            # Get direct fields
             created_by = version.get('Created_x005f_x0020_x005f_By', '')
             modified_by = version.get('Modified_x005f_x0020_x005f_By', '')
             
+            # Parse file size from versions endpoint
             size_str = version.get('File_x005f_x0020_x005f_Size', '0')
             size = safe_int_conversion(size_str)
             
@@ -511,17 +527,39 @@ def get_file_versions_complete(site_url, list_id, item_id):
         log_error(f"Error getting versions for item {item_id}: {str(e)}", e)
         return []
 
-def get_file_details(item):
-    """Extract file details from item"""
+def process_item_batch(site_url, list_id, items, library_name):
+    """Process a batch of items in parallel"""
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_item = {
+            executor.submit(get_file_details_with_complete_versions, site_url, list_id, item): item 
+            for item in items
+        }
+        
+        for future in as_completed(future_to_item):
+            try:
+                file_details = future.result()
+                if file_details:
+                    results.append(file_details)
+                update_progress(file_details.get('name', 'Unknown'), library_name)
+            except Exception as e:
+                log_error(f"Error processing item: {str(e)}", e)
+    
+    return results
+
+def get_file_details_with_complete_versions(site_url, list_id, item):
+    """
+    Get file details with COMPLETE version information from versions endpoint
+    """
+    # Get basic file info from items endpoint
     file_name = item.get('FileLeafRef', '')
     if not file_name:
-        file_name = item.get('Title', f"Item_{item.get('Id', 0)}")
+        file_name = f"Item_{item.get('Id', 0)}"
     
     file_size = item.get('File_x005f_x0020_x005f_Size', 0)
-    if not file_size or file_size == 0:
-        file_size = item.get('FileSize', 0)
     
-    return {
+    file_details = {
         'id': item.get('Id', 0),
         'name': file_name,
         'name_without_ext': get_file_name_without_extension(file_name),
@@ -535,47 +573,52 @@ def get_file_details(item):
         'modified_formatted': format_datetime(item.get('Modified', 'N/A')),
         'is_folder': item.get('FileSystemObjectType', 0) == 1
     }
-
-def get_file_details_with_complete_versions(site_url, list_id, item):
-    """Get file details with COMPLETE version information"""
-    file_details = get_file_details(item)
     
-    if not file_details['is_folder']:
-        versions = get_file_versions_complete(site_url, list_id, item.get('Id'))
-        file_details['versions'] = versions
-        file_details['version_count'] = len(versions)
-        
-        if versions:
-            latest = versions[0]
-            file_details['last_modified_by'] = latest.get('editor_name', '')
-            file_details['last_modified_by_email'] = latest.get('editor_email', '')
-            file_details['last_modified_date'] = latest.get('modified_formatted', '')
-            file_details['last_modified_size'] = latest.get('size_mb', 0)
-            
-            all_sizes = [v['size'] for v in versions]
-            file_details['version_stats'] = {
-                'min_size': bytes_to_mb(min(all_sizes)) if all_sizes else 0,
-                'max_size': bytes_to_mb(max(all_sizes)) if all_sizes else 0,
-                'avg_size': bytes_to_mb(sum(all_sizes) // len(all_sizes)) if all_sizes else 0,
-                'total_versions_size': bytes_to_mb(sum(all_sizes)) if all_sizes else 0
-            }
-            
-            editors = set()
-            for v in versions:
-                if v['editor_name']:
-                    editors.add(v['editor_name'])
-            file_details['unique_editors'] = list(editors)
-            file_details['editor_count'] = len(editors)
-        else:
-            file_details['last_modified_by'] = ''
-            file_details['last_modified_by_email'] = ''
-            file_details['last_modified_date'] = file_details['modified_formatted']
-            file_details['version_stats'] = {}
-            file_details['unique_editors'] = []
-            file_details['editor_count'] = 0
-    else:
+    # Skip folders
+    if file_details['is_folder']:
         file_details['version_count'] = 0
         file_details['versions'] = []
+        file_details['last_modified_by'] = ''
+        file_details['last_modified_by_email'] = ''
+        file_details['last_modified_date'] = file_details['modified_formatted']
+        file_details['version_stats'] = {}
+        file_details['unique_editors'] = []
+        file_details['editor_count'] = 0
+        return file_details
+    
+    # Get ALL version details from versions endpoint
+    versions = get_file_versions_complete(site_url, list_id, item.get('Id'))
+    
+    # Store complete version data
+    file_details['versions'] = versions
+    file_details['version_count'] = len(versions)
+    
+    # Version statistics from versions endpoint
+    if versions:
+        # Latest version (index 0 since sorted by Created desc)
+        latest = versions[0]
+        file_details['last_modified_by'] = latest.get('editor_name', '')
+        file_details['last_modified_by_email'] = latest.get('editor_email', '')
+        file_details['last_modified_date'] = latest.get('modified_formatted', '')
+        file_details['last_modified_size'] = latest.get('size_mb', 0)
+        
+        # Version summary stats
+        all_sizes = [v['size'] for v in versions]
+        file_details['version_stats'] = {
+            'min_size': bytes_to_mb(min(all_sizes)) if all_sizes else 0,
+            'max_size': bytes_to_mb(max(all_sizes)) if all_sizes else 0,
+            'avg_size': bytes_to_mb(sum(all_sizes) // len(all_sizes)) if all_sizes else 0,
+            'total_versions_size': bytes_to_mb(sum(all_sizes)) if all_sizes else 0
+        }
+        
+        # Get unique editors
+        editors = set()
+        for v in versions:
+            if v['editor_name']:
+                editors.add(v['editor_name'])
+        file_details['unique_editors'] = list(editors)
+        file_details['editor_count'] = len(editors)
+    else:
         file_details['last_modified_by'] = ''
         file_details['last_modified_by_email'] = ''
         file_details['last_modified_date'] = file_details['modified_formatted']
@@ -586,11 +629,13 @@ def get_file_details_with_complete_versions(site_url, list_id, item):
     return file_details
 
 # ============================================================
-# COMPARISON FUNCTIONS
+# BUILD FILE MAP WITH BATCH PROCESSING
 # ============================================================
 
 def build_file_map(items, site_url, list_id, library_name):
-    """Build a map of files by name with details"""
+    """Build a map of files by name with details using batch processing"""
+    global PROCESSED_COUNT
+    
     file_map = {}
     total_size = 0
     total_versions = 0
@@ -599,34 +644,42 @@ def build_file_map(items, site_url, list_id, library_name):
     files_count = 0
     
     print(f"\n[BUILD] Building file map for {library_name}...")
+    print(f"[INFO] Total items: {len(items)}")
+    print(f"[INFO] Processing in batches of {BATCH_SIZE} with {MAX_WORKERS} parallel threads")
     
+    # Reset progress
+    PROCESSED_COUNT = 0
     PROGRESS['total_items'] = len(items)
     PROGRESS['processed_items'] = 0
     PROGRESS['current_library'] = library_name
     PROGRESS['start_time'] = time.time()
     
-    for item in items:
-        file_details = get_file_details_with_complete_versions(site_url, list_id, item)
+    # Process items in batches
+    for i in range(0, len(items), BATCH_SIZE):
+        batch = items[i:i+BATCH_SIZE]
+        print(f"\n  [BATCH] Processing batch {i//BATCH_SIZE + 1}/{(len(items)-1)//BATCH_SIZE + 1} ({len(batch)} items)")
         
-        if file_details['is_folder']:
-            folders += 1
-            update_progress(file_details['name'] or "Folder", library_name)
-            continue
+        # Process batch in parallel
+        batch_results = process_item_batch(site_url, list_id, batch, library_name)
         
-        key = file_details['name_without_ext'].lower()
-        
-        if key not in file_map:
-            file_map[key] = []
-        
-        file_map[key].append(file_details)
-        files_count += 1
-        
-        total_size += file_details['size']
-        total_versions += file_details['version_count']
-        if file_details['version_count'] > 0:
-            files_with_versions += 1
-        
-        update_progress(file_details['name'], library_name)
+        # Add results to file map
+        for file_details in batch_results:
+            if file_details['is_folder']:
+                folders += 1
+                continue
+            
+            key = file_details['name_without_ext'].lower()
+            
+            if key not in file_map:
+                file_map[key] = []
+            
+            file_map[key].append(file_details)
+            files_count += 1
+            
+            total_size += file_details['size']
+            total_versions += file_details['version_count']
+            if file_details['version_count'] > 0:
+                files_with_versions += 1
     
     print()
     
@@ -637,6 +690,10 @@ def build_file_map(items, site_url, list_id, library_name):
     print(f"  Files with versions: {files_with_versions}")
     
     return file_map, total_size, total_versions, files_with_versions
+
+# ============================================================
+# COMPARISON FUNCTIONS
+# ============================================================
 
 def compare_libraries(source_map, dest_map, source_site, dest_site):
     """Compare source and destination file maps"""
@@ -1127,6 +1184,8 @@ def main():
         print("[WARNING] TRACEBACK MODE: ENABLED (detailed error output)")
     else:
         print("[INFO] TRACEBACK MODE: DISABLED (set SHOW_TRACEBACK=True for debugging)")
+    
+    print(f"[INFO] Batch Size: {BATCH_SIZE}, Max Workers: {MAX_WORKERS}")
     
     source_site = CONFIG['source']['site_url']
     dest_site = CONFIG['destination']['site_url']
