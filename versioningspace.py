@@ -492,8 +492,8 @@ def get_all_items_from_library(site_url, library_id):
 def get_file_versions(site_url, list_id, item_id):
     """Get ALL versions for a specific item with creator and modifier info"""
     try:
-        # Add expand for CreatedBy and ModifiedBy fields
-        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions?$expand=CreatedBy,ModifiedBy"
+        # No expand needed - fields are directly available in the version object
+        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
         
         response = make_sharepoint_request(site_url, versions_url)
         
@@ -508,31 +508,17 @@ def get_file_versions(site_url, list_id, item_id):
             # Get size from version
             version_size = version.get('File_x005f_x0020_x005f_Size', 0)
             
-            # Extract created by user
+            # Get created by - directly from the field
             created_by = 'N/A'
-            if 'CreatedBy' in version and version['CreatedBy']:
-                created_by_user = version['CreatedBy']
-                if isinstance(created_by_user, dict):
-                    created_by = created_by_user.get('Title', 'N/A')
-                    if created_by == 'N/A':
-                        created_by = created_by_user.get('Email', 'N/A')
-                    # If still N/A, try to get from login name
-                    if created_by == 'N/A':
-                        login_name = created_by_user.get('LoginName', '')
-                        created_by = extract_user_from_claim(login_name)
+            created_by_field = version.get('Created_x005f_x0020_x005f_By', '')
+            if created_by_field:
+                created_by = extract_user_from_claim(created_by_field)
             
-            # Extract modified by user
+            # Get modified by - directly from the field
             modified_by = 'N/A'
-            if 'ModifiedBy' in version and version['ModifiedBy']:
-                modified_by_user = version['ModifiedBy']
-                if isinstance(modified_by_user, dict):
-                    modified_by = modified_by_user.get('Title', 'N/A')
-                    if modified_by == 'N/A':
-                        modified_by = modified_by_user.get('Email', 'N/A')
-                    # If still N/A, try to get from login name
-                    if modified_by == 'N/A':
-                        login_name = modified_by_user.get('LoginName', '')
-                        modified_by = extract_user_from_claim(login_name)
+            modified_by_field = version.get('Modified_x005f_x0020_x005f_By', '')
+            if modified_by_field:
+                modified_by = extract_user_from_claim(modified_by_field)
             
             version_data = {
                 'version_id': version.get('VersionId', 0),
