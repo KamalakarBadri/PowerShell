@@ -42,6 +42,14 @@ CONFIG = {
     "min_file_size_mb": 200,  # Only check files > 200 MB
     "keep_versions_options": [20, 50, 100],  # Retention policies
     
+    # Item range filter (set both to 0 to process all items)
+    "item_range_start": 0,  # Starting item ID (inclusive)
+    "item_range_end": 0,    # Ending item ID (inclusive) - 0 means no limit
+    
+    # Output options
+    "output_all_files": True,   # True: Output all files, False: Output only files with versions checked
+    "include_user_fields": True, # True: Include Created By and Modified By fields
+    
     # Performance
     "batch_size": 30,
     "max_workers": 5,
@@ -50,7 +58,7 @@ CONFIG = {
     "output_dir": "reports"
 }
 
-# File extensions to process
+# File extensions to process (set to [] to process all files)
 FILE_EXTENSIONS = ["docx", "pdf", "xlsx"]
 
 # ============================================================
@@ -335,11 +343,20 @@ def calculate_version_space_savings(versions, keep_last_n):
             'keep_size_bytes': 0,
             'delete_size_bytes': 0,
             'space_saved_gb': 0.0,
-            'delete_range': 'N/A'
+            'delete_range': 'N/A',
+            'created_by': 'N/A',
+            'modified_by': 'N/A'
         }
     
     sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
     total_versions = len(sorted_versions)
+    
+    # Get first and last version users
+    first_version = sorted_versions[0] if sorted_versions else {}
+    last_version = sorted_versions[-1] if sorted_versions else {}
+    
+    created_by = first_version.get('created_by', 'N/A')
+    modified_by = last_version.get('modified_by', 'N/A')
     
     if total_versions <= keep_last_n:
         keep_count = total_versions
@@ -367,11 +384,49 @@ def calculate_version_space_savings(versions, keep_last_n):
         'keep_size_bytes': keep_size_bytes,
         'delete_size_bytes': delete_size_bytes,
         'space_saved_gb': bytes_to_gb(delete_size_bytes),
-        'delete_range': delete_range
+        'delete_range': delete_range,
+        'created_by': created_by,
+        'modified_by': modified_by
     }
 
+def extract_user_from_claim(user_claim):
+    """Extract username from claim string"""
+    if not user_claim:
+        return 'N/A'
+    
+    # Handle different claim formats
+    if '|' in user_claim:
+        parts = user_claim.split('|')
+        if len(parts) > 1:
+            # Check if it's email format
+            if '@' in parts[-1]:
+                return parts[-1]
+            return parts[-1]
+    
+    # Check if it's already an email
+    if '@' in user_claim:
+        return user_claim
+    
+    return user_claim
+
+def is_within_item_range(item_id):
+    """Check if item ID is within the configured range"""
+    start = CONFIG.get('item_range_start', 0)
+    end = CONFIG.get('item_range_end', 0)
+    
+    if start == 0 and end == 0:
+        return True  # No range filter
+    
+    if start > 0 and item_id < start:
+        return False
+    
+    if end > 0 and item_id > end:
+        return False
+    
+    return True
+
 # ============================================================
-# SHAREPOINT DATA RETRIEVAL - NO Expand, NO CAML
+# SHAREPOINT DATA RETRIEVAL
 # ============================================================
 
 def get_all_libraries(site_url):
@@ -435,9 +490,10 @@ def get_all_items_from_library(site_url, library_id):
     return all_items
 
 def get_file_versions(site_url, list_id, item_id):
-    """Get ALL versions for a specific item"""
+    """Get ALL versions for a specific item with creator and modifier info"""
     try:
-        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions"
+        # Add expand for CreatedBy and ModifiedBy fields
+        versions_url = f"{site_url}/_api/Web/Lists(guid'{list_id}')/items({item_id})/versions?$expand=CreatedBy,ModifiedBy"
         
         response = make_sharepoint_request(site_url, versions_url)
         
@@ -452,13 +508,41 @@ def get_file_versions(site_url, list_id, item_id):
             # Get size from version
             version_size = version.get('File_x005f_x0020_x005f_Size', 0)
             
+            # Extract created by user
+            created_by = 'N/A'
+            if 'CreatedBy' in version and version['CreatedBy']:
+                created_by_user = version['CreatedBy']
+                if isinstance(created_by_user, dict):
+                    created_by = created_by_user.get('Title', 'N/A')
+                    if created_by == 'N/A':
+                        created_by = created_by_user.get('Email', 'N/A')
+                    # If still N/A, try to get from login name
+                    if created_by == 'N/A':
+                        login_name = created_by_user.get('LoginName', '')
+                        created_by = extract_user_from_claim(login_name)
+            
+            # Extract modified by user
+            modified_by = 'N/A'
+            if 'ModifiedBy' in version and version['ModifiedBy']:
+                modified_by_user = version['ModifiedBy']
+                if isinstance(modified_by_user, dict):
+                    modified_by = modified_by_user.get('Title', 'N/A')
+                    if modified_by == 'N/A':
+                        modified_by = modified_by_user.get('Email', 'N/A')
+                    # If still N/A, try to get from login name
+                    if modified_by == 'N/A':
+                        login_name = modified_by_user.get('LoginName', '')
+                        modified_by = extract_user_from_claim(login_name)
+            
             version_data = {
                 'version_id': version.get('VersionId', 0),
                 'version_label': version.get('VersionLabel', ''),
                 'created': version.get('Created', ''),
                 'is_current': version.get('IsCurrentVersion', False),
                 'size': safe_int_conversion(version_size),
-                'checkin_comment': version.get('OData__x005f_CheckinComment', '')
+                'checkin_comment': version.get('OData__x005f_CheckinComment', ''),
+                'created_by': created_by,
+                'modified_by': modified_by
             }
             versions.append(version_data)
         
@@ -482,7 +566,8 @@ def get_file_details_from_item(item):
         'file_name': file_name,
         'file_path': file_path,
         'created': item.get('Created', 'N/A'),
-        'modified': item.get('Modified', 'N/A')
+        'modified': item.get('Modified', 'N/A'),
+        'item_id': item.get('Id', 0)
     }
 
 # ============================================================
@@ -526,6 +611,10 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         if fsob_type != 0:
             return None
         
+        # Check item range
+        if not is_within_item_range(item_id):
+            return None
+        
         file_details = get_file_details_from_item(item)
         
         # Get ALL versions first
@@ -534,11 +623,21 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
         
         # Get current file size from the latest version
         current_file_size = 0
+        first_version_created_by = 'N/A'
+        last_version_modified_by = 'N/A'
+        
         if versions:
             # Sort by created date to get latest
             sorted_versions = sorted(versions, key=lambda x: x.get('created', ''))
             latest_version = sorted_versions[-1]  # Last one is newest
             current_file_size = latest_version.get('size', 0)
+            
+            # Get creator of first version
+            first_version = sorted_versions[0]
+            first_version_created_by = first_version.get('created_by', 'N/A')
+            
+            # Get modifier of last version
+            last_version_modified_by = latest_version.get('modified_by', 'N/A')
         
         file_size_mb = bytes_to_mb(current_file_size)
         
@@ -569,7 +668,9 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
                 savings_data[f'Keep_{keep_versions}'] = {
                     'delete_count': savings['delete_count'],
                     'space_saved_gb': savings['space_saved_gb'],
-                    'delete_range': savings['delete_range']
+                    'delete_range': savings['delete_range'],
+                    'created_by': first_version_created_by,
+                    'modified_by': last_version_modified_by
                 }
         
         # If no versions, use current file size as total
@@ -594,10 +695,15 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
             'modified_formatted': format_datetime(file_details['modified']),
             'first_version_formatted': format_datetime(first_version_date),
             'last_version_formatted': format_datetime(last_version_date),
+            'first_version_created_by': first_version_created_by,
+            'last_version_modified_by': last_version_modified_by,
             'savings_data': savings_data
         }
         
-        append_to_report(output_file, file_data)
+        # Check if we should output this file based on configuration
+        output_all_files = CONFIG.get('output_all_files', True)
+        if output_all_files or check_versions:
+            append_to_report(output_file, file_data)
         
         # Print progress
         file_name_short = file_details['file_name'][:30] + "..." if len(file_details['file_name']) > 30 else file_details['file_name']
@@ -609,13 +715,13 @@ def process_single_file(site_url, list_id, item, library_title, output_file):
             delete_count = savings_first.get('delete_count', 0)
             space_saved = savings_first.get('space_saved_gb', 0)
             
-            print(f"\n  {size_indicator} {file_name_short} [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
+            print(f"\n  {size_indicator} {file_name_short} [ID:{item_id}] [{file_size_mb:.1f}MB] - {version_count} versions, {bytes_to_mb(total_versions_size):.1f}MB total", end="")
             if delete_count > 0:
-                print(f" | Delete {delete_count} versions | Save: {space_saved:.2f}GB")
+                print(f" | Delete {delete_count} versions | Save: {space_saved:.2f}GB | Created: {first_version_created_by[:20]} | Modified: {last_version_modified_by[:20]}")
             else:
-                print()
+                print(f" | Created: {first_version_created_by[:20]} | Modified: {last_version_modified_by[:20]}")
         else:
-            print(f"\n  ⚪ {file_name_short} [{file_size_mb:.1f}MB] - Skip (≤{CONFIG['min_file_size_mb']}MB)")
+            print(f"\n  ⚪ {file_name_short} [ID:{item_id}] [{file_size_mb:.1f}MB] - Skip (≤{CONFIG['min_file_size_mb']}MB)")
         
         return file_data
         
@@ -637,6 +743,10 @@ def initialize_report(output_file):
         'Last Version Date', 'Total Versions Size (MB)', 
         'File Created', 'File Modified', 'Versions Checked'
     ]
+    
+    # Add user fields if configured
+    if CONFIG.get('include_user_fields', True):
+        base_fieldnames.extend(['First Version Created By', 'Last Version Modified By'])
     
     policy_fieldnames = []
     for keep in CONFIG['keep_versions_options']:
@@ -675,6 +785,11 @@ def append_to_report(output_file, data):
                 'File Modified': data.get('modified_formatted', 'N/A'),
                 'Versions Checked': 'Yes' if data.get('versions_checked', False) else 'No'
             }
+            
+            # Add user fields if configured
+            if CONFIG.get('include_user_fields', True):
+                row['First Version Created By'] = data.get('first_version_created_by', 'N/A')
+                row['Last Version Modified By'] = data.get('last_version_modified_by', 'N/A')
             
             savings_data = data.get('savings_data', {})
             for keep in CONFIG['keep_versions_options']:
@@ -731,15 +846,24 @@ def process_site(site_url):
     for lib in libraries:
         print(f"  - {lib['title']}")
     
+    # Display range filter information
+    start = CONFIG.get('item_range_start', 0)
+    end = CONFIG.get('item_range_end', 0)
+    range_filter = "No range filter" if (start == 0 and end == 0) else f"Item ID {start} to {end}"
+    
     print(f"\n⚡ Performance Settings:")
     print(f"  - Batch size: {CONFIG['batch_size']} files per batch")
     print(f"  - Max workers: {CONFIG['max_workers']} concurrent threads")
     print(f"  - Min size for version check: {CONFIG['min_file_size_mb']} MB")
-    print(f"  - Policies: {CONFIG['keep_versions_options']} in ONE report\n")
+    print(f"  - Policies: {CONFIG['keep_versions_options']} in ONE report")
+    print(f"  - Item Range: {range_filter}")
+    print(f"  - Output all files: {CONFIG.get('output_all_files', True)}")
+    print(f"  - Include user fields: {CONFIG.get('include_user_fields', True)}\n")
     
     all_file_data = []
     total_files = 0
     skipped_by_extension = 0
+    skipped_by_range = 0
     batch_count = 0
     
     site_stats = {
@@ -781,18 +905,28 @@ def process_site(site_url):
             print(f"  No files found in {library['title']}")
             continue
         
-        # Filter by extension
+        # Filter by extension and range
         valid_files = []
         for f in files:
             file_name = f.get('FileLeafRef', f"Item_{f.get('Id', 0)}")
-            if should_process_file(file_name):
-                valid_files.append(f)
-            else:
+            item_id = f.get('Id', 0)
+            
+            # Check extension
+            if not should_process_file(file_name):
                 skipped_by_extension += 1
+                continue
+            
+            # Check range
+            if not is_within_item_range(item_id):
+                skipped_by_range += 1
+                continue
+            
+            valid_files.append(f)
         
         print(f"  Found {len(files)} files in {library['title']}")
         print(f"  - Files matching extension filter: {len(valid_files)}")
         print(f"  - Files skipped by extension filter: {len(files) - len(valid_files)}")
+        print(f"  - Files skipped by range filter: {skipped_by_range}")
         
         total_files += len(valid_files)
         
@@ -840,7 +974,8 @@ def process_site(site_url):
     print(f"\n{'='*60}")
     print(f"✅ Site processing completed: {site_prefix}")
     print(f"   Processed {len(all_file_data)} files")
-    print(f"   Skipped {skipped_by_extension} files due to extension filter")
+    print(f"   Skipped by extension: {skipped_by_extension} files")
+    print(f"   Skipped by range: {skipped_by_range} files")
     print(f"   Report saved: {output_file}")
     
     close_reports()
@@ -856,6 +991,11 @@ def create_summary_report(all_site_stats):
     summary_file = os.path.join(CONFIG['output_dir'], f"Summary_All_Sites_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
     
     base_fieldnames = ['Site URL', 'Site Prefix', 'Total Files', 'Files Checked', 'Current Size (GB)', 'Versions Size (GB)', 'Total Versions']
+    
+    # Add range info to summary
+    start = CONFIG.get('item_range_start', 0)
+    end = CONFIG.get('item_range_end', 0)
+    base_fieldnames.extend(['Item Range Start', 'Item Range End'])
     
     policy_fieldnames = []
     for keep in CONFIG['keep_versions_options']:
@@ -880,7 +1020,9 @@ def create_summary_report(all_site_stats):
                 'Files Checked': stats['files_checked'],
                 'Current Size (GB)': f"{bytes_to_gb(stats['total_current_size_bytes']):.2f}",
                 'Versions Size (GB)': f"{bytes_to_gb(stats['total_versions_size_bytes']):.2f}",
-                'Total Versions': stats['total_versions_count']
+                'Total Versions': stats['total_versions_count'],
+                'Item Range Start': CONFIG.get('item_range_start', 0),
+                'Item Range End': CONFIG.get('item_range_end', 0)
             }
             
             for keep in CONFIG['keep_versions_options']:
@@ -914,6 +1056,14 @@ def print_global_summary(all_site_stats):
     print(f"  Version Policies: {CONFIG['keep_versions_options']}")
     print(f"  Total Files Processed: {total_files}")
     print(f"  Files with Version Check: {total_files_checked}")
+    
+    # Display range filter
+    start = CONFIG.get('item_range_start', 0)
+    end = CONFIG.get('item_range_end', 0)
+    if start > 0 or end > 0:
+        print(f"  Item Range Filter: {start} to {end}")
+    else:
+        print(f"  Item Range Filter: No filter")
     
     print(f"\n💾 SIZE STATISTICS:")
     print(f"  Total Current File Size: {bytes_to_gb(total_current_size):.2f} GB")
@@ -958,7 +1108,7 @@ def main():
     """Main function"""
     print("="*100)
     print("📊 BULK SITE VERSION HISTORY REPORT GENERATOR")
-    print("(Gets file size from versions - NO expand needed)")
+    print("(Gets file size from versions - with creator/modifier info)")
     print("="*100)
     
     global ALLOWED_FILE_EXTENSIONS
@@ -966,11 +1116,18 @@ def main():
     
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
     
+    start = CONFIG.get('item_range_start', 0)
+    end = CONFIG.get('item_range_end', 0)
+    range_filter = "No range filter" if (start == 0 and end == 0) else f"{start} to {end}"
+    
     print(f"\n📌 Configuration:")
     print(f"  Total Sites: {len(SITES)}")
     print(f"  Version Policies: {CONFIG['keep_versions_options']}")
     print(f"  Min File Size: {CONFIG['min_file_size_mb']} MB")
     print(f"  File Extensions: {FILE_EXTENSIONS if FILE_EXTENSIONS else 'All files'}")
+    print(f"  Item Range: {range_filter}")
+    print(f"  Output All Files: {CONFIG.get('output_all_files', True)}")
+    print(f"  Include User Fields: {CONFIG.get('include_user_fields', True)}")
     print(f"  Output Directory: {CONFIG['output_dir']}")
     print("="*100)
     
