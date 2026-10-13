@@ -6,7 +6,7 @@ Workflow A: Not Found -> Enabled users (via User Account Status Change History)
   File1 -> File2/File3 -> File4/File5
 
 Workflow B: Manager Changed users (via Manager Change History)
-  File7 -> File8/File9 -> File10/File11
+  File6 -> File7/File8 -> File9/File10
 
 Both workflows use the SAME mismatch-check + repair logic.
 Master report gets PUID columns written back for both.
@@ -62,19 +62,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_timeout_seconds": 60,
 }
 
-# Workflow A files (Not Found -> Enabled)
+# --- Workflow A: Not Found -> Enabled ---
 FILE1 = "File1.csv"   # candidates
 FILE2 = "File2.csv"   # mismatch found
 FILE3 = "File3.csv"   # mismatch not found
 FILE4 = "File4.csv"   # repair success (append)
 FILE5 = "File5.csv"   # repair failed  (append)
 
-# Workflow B files (Manager Change)
-FILE7 = "File7.csv"    # candidates
-FILE8 = "File8.csv"    # mismatch found
-FILE9 = "File9.csv"    # mismatch not found
-FILE10 = "File10.csv"  # repair success (append)
-FILE11 = "File11.csv"  # repair failed  (append)
+# --- Workflow B: Manager Change ---
+FILE6 = "File6.csv"    # candidates
+FILE7 = "File7.csv"    # mismatch found
+FILE8 = "File8.csv"    # mismatch not found
+FILE9 = "File9.csv"    # repair success (append)
+FILE10 = "File10.csv"  # repair failed  (append)
 
 
 # ============================================================================
@@ -348,7 +348,7 @@ def is_not_found_to_enabled(row: Dict[str, str]) -> bool:
 
 
 def is_manager_changed(row: Dict[str, str]) -> bool:
-    """Workflow B trigger: any non-empty Manager Change History."""
+    """Workflow B trigger: any non-empty Manager Change History with a transition."""
     history = safe_str(row.get("Manager Change History", ""))
     if not history:
         return False
@@ -369,10 +369,6 @@ def build_candidates(
     existing_candidates: Dict[str, Dict[str, str]],
     log: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """
-    Generic candidate builder.
-    detector(row) -> bool  determines if row qualifies.
-    """
     ts = now_iso()
     workflow = {
         "mismatch_status", "mismatch_checked_at",
@@ -384,7 +380,6 @@ def build_candidates(
     for r in master_rows:
         if not detector(r):
             continue
-        # Skip if this workflow already succeeded for this site
         surl = safe_str(r.get("Site URL", ""))
         prior = existing_candidates.get(surl, {})
         if (prior.get("repair_status") or "").lower() == "success":
@@ -403,7 +398,6 @@ def build_candidates(
 
     log.info("[%s] candidates from master: %d", trigger_label, len(candidates))
 
-    # Merge with existing candidate file (preserve workflow state)
     merged: Dict[str, Dict[str, Any]] = {}
     seen = set()
     for rec in candidates:
@@ -428,7 +422,6 @@ def build_candidates(
             })
             merged[url] = rec
 
-    # Preserve old rows still needing work (retries)
     for url, old in existing_candidates.items():
         if url in seen:
             continue
@@ -629,7 +622,6 @@ def update_master_with_puid(master_path: Path, rows: List[Dict[str, Any]],
         surl = safe_str(m.get("Site URL", ""))
         f = by_id.get(sid) or by_url.get(surl)
         if f:
-            # Merge: don't overwrite a success with a pending from other workflow
             current = (m.get("PUID Repair Status") or "").lower()
             new_status = f.get("repair_status") or f.get("mismatch_status") or ""
             if current != "success" or new_status.lower() == "success":
@@ -672,45 +664,40 @@ def run_workflow(
     skip_mismatch: bool,
     log: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """
-    Run one workflow (A or B). Returns updated candidate rows for master writeback.
-    """
     log.info("=" * 70)
     log.info("Workflow: %s", trigger_label)
     log.info("=" * 70)
 
     cand_path = report_dir / candidate_file
-    f2_path = report_dir / mismatch_found_file
-    f3_path = report_dir / mismatch_notfound_file
-    f4_path = report_dir / success_file
-    f5_path = report_dir / failed_file
+    f_found_path = report_dir / mismatch_found_file
+    f_notfound_path = report_dir / mismatch_notfound_file
+    f_success_path = report_dir / success_file
+    f_failed_path = report_dir / failed_file
 
     existing = {r.get("site_url", ""): r for r in read_csv(cand_path) if r.get("site_url")}
     candidates = build_candidates(master_rows, detector, trigger_label, existing, log)
     write_csv(cand_path, candidates, CANDIDATE_FIELDS)
     log.info("%s written: %d row(s)", candidate_file, len(candidates))
 
-    # Mismatch check
-    if skip_mismatch and f2_path.exists():
-        found = read_csv(f2_path)
+    if skip_mismatch and f_found_path.exists():
+        found = read_csv(f_found_path)
         log.info("Skipping mismatch, using %s: %d row(s)", mismatch_found_file, len(found))
     else:
         found, not_found = run_mismatch(client, candidates, max_workers, log)
-        write_csv(f2_path, found, MISMATCH_FIELDS)
-        write_csv(f3_path, not_found, MISMATCH_FIELDS)
+        write_csv(f_found_path, found, MISMATCH_FIELDS)
+        write_csv(f_notfound_path, not_found, MISMATCH_FIELDS)
         log.info("%s (mismatch found): %d", mismatch_found_file, len(found))
         log.info("%s (mismatch not found): %d", mismatch_notfound_file, len(not_found))
         write_csv(cand_path, candidates, CANDIDATE_FIELDS)
 
-    # Repair
     if not apply_changes:
         log.info("Run mode 'report_only' -> repairs skipped")
     elif not found:
         log.info("No mismatch records -> no repairs")
     else:
         success, failed = run_repairs(client, found, max_workers, log)
-        append_csv(f4_path, success, REPAIR_FIELDS)
-        append_csv(f5_path, failed, REPAIR_FIELDS)
+        append_csv(f_success_path, success, REPAIR_FIELDS)
+        append_csv(f_failed_path, failed, REPAIR_FIELDS)
         log.info("%s (success): appended %d", success_file, len(success))
         log.info("%s (failed): appended %d", failed_file, len(failed))
 
@@ -748,8 +735,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--master-report", default=None)
     p.add_argument("--skip-mismatch", action="store_true")
-    p.add_argument("--only", choices=["notfound", "manager", "both"], default="both",
-                   help="Which workflow(s) to run")
+    p.add_argument("--only", choices=["notfound", "manager", "both"], default="both")
     p.add_argument("--max-workers", type=int, default=None)
     return p.parse_args()
 
@@ -780,7 +766,7 @@ def main() -> int:
     all_rows: List[Dict[str, Any]] = []
 
     try:
-        # ---- Workflow A: Not Found -> Enabled ----
+        # ---- Workflow A: Not Found -> Enabled → File1..File5 ----
         if args.only in ("notfound", "both"):
             rows_a = run_workflow(
                 client, report_dir, master_rows,
@@ -798,17 +784,17 @@ def main() -> int:
             )
             all_rows.extend(rows_a)
 
-        # ---- Workflow B: Manager Change ----
+        # ---- Workflow B: Manager Change → File6..File10 ----
         if args.only in ("manager", "both"):
             rows_b = run_workflow(
                 client, report_dir, master_rows,
                 detector=is_manager_changed,
                 trigger_label="manager_change",
-                candidate_file=FILE7,
-                mismatch_found_file=FILE8,
-                mismatch_notfound_file=FILE9,
-                success_file=FILE10,
-                failed_file=FILE11,
+                candidate_file=FILE6,
+                mismatch_found_file=FILE7,
+                mismatch_notfound_file=FILE8,
+                success_file=FILE9,
+                failed_file=FILE10,
                 apply_changes=apply_changes,
                 max_workers=max_workers,
                 skip_mismatch=args.skip_mismatch,
@@ -816,8 +802,7 @@ def main() -> int:
             )
             all_rows.extend(rows_b)
 
-        # ---- Write master PUID columns ----
-        # Deduplicate by site_url, prefer success over pending
+        # ---- Master PUID writeback (deduped, success wins) ----
         best: Dict[str, Dict[str, Any]] = {}
         for r in all_rows:
             url = r.get("site_url", "")
@@ -839,11 +824,11 @@ def main() -> int:
         log.info("    File4 : %s", report_dir / FILE4)
         log.info("    File5 : %s", report_dir / FILE5)
         log.info("  Workflow B (Manager Change):")
+        log.info("    File6  : %s", report_dir / FILE6)
         log.info("    File7  : %s", report_dir / FILE7)
         log.info("    File8  : %s", report_dir / FILE8)
         log.info("    File9  : %s", report_dir / FILE9)
         log.info("    File10 : %s", report_dir / FILE10)
-        log.info("    File11 : %s", report_dir / FILE11)
         log.info("=" * 70)
         return 0
 
