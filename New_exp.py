@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-PUID Mismatch Repair for "Not Found -> Enabled" OneDrive owners.
+OneDrive PUID Mismatch Repair — driven by master report.
 
-Flow:
-  1. Read master report.
-  2. Find rows where Owner Status in (Not Found, Disabled, Deleted, ...).
-  3. Re-check owner in Graph -> if NOW Enabled, add to File1.csv.
-  4. For each File1 row (repair_status != success):
-       - Compare site owner NameId vs reference-site NameId
-       - Mismatch  -> File2.csv
-       - Match     -> File3.csv
-  5. If run_mode = apply, repair each File2 row -> File4 (success) / File5 (failed).
-  6. Write PUID status back to master report.
+Workflow:
+  PHASE 1  (your existing master_report.py) — refresh master CSV.
+
+  PHASE 2  (this script):
+    1. Read master CSV.
+    2. Filter rows where:
+         - "User Account Status Change History" contains a "Not Found >> Enabled" transition
+         - "User Account Status" (current) == Enabled
+         - "PUID Repair Status" != success
+       → these go to File1.csv
+    3. For each File1 row (repair_status != success):
+         - Compare site's current NameId vs reference-site NameId
+         - Mismatch  → File2.csv
+         - Match     → File3.csv
+    4. If run_mode = apply, repair each File2 row:
+         - Success → File4.csv (appended)
+         - Failed  → File5.csv (appended)
+    5. Write PUID columns back to master CSV.
 
 Outputs (under reports/):
-  File1.csv  -- "Not Found -> Enabled" users (the input list)
+  File1.csv  -- "Not Found -> Enabled" users
   File2.csv  -- mismatch found
   File3.csv  -- mismatch not found
   File4.csv  -- repair success (appended)
@@ -28,6 +36,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -56,14 +65,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "certificate_path": "certificate.pem",
     "private_key_path": "private_key.pem",
     "scopes": {
-        "graph": "https://graph.microsoft.com/.default",
         "sharepoint": "https://geekbyteonline.sharepoint.com/.default",
     },
-
-    # Master report (produced by your existing master script)
     "master_report_path": "geekbyteonline_onedrive_master_report.csv",
-
-    # PUID repair
     "repair_account": "edit@geekbyte.online",
     "new_id_site_url": "https://geekbyteonline.sharepoint.com/sites/2DayRetention",
     "run_mode": "report_only",              # report_only | apply
@@ -76,13 +80,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_timeout_seconds": 60,
 }
 
-FILE1 = "File1.csv"   # Not Found -> Enabled users (PUID workflow input)
+FILE1 = "File1.csv"   # Not Found -> Enabled
 FILE2 = "File2.csv"   # Mismatch found
 FILE3 = "File3.csv"   # Mismatch not found
 FILE4 = "File4.csv"   # Repair success (append)
 FILE5 = "File5.csv"   # Repair failed  (append)
-
-PROBLEM_STATUSES = {"not found", "disabled", "deleted", "not_found"}
 
 
 # ============================================================================
@@ -158,145 +160,91 @@ def append_csv(path: Path, rows: List[Dict[str, Any]], fields: List[str]) -> Non
 
 
 # ============================================================================
-# MICROSOFT 365 CLIENT
+# SHAREPOINT CLIENT
 # ============================================================================
 
-class MS365Client:
+class SharePointClient:
     def __init__(self, cfg: Dict[str, Any], log: logging.Logger):
         self.cfg = cfg
         self.log = log
         self.timeout = cfg.get("request_timeout_seconds", 60)
         self.throttle = cfg.get("api_throttle_seconds", 0.25)
-        self._tokens: Dict[str, str] = {}
+        self._token: Optional[str] = None
         self._lock = Lock()
 
     def _wait(self) -> None:
         if self.throttle and self.throttle > 0:
             time.sleep(self.throttle)
 
-    # ---------- tokens ----------
-    def token(self, key: str) -> str:
-        scope = self.cfg["scopes"][key]
-        if scope in self._tokens:
-            return self._tokens[scope]
-        t = self._cert_token(scope) or self._secret_token(scope)
-        if not t:
-            raise RuntimeError(f"Failed to obtain token for {scope}")
-        self._tokens[scope] = t
-        return t
+    def token(self) -> str:
+        with self._lock:
+            if not self._token:
+                self._token = self._acquire()
+            return self._token
 
-    def _cert_token(self, scope: str) -> Optional[str]:
-        try:
-            cp, kp = self.cfg["certificate_path"], self.cfg["private_key_path"]
-            if not (os.path.exists(cp) and os.path.exists(kp)):
-                return None
-            with open(cp, "rb") as f:
-                cert = load_pem_x509_certificate(f.read(), default_backend())
-            with open(kp, "rb") as f:
-                key = load_pem_private_key(f.read(), password=None, backend=default_backend())
-            now = int(time.time())
-            header = {
-                "alg": "RS256", "typ": "JWT",
-                "x5t": base64.urlsafe_b64encode(
-                    cert.fingerprint(hashes.SHA1())
-                ).decode().rstrip("="),
-            }
-            payload = {
-                "aud": f"https://login.microsoftonline.com/{self.cfg['tenant_id']}/oauth2/v2.0/token",
-                "exp": now + 300, "iss": self.cfg["app_id"],
-                "jti": str(uuid.uuid4()), "nbf": now, "sub": self.cfg["app_id"],
-            }
-            eh = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip("=")
-            ep = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-            unsigned = f"{eh}.{ep}"
-            sig = key.sign(unsigned.encode(), padding.PKCS1v15(), hashes.SHA256())
-            assertion = f"{unsigned}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
-            url = f"https://login.microsoftonline.com/{self.cfg['tenant_id']}/oauth2/v2.0/token"
-            self._wait()
-            r = requests.post(url, data={
-                "client_id": self.cfg["app_id"],
-                "client_assertion": assertion,
-                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                "scope": scope, "grant_type": "client_credentials",
-            }, timeout=self.timeout)
-            if r.status_code == 200:
-                return r.json()["access_token"]
-            self.log.warning("Cert auth failed: %s", r.text[:300])
-            return None
-        except Exception:
-            self.log.exception("Cert auth error")
-            return None
-
-    def _secret_token(self, scope: str) -> Optional[str]:
-        try:
-            url = f"https://login.microsoftonline.com/{self.cfg['tenant_id']}/oauth2/v2.0/token"
-            self._wait()
-            r = requests.post(url, data={
-                "client_id": self.cfg["app_id"],
-                "client_secret": self.cfg["client_secret"],
-                "scope": scope, "grant_type": "client_credentials",
-            }, timeout=self.timeout)
-            if r.status_code == 200:
-                return r.json()["access_token"]
-            self.log.warning("Secret auth failed: %s", r.text[:300])
-            return None
-        except Exception:
-            self.log.exception("Secret auth error")
-            return None
-
-    # ---------- Graph: is this user enabled now? ----------
-    def graph_user_enabled(self, email: str) -> Optional[Dict[str, Any]]:
-        """
-        Returns:
-          {"enabled": True/False, "upn": ..., "mail": ..., "display_name": ..., "id": ...}
-          or None if user not found.
-        """
-        if not email:
-            return None
-        url = (f"https://graph.microsoft.com/v1.0/users?$filter=mail eq "
-               f"'{requests.utils.quote(email)}'"
-               f"&$select=id,userPrincipalName,mail,displayName,accountEnabled")
-        self._wait()
-        r = requests.get(url, headers={
-            "Authorization": f"Bearer {self.token('graph')}",
-            "Accept": "application/json",
-        }, timeout=self.timeout)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        vals = r.json().get("value", [])
-        if not vals:
-            return None
-        u = vals[0]
-        return {
-            "id": u.get("id", ""),
-            "upn": u.get("userPrincipalName", ""),
-            "mail": u.get("mail", email),
-            "display_name": u.get("displayName", ""),
-            "enabled": bool(u.get("accountEnabled", False)),
+    def _acquire(self) -> str:
+        scope = self.cfg["scopes"]["sharepoint"]
+        assertion = self._assertion()
+        url = f"https://login.microsoftonline.com/{self.cfg['tenant_id']}/oauth2/v2.0/token"
+        data = {
+            "client_id": self.cfg["app_id"],
+            "client_assertion": assertion,
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "scope": scope, "grant_type": "client_credentials",
         }
+        r = requests.post(url, data=data, timeout=self.timeout)
+        if r.status_code == 200:
+            return r.json()["access_token"]
+        r2 = requests.post(url, data={
+            "client_id": self.cfg["app_id"],
+            "client_secret": self.cfg["client_secret"],
+            "scope": scope, "grant_type": "client_credentials",
+        }, timeout=self.timeout)
+        r2.raise_for_status()
+        return r2.json()["access_token"]
 
-    # ---------- SharePoint site ops ----------
-    def _sp_headers(self, token: str) -> Dict[str, str]:
+    def _assertion(self) -> str:
+        with open(self.cfg["certificate_path"], "rb") as f:
+            cert = load_pem_x509_certificate(f.read(), default_backend())
+        with open(self.cfg["private_key_path"], "rb") as f:
+            key = load_pem_private_key(f.read(), password=None, backend=default_backend())
+        now = int(time.time())
+        header = {
+            "alg": "RS256", "typ": "JWT",
+            "x5t": base64.urlsafe_b64encode(
+                cert.fingerprint(hashes.SHA1())
+            ).decode().rstrip("="),
+        }
+        payload = {
+            "aud": f"https://login.microsoftonline.com/{self.cfg['tenant_id']}/oauth2/v2.0/token",
+            "exp": now + 300, "iss": self.cfg["app_id"],
+            "jti": str(uuid.uuid4()), "nbf": now, "sub": self.cfg["app_id"],
+        }
+        eh = base64.urlsafe_b64encode(json.dumps(header).encode()).decode().rstrip("=")
+        ep = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        unsigned = f"{eh}.{ep}"
+        sig = key.sign(unsigned.encode(), padding.PKCS1v15(), hashes.SHA256())
+        return f"{unsigned}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
+
+    def _sp_headers(self) -> Dict[str, str]:
         return {
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {self.token()}",
             "Accept": "application/json;odata=verbose",
             "Content-Type": "application/json;odata=verbose",
         }
 
-    def get_digest(self, site_url: str, token: str) -> str:
+    def get_digest(self, site_url: str) -> str:
         self._wait()
         r = requests.post(f"{site_url.rstrip('/')}/_api/contextinfo",
-                          headers=self._sp_headers(token), timeout=self.timeout)
+                          headers=self._sp_headers(), timeout=self.timeout)
         r.raise_for_status()
         return r.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
 
     def get_site_owner(self, site_url: str) -> Dict[str, Optional[str]]:
-        token = self.token("sharepoint")
         self._wait()
         r = requests.get(
             f"{site_url.rstrip('/')}/_api/site/owner",
-            headers={"Authorization": f"Bearer {token}",
+            headers={"Authorization": f"Bearer {self.token()}",
                      "Accept": "application/json;odata=verbose"},
             timeout=self.timeout,
         )
@@ -311,42 +259,41 @@ class MS365Client:
             "title": d.get("Title"),
         }
 
-    def ensure_user(self, site_url: str, token: str, digest: str, upn: str) -> Dict[str, Any]:
+    def ensure_user(self, site_url: str, digest: str, upn: str) -> Dict[str, Any]:
         self._wait()
         r = requests.post(f"{site_url.rstrip('/')}/_api/web/ensureuser",
-                          headers={**self._sp_headers(token), "X-RequestDigest": digest},
+                          headers={**self._sp_headers(), "X-RequestDigest": digest},
                           json={"logonName": upn}, timeout=self.timeout)
         r.raise_for_status()
         return r.json()["d"]
 
-    def set_admin(self, site_url: str, token: str, digest: str, uid: str, admin: bool) -> None:
+    def set_admin(self, site_url: str, digest: str, uid: str, admin: bool) -> None:
         self._wait()
         r = requests.post(f"{site_url.rstrip('/')}/_api/web/getuserbyid({uid})",
-                          headers={**self._sp_headers(token), "X-RequestDigest": digest,
+                          headers={**self._sp_headers(), "X-RequestDigest": digest,
                                    "X-HTTP-Method": "MERGE", "IF-MATCH": "*"},
                           json={"__metadata": {"type": "SP.User"}, "IsSiteAdmin": admin},
                           timeout=self.timeout)
         if r.status_code not in (200, 204):
             raise RuntimeError(f"set_admin failed {uid}: {r.text[:300]}")
 
-    def remove_user(self, site_url: str, token: str, digest: str, uid: str) -> None:
+    def remove_user(self, site_url: str, digest: str, uid: str) -> None:
         self._wait()
         r = requests.post(f"{site_url.rstrip('/')}/_api/web/siteusers/removebyid({uid})",
-                          headers={**self._sp_headers(token), "X-RequestDigest": digest},
+                          headers={**self._sp_headers(), "X-RequestDigest": digest},
                           timeout=self.timeout)
         if r.status_code not in (200, 204):
             raise RuntimeError(f"remove_user failed {uid}: {r.text[:300]}")
 
     def get_reference_nameid(self, upn: str) -> Optional[str]:
-        token = self.token("sharepoint")
         ref = self.cfg["new_id_site_url"]
-        digest = self.get_digest(ref, token)
-        ensured = self.ensure_user(ref, token, digest, upn)
+        digest = self.get_digest(ref)
+        ensured = self.ensure_user(ref, digest, upn)
         ref_uid = str(ensured.get("Id")) if ensured.get("Id") is not None else None
         nameid = (ensured.get("UserId") or {}).get("NameId")
         if self.cfg.get("cleanup_reference_site_user", True) and ref_uid:
             try:
-                self.remove_user(ref, token, digest, ref_uid)
+                self.remove_user(ref, digest, ref_uid)
             except Exception as exc:
                 self.log.warning("Reference cleanup failed: %s", exc)
         return nameid
@@ -359,7 +306,7 @@ class MS365Client:
 FILE1_FIELDS = [
     "site_url", "site_id", "site_title", "site_created",
     "owner_email", "owner_upn", "owner_display_name",
-    "owner_status", "account_enabled", "graph_user_id",
+    "owner_status", "account_enabled",
     "mismatch_status", "mismatch_checked_at",
     "repair_status", "repair_attempted_at", "repair_message",
     "current_nameid", "reference_nameid", "verified_nameid",
@@ -382,21 +329,54 @@ REPAIR_FIELDS = [
 
 
 # ============================================================================
-# STEP 1 — BUILD FILE1 FROM MASTER (Not Found -> Enabled only)
+# STEP 1 — FILTER "NOT FOUND -> ENABLED" FROM MASTER
 # ============================================================================
 
-def build_file1_notfound_enabled(
-    client: MS365Client,
+def was_not_found_now_enabled(row: Dict[str, str]) -> bool:
+    """
+    True if the master row shows a 'Not Found >> Enabled' transition
+    in 'User Account Status Change History' and the current status is Enabled.
+
+    Handles formats like:
+      [2026-10-10 09:00:00] Not Found >> Enabled
+      [ts] Not Found >> Enabled | [ts] Enabled >> Disabled
+      [ts] Not Found → Enabled
+      [ts] Not Found>>Enabled
+    """
+    history = safe_str(row.get("User Account Status Change History", ""))
+    current = safe_str(row.get("User Account Status", "")).lower()
+    repair_status = safe_str(row.get("PUID Repair Status", "")).lower()
+
+    if current != "enabled":
+        return False
+    if repair_status == "success":
+        return False
+    if not history:
+        return False
+
+    # Normalize: lowercase, unify arrows, collapse spaces
+    h = history.lower()
+    h = re.sub(r"\s*>>\s*", " >> ", h)
+    h = re.sub(r"\s*→\s*", " >> ", h)
+    h = re.sub(r"\s+", " ", h)
+
+    # Must contain the transition
+    if "not found >> enabled" not in h:
+        return False
+
+    # Latest right-side must be "enabled" (i.e., not reverted)
+    matches = re.findall(r">>\s*([a-z ]+)", h)
+    if matches and matches[-1].strip() != "enabled":
+        return False
+
+    return True
+
+
+def build_file1_from_master(
     master_rows: List[Dict[str, str]],
     existing_file1: Dict[str, Dict[str, str]],
-    max_workers: int,
     log: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """
-    For each master row whose owner was Not Found/Disabled/Deleted,
-    re-check Graph. If the user is NOW Enabled -> include in File1.
-    Otherwise keep existing File1 state (for retry) but don't add new rows.
-    """
     ts = now_iso()
     workflow = {
         "mismatch_status", "mismatch_checked_at",
@@ -404,87 +384,38 @@ def build_file1_notfound_enabled(
         "current_nameid", "reference_nameid", "verified_nameid", "resolved",
     }
 
-    # 1) Filter master rows to problem candidates
-    candidates: List[Dict[str, str]] = []
+    candidates: List[Dict[str, Any]] = []
     for r in master_rows:
-        owner_status = safe_str(r.get("Owner Status", "")).lower()
-        owner_exists = safe_str(r.get("Owner Exists", "")).lower()
-        user_status = safe_str(r.get("User Account Status", "")).lower()
-        if (owner_exists == "no"
-                or owner_status in PROBLEM_STATUSES
-                or user_status in PROBLEM_STATUSES):
-            candidates.append(r)
-
-    log.info("Problem-owner candidates from master: %d", len(candidates))
-
-    # 2) Re-check in Graph in parallel
-    def check(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        email = safe_str(row.get("Owner Email", "") or row.get("User Email", ""))
-        if not email:
-            return None
-        try:
-            u = client.graph_user_enabled(email)
-        except Exception as e:
-            log.warning("Graph lookup failed %s: %s", email, e)
-            return None
-        if not u or not u.get("enabled"):
-            return None
-        old_status = safe_str(row.get("Owner Status", "")) or \
-                     safe_str(row.get("User Account Status", "")) or "Not Found"
-        return {
-            "site_url": safe_str(row.get("Site URL", "")),
-            "site_id": safe_str(row.get("Site ID", "")),
-            "site_title": safe_str(row.get("Title", "")),
-            "site_created": safe_str(row.get("Created On", "")),
-            "owner_email": email,
-            "owner_upn": u.get("upn", "") or safe_str(row.get("User UPN", "")),
-            "owner_display_name": u.get("display_name", "") or
-                                  safe_str(row.get("User Display Name", "")),
-            "owner_status": "not_found",              # was problematic
-            "new_status": "enabled",                  # now enabled
-            "old_master_status": old_status,
+        if not was_not_found_now_enabled(r):
+            continue
+        candidates.append({
+            "site_url": safe_str(r.get("Site URL", "")),
+            "site_id": safe_str(r.get("Site ID", "")),
+            "site_title": safe_str(r.get("Title", "")),
+            "site_created": safe_str(r.get("Created On", "")),
+            "owner_email": safe_str(r.get("Owner Email", "") or r.get("User Email", "")),
+            "owner_upn": safe_str(r.get("User UPN", "")),
+            "owner_display_name": safe_str(r.get("User Display Name", "")),
+            "owner_status": "not_found",
             "account_enabled": "Yes",
-            "graph_user_id": u.get("id", ""),
             "last_updated": ts,
-        }
+        })
 
-    fresh_problems: List[Dict[str, Any]] = []
-    if candidates:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = {ex.submit(check, r): r for r in candidates}
-            for fut in as_completed(futs):
-                try:
-                    rec = fut.result()
-                    if rec:
-                        fresh_problems.append(rec)
-                except Exception:
-                    log.exception("Owner check failed")
+    log.info("Not Found -> Enabled candidates: %d", len(candidates))
 
-    log.info("Not Found -> Enabled users found: %d", len(fresh_problems))
-
-    # 3) Merge with existing File1 (state-machine)
     merged: Dict[str, Dict[str, Any]] = {}
-    seen_urls = set()
-    for rec in fresh_problems:
+    seen = set()
+    for rec in candidates:
         url = rec["site_url"]
-        seen_urls.add(url)
+        seen.add(url)
         old = existing_file1.get(url)
         if old:
             upd = dict(old)
             for k, v in rec.items():
-                if k in workflow or k == "new_status":
+                if k in workflow:
                     continue
                 upd[k] = v
             upd["last_updated"] = ts
-            # If owner_status changed from what it was, reset workflow (unless success)
-            if (old.get("owner_status") != rec["owner_status"]
-                    and (old.get("repair_status") or "").lower() != "success"):
-                upd["mismatch_status"] = "pending"
-                upd["mismatch_checked_at"] = ""
-                upd["repair_status"] = "pending"
-                upd["repair_attempted_at"] = ""
-                upd["repair_message"] = ""
-                upd["resolved"] = "no"
             merged[url] = upd
         else:
             rec.update({
@@ -496,16 +427,12 @@ def build_file1_notfound_enabled(
             })
             merged[url] = rec
 
-    # Preserve existing File1 rows that are still not success
-    # (so retries happen even if Graph check was skipped/failed this run)
+    # Preserve previous File1 rows (retries for non-success)
     for url, old in existing_file1.items():
-        if url in merged:
+        if url in seen:
             continue
-        if (old.get("repair_status") or "").lower() == "success":
+        if (old.get("repair_status") or "").lower() != "success":
             merged[url] = dict(old)
-            continue
-        # Keep rows that were "not found/disabled" but not re-checked
-        merged[url] = dict(old)
 
     return list(merged.values())
 
@@ -514,7 +441,7 @@ def build_file1_notfound_enabled(
 # STEP 2 — MISMATCH CHECK
 # ============================================================================
 
-def check_mismatch(client: MS365Client, row: Dict[str, str],
+def check_mismatch(client: SharePointClient, row: Dict[str, str],
                    log: logging.Logger) -> Dict[str, Any]:
     rec = {
         "site_url": row.get("site_url", ""),
@@ -543,13 +470,12 @@ def check_mismatch(client: MS365Client, row: Dict[str, str],
     return rec
 
 
-def run_mismatch(client: MS365Client, file1_rows: List[Dict[str, Any]],
+def run_mismatch(client: SharePointClient, file1_rows: List[Dict[str, Any]],
                  max_workers: int, log: logging.Logger
                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     candidates = [
         r for r in file1_rows
         if (r.get("repair_status") or "").lower() != "success"
-        and (r.get("owner_status") or "").lower() in PROBLEM_STATUSES
     ]
     log.info("Mismatch candidates: %d", len(candidates))
 
@@ -588,7 +514,7 @@ def run_mismatch(client: MS365Client, file1_rows: List[Dict[str, Any]],
 # STEP 3 — REPAIR
 # ============================================================================
 
-def repair_one(client: MS365Client, row: Dict[str, str],
+def repair_one(client: SharePointClient, row: Dict[str, str],
                log: logging.Logger) -> Dict[str, Any]:
     rec = {
         "site_url": row.get("site_url", ""),
@@ -605,33 +531,32 @@ def repair_one(client: MS365Client, row: Dict[str, str],
     site_url = rec["site_url"]
     upn = rec["owner_upn"]
     try:
-        token = client.token("sharepoint")
-        digest = client.get_digest(site_url, token)
+        digest = client.get_digest(site_url)
 
         owner = client.get_site_owner(site_url)
         current_uid = owner.get("user_id")
         if not current_uid:
             raise RuntimeError("Owner user ID missing on site")
 
-        repair_user = client.ensure_user(site_url, token, digest, client.cfg["repair_account"])
+        repair_user = client.ensure_user(site_url, digest, client.cfg["repair_account"])
         repair_uid = str(repair_user.get("Id"))
         rec["repair_account_user_id"] = repair_uid
-        client.set_admin(site_url, token, digest, repair_uid, True)
+        client.set_admin(site_url, digest, repair_uid, True)
 
-        client.set_admin(site_url, token, digest, current_uid, False)
-        client.remove_user(site_url, token, digest, current_uid)
+        client.set_admin(site_url, digest, current_uid, False)
+        client.remove_user(site_url, digest, current_uid)
         time.sleep(client.cfg.get("sleep_after_remove_seconds", 2))
 
-        readded = client.ensure_user(site_url, token, digest, upn)
+        readded = client.ensure_user(site_url, digest, upn)
         readded_uid = str(readded.get("Id"))
         rec["readded_user_id"] = readded_uid
 
         if client.cfg.get("readded_user_site_admin", True):
-            client.set_admin(site_url, token, digest, readded_uid, True)
+            client.set_admin(site_url, digest, readded_uid, True)
 
         try:
-            client.set_admin(site_url, token, digest, repair_uid, False)
-            client.remove_user(site_url, token, digest, repair_uid)
+            client.set_admin(site_url, digest, repair_uid, False)
+            client.remove_user(site_url, digest, repair_uid)
         except Exception as exc:
             log.warning("Repair account cleanup failed: %s", exc)
 
@@ -657,7 +582,7 @@ def repair_one(client: MS365Client, row: Dict[str, str],
     return rec
 
 
-def run_repairs(client: MS365Client, mismatch_rows: List[Dict[str, str]],
+def run_repairs(client: SharePointClient, mismatch_rows: List[Dict[str, str]],
                 max_workers: int, log: logging.Logger
                 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     success, failed = [], []
@@ -732,11 +657,10 @@ def update_master_with_puid(master_path: Path, file1_rows: List[Dict[str, Any]],
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PUID repair for 'Not Found -> Enabled' OneDrive owners")
+        description="PUID repair for 'Not Found -> Enabled' owners (master-driven)")
     p.add_argument("--config", default=None)
-    p.add_argument("--master-report", default=None, help="Override master CSV path")
-    p.add_argument("--skip-mismatch", action="store_true",
-                   help="Use existing File2.csv (skip mismatch recheck)")
+    p.add_argument("--master-report", default=None)
+    p.add_argument("--skip-mismatch", action="store_true")
     p.add_argument("--max-workers", type=int, default=None)
     return p.parse_args()
 
@@ -752,6 +676,7 @@ def main() -> int:
     master_path = Path(args.master_report or cfg["master_report_path"])
     if not master_path.exists():
         log.error("Master report not found: %s", master_path)
+        log.error("Run your master_report.py first.")
         return 1
 
     file1_path = report_dir / FILE1
@@ -761,23 +686,20 @@ def main() -> int:
     file5_path = report_dir / FILE5
 
     log.info("=" * 70)
-    log.info("PUID Repair — Not Found -> Enabled workflow")
+    log.info("PUID Repair — Not Found -> Enabled (master-driven)")
     log.info("Mode: %s", "APPLY" if apply_changes else "REPORT ONLY")
     log.info("Master: %s", master_path)
     log.info("=" * 70)
 
-    client = MS365Client(cfg, log)
+    client = SharePointClient(cfg, log)
     max_workers = args.max_workers or cfg.get("max_workers", 5)
 
     try:
-        # ---- STEP 1: Build File1 from master ----
+        # ---- STEP 1: Filter Not Found -> Enabled from master ----
         master_rows = read_csv(master_path)
         existing_file1 = {r.get("site_url", ""): r for r in read_csv(file1_path)
                           if r.get("site_url")}
-
-        file1_rows = build_file1_notfound_enabled(
-            client, master_rows, existing_file1, max_workers, log
-        )
+        file1_rows = build_file1_from_master(master_rows, existing_file1, log)
         write_csv(file1_path, file1_rows, FILE1_FIELDS)
         log.info("File1.csv written: %d row(s)", len(file1_rows))
 
@@ -826,7 +748,7 @@ def main() -> int:
                     r["last_updated"] = now_iso()
             write_csv(file1_path, file1_rows, FILE1_FIELDS)
 
-        # ---- STEP 4: Master report PUID status ----
+        # ---- STEP 4: Master PUID writeback ----
         update_master_with_puid(master_path, file1_rows, log)
 
         log.info("=" * 70)
