@@ -2,16 +2,19 @@
 """
 OneDrive PUID Mismatch Repair — two workflows + date filter + repair_master.
 
-Workflow A: Not Found -> Enabled users
+IMPORTANT: This script NEVER modifies geekbyteonline_onedrive_master_report.csv.
+           The master is READ-ONLY. Your master_report.py remains the only writer.
+           All PUID results live in repair_master.csv and File1..File10.
+
+Workflow A: User status change (Not Found -> Enabled)
   File1 -> File2/File3 -> File4/File5
 
-Workflow B: Manager Changed users
+Workflow B: Manager change
   File6 -> File7/File8 -> File9/File10
 
 All candidates must have a transition timestamp >= --from-date.
 
-Successfully repaired sites are also written to repair_master.csv, showing
-which trigger caused the repair.
+Successfully repaired sites are written to repair_master.csv.
 """
 
 import argparse
@@ -62,7 +65,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "readded_user_site_admin": True,
     "cleanup_reference_site_user": True,
     "request_timeout_seconds": 60,
-    "default_days_back": 7,                 # if --from-date omitted, use this
+    "default_days_back": 7,
 }
 
 # Workflow A: Not Found -> Enabled
@@ -158,7 +161,7 @@ def append_csv(path: Path, rows: List[Dict[str, Any]], fields: List[str]) -> Non
 def extract_timestamps(history_text: str) -> List[datetime]:
     """
     Extract all timestamps from a change-history string.
-    Supports formats:
+    Supports:
       [2026-10-13 09:00:00]
       [2026-10-13T09:00:00Z]
     """
@@ -172,7 +175,6 @@ def extract_timestamps(history_text: str) -> List[datetime]:
             if raw.endswith("Z"):
                 dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             else:
-                # Try both space and ISO-T
                 for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
                     try:
                         dt = datetime.strptime(raw, fmt)
@@ -195,10 +197,6 @@ def latest_timestamp(history_text: str) -> Optional[datetime]:
 
 
 def is_within_date_range(history_text: str, from_dt: datetime) -> bool:
-    """
-    True if any timestamp in the history is >= from_dt.
-    If no timestamp found, treat as not passing the filter.
-    """
     latest = latest_timestamp(history_text)
     if latest is None:
         return False
@@ -352,9 +350,7 @@ class SharePointClient:
 CANDIDATE_FIELDS = [
     "site_url", "site_id", "site_title", "site_created",
     "owner_email", "owner_upn", "owner_display_name",
-    "trigger",                    # "user_status_change" | "manager_change"
-    "trigger_history",            # raw history string that caused match
-    "trigger_timestamp",          # latest change timestamp
+    "trigger", "trigger_history", "trigger_timestamp",
     "mismatch_status", "mismatch_checked_at",
     "repair_status", "repair_attempted_at", "repair_message",
     "current_nameid", "reference_nameid", "verified_nameid",
@@ -380,21 +376,11 @@ REPAIR_FIELDS = [
 REPAIR_MASTER_FIELDS = [
     "site_url", "site_id", "site_title",
     "owner_email", "owner_upn", "owner_display_name",
-    "trigger",                    # "user_status_change" | "manager_change" | "both"
-    "trigger_details",            # human readable summary
-    "trigger_timestamp",
+    "trigger", "trigger_details", "trigger_timestamp",
     "old_nameid", "new_nameid", "reference_nameid", "verified_nameid",
     "verified_match",
-    "repair_status",              # success | failed
-    "repair_message",
-    "repair_attempted_at",
-    "first_repaired_at",          # first time it succeeded (dedupe)
-    "last_updated",
-]
-
-PUID_COLS = [
-    "PUID Repair Status", "PUID Repair Attempted At", "PUID Repair Message",
-    "PUID Current NameId", "PUID Reference NameId", "PUID Verified NameId",
+    "repair_status", "repair_message", "repair_attempted_at",
+    "first_repaired_at", "last_updated",
 ]
 
 
@@ -403,10 +389,7 @@ PUID_COLS = [
 # ============================================================================
 
 def is_not_found_to_enabled(row: Dict[str, str], from_dt: datetime) -> Optional[Dict[str, str]]:
-    """
-    Workflow A trigger.
-    Returns {"history": ..., "timestamp": ...} if matched, else None.
-    """
+    """Workflow A: Not Found -> Enabled, timestamp >= from_dt."""
     history = safe_str(row.get("User Account Status Change History", ""))
     current = safe_str(row.get("User Account Status", "")).lower()
     if current != "enabled" or not history:
@@ -435,10 +418,7 @@ def is_not_found_to_enabled(row: Dict[str, str], from_dt: datetime) -> Optional[
 
 
 def is_manager_changed(row: Dict[str, str], from_dt: datetime) -> Optional[Dict[str, str]]:
-    """
-    Workflow B trigger.
-    Returns {"history": ..., "timestamp": ...} if matched, else None.
-    """
+    """Workflow B: Manager change, timestamp >= from_dt."""
     history = safe_str(row.get("Manager Change History", ""))
     if not history:
         return None
@@ -712,48 +692,6 @@ def run_repairs(client: SharePointClient, rows: List[Dict[str, str]],
 
 
 # ============================================================================
-# MASTER PUID WRITEBACK
-# ============================================================================
-
-def update_master_with_puid(master_path: Path, rows: List[Dict[str, Any]],
-                            log: logging.Logger) -> None:
-    master_rows = read_csv(master_path)
-    if not master_rows:
-        log.warning("Master report missing/empty: %s", master_path)
-        return
-
-    by_url = {r["site_url"]: r for r in rows if r.get("site_url")}
-    by_id = {r.get("site_id"): r for r in rows if r.get("site_id")}
-
-    updated = 0
-    for m in master_rows:
-        sid = safe_str(m.get("Site ID", ""))
-        surl = safe_str(m.get("Site URL", ""))
-        f = by_id.get(sid) or by_url.get(surl)
-        if f:
-            current = (m.get("PUID Repair Status") or "").lower()
-            new_status = f.get("repair_status") or f.get("mismatch_status") or ""
-            if current != "success" or new_status.lower() == "success":
-                m["PUID Repair Status"] = new_status
-                m["PUID Repair Attempted At"] = f.get("repair_attempted_at", "")
-                m["PUID Repair Message"] = f.get("repair_message", "")
-                m["PUID Current NameId"] = f.get("current_nameid", "")
-                m["PUID Reference NameId"] = f.get("reference_nameid", "")
-                m["PUID Verified NameId"] = f.get("verified_nameid", "")
-                updated += 1
-        for c in PUID_COLS:
-            m.setdefault(c, "")
-
-    base_fields = list(master_rows[0].keys())
-    for c in PUID_COLS:
-        if c not in base_fields:
-            base_fields.append(c)
-
-    write_csv(master_path, master_rows, base_fields)
-    log.info("Master report updated with PUID results: %d row(s)", updated)
-
-
-# ============================================================================
 # REPAIR MASTER (File11)
 # ============================================================================
 
@@ -766,8 +704,7 @@ def update_repair_master(
 ) -> None:
     """
     Write/refresh repair_master.csv with successfully repaired sites.
-    Dedupes by site_url, merges triggers if a site was repaired by both
-    workflows at different times.
+    This file is INDEPENDENT of the master report.
     """
     existing = read_csv(repair_master_path)
     index: Dict[str, Dict[str, Any]] = {
@@ -784,7 +721,6 @@ def update_repair_master(
         master_row = master_rows_by_url.get(url, {})
         prior = index.get(url, {})
 
-        # Merge trigger labels
         prev_trigger = prior.get("trigger", "")
         if not prev_trigger:
             merged_trigger = trigger_label
@@ -793,7 +729,6 @@ def update_repair_master(
         else:
             merged_trigger = f"{prev_trigger}|{trigger_label}"
 
-        # Build trigger_details
         detail_parts = []
         if prior.get("trigger_details"):
             detail_parts.append(prior["trigger_details"])
@@ -922,8 +857,7 @@ def run_workflow(
 
 def resolve_from_date(args, cfg) -> datetime:
     if args.from_date:
-        dt = datetime.fromisoformat(f"{args.from_date}T00:00:00+00:00")
-        return dt
+        return datetime.fromisoformat(f"{args.from_date}T00:00:00+00:00")
     days = int(cfg.get("default_days_back", 7))
     return (datetime.now(timezone.utc) - timedelta(days=days)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -936,8 +870,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--master-report", default=None)
     p.add_argument("--from-date", default=None,
-                   help="YYYY-MM-DD. Transitions on/after this date only. "
-                        "Default: config.default_days_back ago.")
+                   help="YYYY-MM-DD. Transitions on/after this date only.")
     p.add_argument("--skip-mismatch", action="store_true")
     p.add_argument("--only", choices=["notfound", "manager", "both"], default="both")
     p.add_argument("--max-workers", type=int, default=None)
@@ -961,23 +894,24 @@ def main() -> int:
     log.info("=" * 70)
     log.info("PUID Repair — starting")
     log.info("Mode: %s", "APPLY" if apply_changes else "REPORT ONLY")
-    log.info("Master: %s", master_path)
+    log.info("Master (read-only): %s", master_path)
     log.info("Date filter (>=): %s", from_dt.strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 70)
 
     client = SharePointClient(cfg, log)
     max_workers = args.max_workers or cfg.get("max_workers", 5)
+
+    # ---- Read master ONCE. Never write to it. ----
     master_rows = read_csv(master_path)
     master_by_url = {safe_str(r.get("Site URL", "")): r for r in master_rows}
 
-    all_rows: List[Dict[str, Any]] = []
     success_a: List[Dict[str, Any]] = []
     success_b: List[Dict[str, Any]] = []
 
     try:
-        # ---- Workflow A: User status change → Not Found -> Enabled ----
+        # ---- Workflow A ----
         if args.only in ("notfound", "both"):
-            rows_a, success_a = run_workflow(
+            _, success_a = run_workflow(
                 client, report_dir, master_rows,
                 detector=is_not_found_to_enabled,
                 trigger_label="user_status_change",
@@ -992,11 +926,10 @@ def main() -> int:
                 skip_mismatch=args.skip_mismatch,
                 log=log,
             )
-            all_rows.extend(rows_a)
 
-        # ---- Workflow B: Manager change ----
+        # ---- Workflow B ----
         if args.only in ("manager", "both"):
-            rows_b, success_b = run_workflow(
+            _, success_b = run_workflow(
                 client, report_dir, master_rows,
                 detector=is_manager_changed,
                 trigger_label="manager_change",
@@ -1011,22 +944,8 @@ def main() -> int:
                 skip_mismatch=args.skip_mismatch,
                 log=log,
             )
-            all_rows.extend(rows_b)
 
-        # ---- Master PUID writeback ----
-        best: Dict[str, Dict[str, Any]] = {}
-        for r in all_rows:
-            url = r.get("site_url", "")
-            if not url:
-                continue
-            prior = best.get(url)
-            if prior is None:
-                best[url] = r
-            elif (r.get("repair_status") or "").lower() == "success":
-                best[url] = r
-        update_master_with_puid(master_path, list(best.values()), log)
-
-        # ---- Repair master (File11) ----
+        # ---- Repair master (independent file, NOT the master report) ----
         update_repair_master(
             report_dir / REPAIR_MASTER,
             workflow_a_success=success_a,
@@ -1034,6 +953,9 @@ def main() -> int:
             master_rows_by_url=master_by_url,
             log=log,
         )
+
+        # ---- Master report is NOT touched ----
+        log.info("Master report left unmodified: %s", master_path)
 
         log.info("=" * 70)
         log.info("DONE")
@@ -1049,7 +971,7 @@ def main() -> int:
         log.info("    File8  : %s", report_dir / FILE8)
         log.info("    File9  : %s", report_dir / FILE9)
         log.info("    File10 : %s", report_dir / FILE10)
-        log.info("  Repair master:")
+        log.info("  Repair master (independent):")
         log.info("    repair_master.csv : %s", report_dir / REPAIR_MASTER)
         log.info("=" * 70)
         return 0
