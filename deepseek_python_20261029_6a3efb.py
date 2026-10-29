@@ -1,0 +1,341 @@
+import requests
+import json
+from urllib.parse import urljoin, urlparse
+import csv
+from datetime import datetime
+import re
+import uuid
+import base64
+import time
+import os
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.x509 import load_pem_x509_certificate
+from cryptography.hazmat.backends import default_backend
+
+# ============ Configuration ============
+OUTPUT_CSV = f"SharePointBulkContentWithCompliance_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+
+TENANT_NAME = "test.onmicrosoft.com"
+APP_ID = "73efa35d-6188-42d4-b258-838a977eb149"
+
+CERTIFICATE_PATH = "certificate.pem"
+PRIVATE_KEY_PATH = "private_key.pem"
+
+# Token cache: { site_host: {token, expires_at} }
+_token_cache = {}
+
+
+# ============ Certificate / JWT / Auth ============
+def load_certificate_and_key():
+    try:
+        with open(CERTIFICATE_PATH, "rb") as cert_file:
+            certificate = load_pem_x509_certificate(cert_file.read(), default_backend())
+        with open(PRIVATE_KEY_PATH, "rb") as key_file:
+            private_key = load_pem_private_key(key_file.read(), password=None, backend=default_backend())
+        return certificate, private_key
+    except Exception as e:
+        print(f"Error loading certificate or private key: {e}")
+        raise
+
+
+def get_jwt_token(certificate, private_key, audience):
+    now = int(time.time())
+    expiration = now + 600  # 10 min (JWT used only for token exchange)
+
+    thumbprint = certificate.fingerprint(hashes.SHA1())
+    x5t = base64.urlsafe_b64encode(thumbprint).decode('utf-8').replace('=', '')
+
+    jwt_header = {"alg": "RS256", "typ": "JWT", "x5t": x5t}
+    jwt_payload = {
+        "aud": audience,
+        "exp": expiration,
+        "iss": APP_ID,
+        "jti": str(uuid.uuid4()),
+        "nbf": now,
+        "sub": APP_ID,
+    }
+
+    encoded_header = base64.urlsafe_b64encode(
+        json.dumps(jwt_header, separators=(',', ':')).encode()
+    ).decode().replace('=', '')
+    encoded_payload = base64.urlsafe_b64encode(
+        json.dumps(jwt_payload, separators=(',', ':')).encode()
+    ).decode().replace('=', '')
+
+    jwt_unsigned = f"{encoded_header}.{encoded_payload}"
+    signature = private_key.sign(jwt_unsigned.encode(), padding.PKCS1v15(), hashes.SHA256())
+    encoded_signature = base64.urlsafe_b64encode(signature).decode().replace('=', '')
+
+    return f"{jwt_unsigned}.{encoded_signature}"
+
+
+def get_access_token_for_site(site_url):
+    host = urlparse(site_url).netloc
+
+    cached = _token_cache.get(host)
+    if cached and cached["expires_at"] > time.time() + 60:
+        return cached["token"]
+
+    scope = f"https://{host}/.default"
+    audience = f"https://login.microsoftonline.com/{TENANT_NAME}/oauth2/v2.0/token"
+
+    certificate, private_key = load_certificate_and_key()
+    jwt = get_jwt_token(certificate, private_key, audience)
+
+    data = {
+        "client_id": APP_ID,
+        "client_assertion": jwt,
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "scope": scope,
+        "grant_type": "client_credentials",
+    }
+
+    resp = requests.post(audience, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
+    resp.raise_for_status()
+    js = resp.json()
+
+    _token_cache[host] = {
+        "token": js["access_token"],
+        "expires_at": time.time() + int(js.get("expires_in", 3600)),
+    }
+    return js["access_token"]
+
+
+# ============ SharePoint request helper ============
+def make_sharepoint_request(url, access_token, method='GET', headers=None, retries=3):
+    default_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json;odata=verbose",
+        "Content-Type": "application/json",
+    }
+    if headers:
+        default_headers.update(headers)
+
+    delay = 2
+    for attempt in range(retries):
+        try:
+            r = requests.request(method, url, headers=default_headers, timeout=90) # Increased timeout for huge payloads
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", delay))
+                print(f"    Throttled (429). Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            if 500 <= r.status_code < 600:
+                print(f"    Server error {r.status_code}, retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            print(f"    Request failed ({attempt+1}/{retries}) for {url}: {e}")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+# ============ SharePoint data retrieval ============
+def get_all_lists(site_url, access_token):
+    lists_url = urljoin(site_url + "/", "_api/web/lists")
+    response = make_sharepoint_request(lists_url, access_token)
+    if response and 'd' in response and 'results' in response['d']:
+        return [lst for lst in response['d']['results'] if lst['BaseTemplate'] == 101]
+    return []
+
+
+def get_list_items(site_url, list_id, access_token):
+    # Fetch 5000 at a time using __next. 
+    # Using FieldValuesAsText to grab all metadata efficiently.
+    items_url = (
+        f"{site_url}/_api/web/lists(guid'{list_id}')/items"
+        f"?$expand=File,Folder,FieldValuesAsText"
+        f"&$top=5000"
+    )
+    
+    all_items, next_url, page = [], items_url, 0
+    while next_url:
+        response = make_sharepoint_request(next_url, access_token)
+        if response is None:
+            raise RuntimeError(f"Pagination failed on page {page} for list {list_id}")
+            
+        if 'd' in response and 'results' in response['d']:
+            batch = response['d']['results']
+            all_items.extend(batch)
+            print(f"      page {page}: +{len(batch)} (total {len(all_items)})")
+            
+        page += 1
+        next_url = response.get('d', {}).get('__next')
+        
+    return all_items
+
+
+def process_item(item):
+    """Extract details using FieldValuesAsText (flat JSON structure)"""
+    item_type = item['FileSystemObjectType']
+    
+    # FieldValuesAsText contains the metadata you requested
+    fv = item.get('FieldValuesAsText', {})
+    
+    details = {
+        'Type': 'File' if item_type == 0 else 'Folder',
+        'ID': item['Id'],
+        'Name': '',
+        'Path': '',
+        # Pull Size, Author, Editor, Modified directly from FieldValuesAsText
+        'Size': fv.get('File_x005f_x0020_x005f_Size', 'N/A'),
+        'Modified': fv.get('Modified', 'N/A'),
+        'Author': fv.get('Author', 'N/A'),
+        'Editor': fv.get('Editor', 'N/A'),
+        # Compliance details from the screenshot
+        'ComplianceTag': fv.get('OData__x005f_ComplianceTag', 'N/A'),
+        'ComplianceTagWrittenTime': fv.get('OData__x005f_ComplianceTagWrittenTime', 'N/A'),
+    }
+    
+    if item_type == 0:  # File
+        file = item.get('File', {})
+        details['Name'] = file.get('Name', '')
+        details['Path'] = file.get('ServerRelativeUrl', '')
+    else:  # Folder
+        folder = item.get('Folder', {})
+        details['Name'] = folder.get('Name', '')
+        details['Path'] = folder.get('ServerRelativeUrl', '')
+        
+    return details
+
+
+# ============ Main bulk routine ============
+def prompt_sites():
+    print("=" * 70)
+    print("BULK SHAREPOINT SITE SCANNER (5000 Batch Mode)")
+    print("=" * 70)
+    print("Enter SharePoint site URLs, one per line.")
+    print("Type 'DONE' on an empty line when finished.\n")
+
+    sites = []
+    while True:
+        line = input("Site URL (or DONE): ").strip()
+        if not line:
+            continue
+        if line.upper() == "DONE":
+            break
+        if line.lower().endswith(".txt") and os.path.isfile(line):
+            with open(line, "r", encoding="utf-8") as f:
+                for u in f:
+                    u = u.strip()
+                    if u and not u.startswith("#"):
+                        sites.append(u)
+            print(f"  Loaded {len(sites)} URLs from file.")
+            continue
+        for part in [p.strip() for p in line.split(",") if p.strip()]:
+            sites.append(part)
+
+    seen, unique = set(), []
+    for s in sites:
+        s = s.rstrip("/")
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+def main():
+    sites = prompt_sites()
+    if not sites:
+        print("No sites provided. Exiting.")
+        return
+
+    print(f"\nProcessing {len(sites)} site(s)")
+
+    fieldnames = [
+        'Site', 'Library', 'Type', 'ID', 'Name', 'Path', 'Size',
+        'Modified', 'Author', 'Editor', 
+        'ComplianceTag', 'ComplianceTagWrittenTime'
+    ]
+
+    stats = {"sites_ok": 0, "sites_failed": 0, "libraries": 0, "items": 0, "errors": 0}
+    failed_sites = []
+
+    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for site_idx, site_url in enumerate(sites, 1):
+            print(f"\n{'='*70}")
+            print(f"[{site_idx}/{len(sites)}] Site: {site_url}")
+            print('='*70)
+
+            try:
+                token = get_access_token_for_site(site_url)
+            except Exception as e:
+                print(f"  Auth failed for site: {e}")
+                stats["sites_failed"] += 1
+                failed_sites.append((site_url, str(e)))
+                continue
+
+            try:
+                libraries = get_all_lists(site_url, token)
+            except Exception as e:
+                print(f"  Could not list libraries: {e}")
+                stats["sites_failed"] += 1
+                failed_sites.append((site_url, str(e)))
+                continue
+
+            if not libraries:
+                print("  No document libraries found.")
+                stats["sites_ok"] += 1
+                continue
+
+            print(f"  Found {len(libraries)} document libraries.")
+
+            for lib_idx, library in enumerate(libraries, 1):
+                lib_title = library.get('Title', '(untitled)')
+                print(f"\n  [{lib_idx}/{len(libraries)}] Library: {lib_title}")
+
+                try:
+                    items = get_list_items(site_url, library['Id'], token)
+                except Exception as e:
+                    print(f"    Failed to read items: {e}")
+                    stats["errors"] += 1
+                    continue
+
+                if not items:
+                    print("    (empty)")
+                    continue
+
+                stats["libraries"] += 1
+                print(f"    Processing {len(items)} item(s)...")
+
+                for item in items:
+                    try:
+                        details = process_item(item)
+                        details['Site'] = site_url
+                        details['Library'] = lib_title
+                        writer.writerow(details)
+                        stats["items"] += 1
+                    except Exception as e:
+                        stats["errors"] += 1
+                        print(f"    Item {item.get('Id')} error: {e}")
+
+            stats["sites_ok"] += 1
+
+    # ===== Summary =====
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print('='*70)
+    print(f"Sites processed OK : {stats['sites_ok']}")
+    print(f"Sites failed       : {stats['sites_failed']}")
+    print(f"Libraries scanned  : {stats['libraries']}")
+    print(f"Items written      : {stats['items']}")
+    print(f"Item errors        : {stats['errors']}")
+    print(f"\nReport: {OUTPUT_CSV}")
+
+    if failed_sites:
+        print("\nFailed sites:")
+        for s, err in failed_sites:
+            print(f"  - {s} :: {err}")
+
+
+if __name__ == "__main__":
+    main()
