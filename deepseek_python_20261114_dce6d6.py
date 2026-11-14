@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""
+Find / remove users in SharePoint siteusers — sequential, Ctrl+C-safe.
+
+Group details per found user:
+  - SharePoint groups on the site (via /_api/web/sitegroups)
+  - M365 groups the user belongs to (via Graph /users/{upn}/memberOf)
+  - NO owner expansion
+
+Modes:
+  --check  (default) : READ-ONLY
+  --delete           : removes found users from siteusers
+
+Usage:
+  python find_or_remove_users.py --sites sites.csv --users users.csv --check
+  python find_or_remove_users.py --sites sites.csv --users users.csv --delete
+"""
+
+import argparse
+import base64
+import csv
+import json
+import os
+import signal
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from threading import Event, Lock
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.x509 import load_pem_x509_certificate
+
+CONFIG = {
+    "tenant_id": "0e439a1f-a497-462b-9e6b-4e582e203607",
+    "tenant_name": "geekbyteonline.onmicrosoft.com",
+    "app_id": "73efa35d-6188-42d4-b258-838a977eb149",
+    "client_secret": "CyG8Q~FYHuCMSyVmt4sNxt5IejrMc2c24Ziz4a.t",
+    "certificate_path": "certificate.pem",
+    "private_key_path": "private_key.pem",
+    "scopes": {
+        "sharepoint": "https://geekbyteonline.sharepoint.com/.default",
+        "graph": "https://graph.microsoft.com/.default",
+    },
+}
+
+STOP_EVENT = Event()
+DELAY = {"site": 2.0, "user": 0.5, "group": 0.5, "retry": 10.0}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+# ---------------- AUTH ----------------
+_token_cache: Dict[str, Tuple[str, float]] = {}
+_token_lock = Lock()
+
+
+def _tok_cert(scope: str) -> Optional[str]:
+    try:
+        if not os.path.exists(CONFIG["certificate_path"]) or not os.path.exists(CONFIG["private_key_path"]):
+            return None
+        with open(CONFIG["certificate_path"], "rb") as cf:
+            cert = load_pem_x509_certificate(cf.read(), default_backend())
+        with open(CONFIG["private_key_path"], "rb") as kf:
+            key = load_pem_private_key(kf.read(), password=None, backend=default_backend())
+        now = int(time.time())
+        h = {"alg": "RS256", "typ": "JWT",
+             "x5t": base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip("=")}
+        p = {"aud": f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
+             "exp": now + 300, "iss": CONFIG["app_id"], "jti": str(uuid.uuid4()),
+             "nbf": now, "sub": CONFIG["app_id"]}
+        eh = base64.urlsafe_b64encode(json.dumps(h).encode()).decode().rstrip("=")
+        ep = base64.urlsafe_b64encode(json.dumps(p).encode()).decode().rstrip("=")
+        u = f"{eh}.{ep}"
+        sig = key.sign(u.encode(), padding.PKCS1v15(), hashes.SHA256())
+        es = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+        jwt = f"{u}.{es}"
+        r = requests.post(
+            f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
+            data={"client_id": CONFIG["app_id"], "client_assertion": jwt,
+                  "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                  "scope": scope, "grant_type": "client_credentials"}, timeout=30)
+        if r.status_code == 200:
+            return r.json()["access_token"]
+    except Exception:
+        pass
+    return None
+
+
+def _tok_secret(scope: str) -> Optional[str]:
+    try:
+        r = requests.post(
+            f"https://login.microsoftonline.com/{CONFIG['tenant_id']}/oauth2/v2.0/token",
+            data={"client_id": CONFIG["app_id"], "client_secret": CONFIG["client_secret"],
+                  "scope": scope, "grant_type": "client_credentials"}, timeout=30)
+        if r.status_code == 200:
+            return r.json()["access_token"]
+    except Exception:
+        pass
+    return None
+
+
+def get_token(scope_key: str) -> Optional[str]:
+    scope = CONFIG["scopes"][scope_key]
+    with _token_lock:
+        c = _token_cache.get(scope_key)
+        if c and c[1] > time.time() + 60:
+            return c[0]
+    tok = _tok_cert(scope) or _tok_secret(scope)
+    if tok:
+        with _token_lock:
+            _token_cache[scope_key] = (tok, time.time() + 3300)
+    return tok
+
+
+# ---------------- HTTP with 429 retry ----------------
+def http(method: str, url: str, *, token: str, **kw) -> requests.Response:
+    headers = kw.pop("headers", {}) or {}
+    headers.setdefault("Authorization", f"Bearer {token}")
+    timeout = kw.pop("timeout", 60)
+    attempt = 0
+    while True:
+        if STOP_EVENT.is_set():
+            raise KeyboardInterrupt("Stop requested")
+        try:
+            r = requests.request(method, url, headers=headers, timeout=timeout, **kw)
+        except requests.RequestException:
+            attempt += 1
+            if attempt > 3:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", DELAY["retry"]))
+            log(f"    ⏸ 429 on {method} {url[:80]} — waiting {wait}s")
+            for _ in range(wait):
+                if STOP_EVENT.is_set():
+                    raise KeyboardInterrupt("Stop requested")
+                time.sleep(1)
+            attempt += 1
+            if attempt > 5:
+                return r
+            continue
+        return r
+
+
+# ---------------- HELPERS ----------------
+def normalize_site_url(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    if s.startswith("http"):
+        return s.rstrip("/")
+    if not s.startswith("sites/"):
+        s = f"sites/{s}"
+    tenant = CONFIG["tenant_name"].split(".")[0]
+    return f"https://{tenant}.sharepoint.com/{s}".rstrip("/")
+
+
+def get_digest(site_url: str, token: str) -> str:
+    r = http("POST", f"{site_url.rstrip('/')}/_api/contextinfo", token=token,
+             headers={"Accept": "application/json;odata=verbose"}, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"digest {r.status_code}: {r.text[:200]}")
+    return r.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
+
+
+def list_site_users(site_url: str, token: str) -> List[Dict]:
+    r = http("GET", f"{site_url.rstrip('/')}/_api/web/siteusers", token=token,
+             headers={"Accept": "application/xml"}, timeout=60)
+    if r.status_code != 200:
+        raise Exception(f"siteusers GET {r.status_code}: {r.text[:200]}")
+    ns = {"d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
+          "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
+          "atom": "http://www.w3.org/2005/Atom"}
+    out = []
+    for entry in ET.fromstring(r.text).findall(".//atom:entry", ns):
+        content = entry.find("atom:content", ns)
+        if content is None:
+            continue
+        props = content.find("m:properties", ns)
+        if props is None:
+            continue
+
+        def g(tag):
+            e = props.find(f"d:{tag}", ns)
+            return e.text if e is not None else None
+
+        out.append({
+            "Id": g("Id"), "Email": g("Email"),
+            "LoginName": g("LoginName"), "Title": g("Title"),
+        })
+    return out
+
+
+def find_user(site_users: List[Dict], upn: str) -> Optional[Dict]:
+    upn_l = upn.lower()
+    for u in site_users:
+        email = (u.get("Email") or "").lower()
+        login = (u.get("LoginName") or "").lower()
+        if email == upn_l or login == upn_l or login.endswith("|" + upn_l):
+            return u
+    return None
+
+
+def sharepoint_groups_for_user(site_url: str, token: str, user_id: str) -> List[str]:
+    """SharePoint groups on this site the user is a member of."""
+    titles: List[str] = []
+    r = http("GET", f"{site_url.rstrip('/')}/_api/web/sitegroups?$select=Id,Title",
+             token=token, headers={"Accept": "application/json;odata=verbose"}, timeout=30)
+    if r.status_code != 200:
+        return titles
+    for g in r.json().get("d", {}).get("results", []):
+        gid = g.get("Id")
+        if not gid:
+            continue
+        if STOP_EVENT.is_set():
+            raise KeyboardInterrupt("Stop requested")
+        time.sleep(DELAY["group"])
+        rr = http("GET",
+                  f"{site_url.rstrip('/')}/_api/web/sitegroups({gid})/users?$filter=Id eq {user_id}",
+                  token=token, headers={"Accept": "application/json;odata=verbose"}, timeout=20)
+        if rr.status_code == 200 and rr.json().get("d", {}).get("results"):
+            titles.append(g.get("Title", f"group-{gid}"))
+    return titles
+
+
+def m365_groups_for_user(upn: str, graph_token: str) -> List[str]:
+    """M365 group names (no owners)."""
+    names: List[str] = []
+    r = http("GET",
+             f"https://graph.microsoft.com/v1.0/users/{upn}/memberOf"
+             f"?$select=id,displayName,groupTypes",
+             token=graph_token, headers={"Accept": "application/json"}, timeout=30)
+    if r.status_code != 200:
+        return names
+    for g in r.json().get("value", []):
+        if "#microsoft.graph.group" not in (g.get("@odata.type") or ""):
+            continue
+        name = g.get("displayName") or g.get("id") or "?"
+        gtype = "M365" if "Unified" in (g.get("groupTypes") or []) else "Security"
+        names.append(f"{name} [{gtype}]")
+    return names
+
+
+def remove_from_site(site_url: str, token: str, digest: str, uid: str) -> Tuple[bool, str]:
+    r = http("POST", f"{site_url.rstrip('/')}/_api/web/siteusers/removebyid({uid})",
+             token=token,
+             headers={"Accept": "application/json;odata=verbose",
+                      "Content-Type": "application/json;odata=verbose",
+                      "X-RequestDigest": digest}, timeout=30)
+    if r.status_code in (200, 204):
+        return True, ""
+    try:
+        e = r.json().get("error", {})
+        msg = e.get("message", {}).get("value") or str(e)
+        code = e.get("code", "")
+        return False, f"{code}: {msg}" if code else msg
+    except Exception:
+        return False, f"HTTP {r.status_code}: {r.text[:300]}"
+
+
+# ---------------- CORE ----------------
+def process_site(site_url: str, site_name: str, users: List[str],
+                 sp_token: str, graph_token: Optional[str], do_delete: bool) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if STOP_EVENT.is_set():
+        raise KeyboardInterrupt("Stop requested")
+
+    log(f"\n▶ Site: {site_url}")
+    try:
+        site_users = list_site_users(site_url, sp_token)
+        log(f"  siteusers: {len(site_users)} entries")
+    except Exception as e:
+        log(f"  ✗ list siteusers failed: {e}")
+        for upn in users:
+            results.append({
+                "Site URL": site_url, "Site Name": site_name, "User": upn,
+                "Status": "FAILED", "Detail": f"list siteusers: {e}",
+                "Site User ID": "", "Email": "", "LoginName": "",
+                "SharePoint Groups": "", "M365 Groups": "",
+            })
+        return results
+
+    digest: Optional[str] = None
+
+    for idx, upn in enumerate(users):
+        if STOP_EVENT.is_set():
+            raise KeyboardInterrupt("Stop requested")
+        if idx > 0:
+            time.sleep(DELAY["user"])
+
+        found = find_user(site_users, upn)
+        if not found:
+            log(f"  ⊘ {upn}: NOT_FOUND on site")
+            results.append({
+                "Site URL": site_url, "Site Name": site_name, "User": upn,
+                "Status": "NOT_FOUND", "Detail": "User not present in siteusers",
+                "Site User ID": "", "Email": "", "LoginName": "",
+                "SharePoint Groups": "", "M365 Groups": "",
+            })
+            continue
+
+        uid = str(found["Id"])
+        email = found.get("Email") or ""
+        login = found.get("LoginName") or ""
+        log(f"  • {upn}: found (id={uid})")
+
+        # SharePoint groups
+        try:
+            sp_groups = sharepoint_groups_for_user(site_url, sp_token, uid)
+            log(f"    SP groups: {sp_groups or 'none (direct)'}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            sp_groups = []
+            log(f"    ⚠ SP groups failed: {e}")
+
+        # M365 groups (names only, no owners)
+        m365_groups: List[str] = []
+        if graph_token:
+            try:
+                m365_groups = m365_groups_for_user(upn, graph_token)
+                log(f"    M365 groups: {m365_groups or 'none'}")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                log(f"    ⚠ M365 groups failed: {e}")
+
+        sp_str = "; ".join(sp_groups) if sp_groups else "DIRECT"
+        m365_str = "; ".join(m365_groups) if m365_groups else ""
+
+        if not do_delete:
+            log(f"    ✅ {upn}: FOUND (check mode)")
+            results.append({
+                "Site URL": site_url, "Site Name": site_name, "User": upn,
+                "Status": "FOUND", "Detail": f"Present in siteusers (id={uid})",
+                "Site User ID": uid, "Email": email, "LoginName": login,
+                "SharePoint Groups": sp_str, "M365 Groups": m365_str,
+            })
+            continue
+
+        try:
+            if digest is None:
+                digest = get_digest(site_url, sp_token)
+            ok, err = remove_from_site(site_url, sp_token, digest, uid)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            ok, err = False, f"exception: {e}"
+
+        if ok:
+            log(f"    🗑 {upn}: REMOVED")
+            results.append({
+                "Site URL": site_url, "Site Name": site_name, "User": upn,
+                "Status": "REMOVED", "Detail": "Removed from siteusers",
+                "Site User ID": uid, "Email": email, "LoginName": login,
+                "SharePoint Groups": sp_str, "M365 Groups": m365_str,
+            })
+        else:
+            log(f"    ❌ {upn}: FAILED — {err}")
+            results.append({
+                "Site URL": site_url, "Site Name": site_name, "User": upn,
+                "Status": "FAILED", "Detail": f"{err} | (still in siteusers)",
+                "Site User ID": uid, "Email": email, "LoginName": login,
+                "SharePoint Groups": sp_str, "M365 Groups": m365_str,
+            })
+
+    return results
+
+
+# ---------------- CSV ----------------
+def read_sites(path: str) -> List[Dict[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    out = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f)
+        if not rd.fieldnames:
+            raise ValueError("sites CSV has no header")
+        url_col = next((c for c in ["Site URL", "Site", "site_url", "site", "URL", "url", "Url"]
+                        if c in rd.fieldnames), None)
+        if not url_col:
+            raise ValueError(f"sites CSV missing URL column: {rd.fieldnames}")
+        name_col = next((c for c in ["Site Name", "Name", "site_name", "name"]
+                         if c in rd.fieldnames), None)
+        for row in rd:
+            url = (row.get(url_col) or "").strip()
+            if not url:
+                continue
+            name = (row.get(name_col) or "").strip() if name_col else url
+            out.append({"input": url, "name": name})
+    return out
+
+
+def read_users(path: str) -> List[str]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    out = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f)
+        if not rd.fieldnames:
+            raise ValueError("users CSV has no header")
+        cols = ["User UPN", "UPN", "upn", "User", "user",
+                "Email", "email", "UserPrincipalName", "userPrincipalName"]
+        col = next((c for c in cols if c in rd.fieldnames), rd.fieldnames[0])
+        for row in rd:
+            v = (row.get(col) or "").strip()
+            if not v:
+                continue
+            if "@" not in v:
+                log(f"⚠  skipping malformed UPN: {v!r}")
+                continue
+            out.append(v)
+    return out
+
+
+# ---------------- MAIN ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sites", required=True)
+    ap.add_argument("--users", required=True)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--site-delay", type=float, default=2.0)
+    ap.add_argument("--user-delay", type=float, default=0.5)
+    ap.add_argument("--group-delay", type=float, default=0.5)
+    ap.add_argument("--retry-wait", type=float, default=10.0)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--delete", action="store_true")
+    args = ap.parse_args()
+
+    DELAY["site"] = args.site_delay
+    DELAY["user"] = args.user_delay
+    DELAY["group"] = args.group_delay
+    DELAY["retry"] = args.retry_wait
+    do_delete = bool(args.delete)
+
+    def _sigint(signum, frame):
+        if not STOP_EVENT.is_set():
+            log("\n\n⛔ Ctrl+C — stopping at next checkpoint (partial CSV saved)…")
+            STOP_EVENT.set()
+        else:
+            log("⛔ Second Ctrl+C — exiting.")
+            sys.exit(1)
+    signal.signal(signal.SIGINT, _sigint)
+
+    print("=" * 78)
+    print(f"  Mode: {'DELETE' if do_delete else 'CHECK (read-only)'}")
+    print(f"  Groups: SharePoint + M365 (names only, no owners)")
+    print(f"  Delays: site={DELAY['site']}s user={DELAY['user']}s group={DELAY['group']}s")
+    print("=" * 78)
+
+    sites = read_sites(args.sites)
+    users = read_users(args.users)
+    if not sites or not users:
+        print("❌ empty input"); sys.exit(1)
+    print(f"\nSites: {len(sites)} | Users: {len(users)} | Pairs: {len(sites)*len(users)}\n")
+
+    sp_token = get_token("sharepoint")
+    if not sp_token:
+        print("❌ no SharePoint token"); sys.exit(1)
+    graph_token = get_token("graph")
+    if not graph_token:
+        log("⚠ Graph token unavailable — M365 group details will be empty")
+    print("🔑 Auth OK\n")
+
+    out = args.out or f"user_{'remove' if do_delete else 'check'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    fields = ["Site URL", "Site Name", "User", "Status", "Detail",
+              "Site User ID", "Email", "LoginName",
+              "SharePoint Groups", "M365 Groups"]
+
+    all_results: List[Dict] = []
+    interrupted = False
+    start = time.time()
+
+    try:
+        for i, s in enumerate(sites, start=1):
+            if STOP_EVENT.is_set():
+                break
+            site_url = normalize_site_url(s["input"])
+            try:
+                site_results = process_site(site_url, s["name"], users, sp_token, graph_token, do_delete)
+            except KeyboardInterrupt:
+                interrupted = True
+                break
+
+            all_results.extend(site_results)
+            _write_csv(out, fields, all_results)
+
+            counts = {}
+            for r in site_results:
+                counts[r["Status"]] = counts.get(r["Status"], 0) + 1
+            bits = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            print(f"[site {i}/{len(sites)}] {site_url}  →  {bits}")
+
+            if i < len(sites):
+                for _ in range(int(DELAY["site"] * 10)):
+                    if STOP_EVENT.is_set():
+                        break
+                    time.sleep(0.1)
+    except KeyboardInterrupt:
+        interrupted = True
+
+    elapsed = time.time() - start
+    if all_results:
+        _write_csv(out, fields, all_results)
+
+    totals: Dict[str, int] = {}
+    for r in all_results:
+        totals[r["Status"]] = totals.get(r["Status"], 0) + 1
+
+    print()
+    print("=" * 78)
+    print("  SUMMARY" + ("  (INTERRUPTED)" if interrupted else ""))
+    print("=" * 78)
+    print(f"  Sites reported  : {len({r['Site URL'] for r in all_results})}/{len(sites)}")
+    print(f"  Users           : {len(users)}")
+    print(f"  Pairs reported  : {len(all_results)}")
+    print(f"  Time            : {elapsed:.1f}s\n")
+    for k in ("FOUND", "REMOVED", "NOT_FOUND", "FAILED"):
+        if k in totals:
+            print(f"  {k:<10}: {totals[k]}")
+    if all_results:
+        print(f"\n  📄 Report: {out}")
+    print("=" * 78)
+
+
+def _write_csv(path: str, fields: List[str], rows: List[Dict]) -> None:
+    rows_sorted = sorted(rows, key=lambda x: (x["Site URL"].lower(), x["User"].lower()))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows_sorted:
+            w.writerow(r)
+
+
+if __name__ == "__main__":
+    main()
